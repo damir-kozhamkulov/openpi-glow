@@ -195,7 +195,13 @@ openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongs
 - Mixed precision training
 - FSDP (fully-sharded data parallelism) training
 - LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
+
+> **This fork:** EMA (exponential moving average) weights during training *are* supported, and are
+> on whenever the config sets `ema_decay` (see `src/openpi/training/ema_pytorch.py`). Checkpoints
+> written by `scripts/train_pytorch.py` follow the JAX trainer: `model.safetensors` holds the
+> averaged weights that inference loads, and the raw optimizer weights are kept alongside in
+> `model_raw.safetensors` for `--resume`. Set `OPENPI_PYTORCH_EMA=0` to train without averaging,
+> or `OPENPI_PYTORCH_EMA_DEVICE=cpu` to hold the accumulator in host memory.
 
 ### Setup
 1. Make sure that you have the latest version of all dependencies installed: `uv sync`

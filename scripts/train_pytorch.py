@@ -45,6 +45,18 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.ema_pytorch as _ema
+
+# Checkpoint layout. `model.safetensors` holds the weights evaluation loads
+# (`openpi/policies/policy_config.py` looks it up by exactly this name): the EMA-averaged
+# weights when EMA is on, mirroring what the JAX trainer writes into `params/`. The raw
+# optimizer weights then go to a second file that only `--resume` reads. With EMA off,
+# only `model.safetensors` is written.
+MODEL_FILENAME = "model.safetensors"
+RAW_MODEL_FILENAME = "model_raw.safetensors"
+
+_ENV_FALSEY = {"0", "false", "no", "off"}
+_ENV_TRUTHY = {"1", "true", "yes", "on"}
 
 
 def init_logging():
@@ -146,7 +158,22 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def resolve_ema_decay(config: _config.TrainConfig) -> float | None:
+    """EMA decay for this run: the config's `ema_decay`, with an env-var off switch.
+
+    `OPENPI_PYTORCH_EMA=0` disables averaging without editing the config, which is what an
+    A/B against a non-EMA baseline needs; the config value is otherwise authoritative, so a
+    PyTorch run and a JAX run of the same config average identically.
+    """
+    flag = os.environ.get("OPENPI_PYTORCH_EMA", "1").strip().lower()
+    if flag in _ENV_FALSEY:
+        return None
+    if flag not in _ENV_TRUTHY:
+        raise ValueError(f"OPENPI_PYTORCH_EMA must be one of {sorted(_ENV_TRUTHY | _ENV_FALSEY)}, got {flag!r}")
+    return config.ema_decay
+
+
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -164,7 +191,15 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        if ema is None:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / MODEL_FILENAME)
+        else:
+            # Raw optimizer weights first (resume reads these), then the averaged weights
+            # under the name evaluation expects. The swap is undone before this returns, so
+            # training continues from the raw weights either way.
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / RAW_MODEL_FILENAME)
+            with ema.swapped_into(model_to_save):
+                safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / MODEL_FILENAME)
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -174,6 +209,9 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "global_step": global_step,
             "config": dataclasses.asdict(config),
             "timestamp": time.time(),
+            # What `model.safetensors` actually contains, for anything that reads a checkpoint
+            # without the run's logs at hand.
+            "ema_decay": None if ema is None else ema.decay,
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
@@ -194,7 +232,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -217,14 +255,29 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
+        safetensors_path = ckpt_dir / MODEL_FILENAME
+        raw_safetensors_path = ckpt_dir / RAW_MODEL_FILENAME
 
-        if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-            logging.info("Loaded model state from safetensors format")
-        else:
+        if not safetensors_path.exists():
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+        if ema is not None:
+            # `model.safetensors` holds the averaged weights: seed the accumulator from them
+            # before the raw weights are loaded over the top of the model. The file stores
+            # them in the model dtype, so the float32 accumulator is re-rounded once here.
+            ema.copy_from(model_to_load)
+        if raw_safetensors_path.exists():
+            safetensors.torch.load_model(model_to_load, raw_safetensors_path, device=str(device))
+            logging.info(f"Loaded model state from safetensors format (raw weights from {RAW_MODEL_FILENAME})")
+        elif ema is not None:
+            logging.warning(
+                f"{RAW_MODEL_FILENAME} not found in {ckpt_dir}: this checkpoint was written before EMA support. "
+                "Resuming from its weights and seeding the EMA accumulator with them."
+            )
+        else:
+            logging.info("Loaded model state from safetensors format")
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -463,10 +516,19 @@ def train_loop(config: _config.TrainConfig):
         weight_decay=config.optimizer.weight_decay,
     )
 
+    # EMA accumulator, seeded from the weights the run starts at - the pretrained checkpoint
+    # for a fresh run, exactly like the JAX trainer's `ema_params=params` at init. Only the
+    # rank that writes checkpoints keeps one: DDP holds parameters identical across ranks, so
+    # a copy anywhere else would consume memory and produce the same numbers.
+    ema_decay = resolve_ema_decay(config)
+    ema = None
+    if is_main and ema_decay is not None:
+        ema = _ema.create_ema(model, ema_decay, device_preference=os.environ.get("OPENPI_PYTORCH_EMA_DEVICE", "auto"))
+
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema=ema)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -496,7 +558,16 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        if ema is not None:
+            logging.info(
+                f"EMA: decay={ema.decay}, float32 accumulator over {ema.num_parameters / 1e9:.2f}B trainable "
+                f"parameters on {ema.device} ({ema.num_bytes / 1e9:.1f} GB); checkpoints save averaged weights "
+                f"as {MODEL_FILENAME} and raw weights as {RAW_MODEL_FILENAME}"
+            )
+        elif config.ema_decay is None:
+            logging.info("EMA: disabled (config.ema_decay is None)")
+        else:
+            logging.info(f"EMA: disabled via OPENPI_PYTORCH_EMA (config.ema_decay={config.ema_decay})")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
@@ -547,6 +618,12 @@ def train_loop(config: _config.TrainConfig):
 
             # Optimizer step
             optim.step()
+
+            # EMA update, in the same place as the JAX trainer's: after the parameters move,
+            # every step, with no bias correction.
+            if ema is not None:
+                ema.update(model)
+
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
@@ -579,11 +656,17 @@ def train_loop(config: _config.TrainConfig):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+
+                # Distance between the averaged and the raw weights; ~0 means the
+                # accumulator is not moving.
+                ema_distance = ema.relative_distance(model) if ema is not None else None
+
+                log_line = f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e}"
+                if avg_grad_norm is not None:
+                    log_line += f" grad_norm={avg_grad_norm:.2f}"
+                if ema_distance is not None:
+                    log_line += f" ema_dist={ema_distance:.2e}"
+                logging.info(f"{log_line} time={elapsed:.1f}s")
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -595,6 +678,8 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    if ema_distance is not None:
+                        log_payload["ema_distance"] = ema_distance
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -602,7 +687,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema)
 
             # Update progress bar
             if pbar is not None:
