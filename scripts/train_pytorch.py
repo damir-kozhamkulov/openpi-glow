@@ -364,6 +364,13 @@ def train_loop(config: _config.TrainConfig):
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
 
+    if config.pytorch_training_precision == "float32":
+        # float32 weights with TF32 tensor-core matmuls - the float32 counterpart of the JAX
+        # trainer's regime (float32 params, reduced-precision compute). Plain float32 matmuls
+        # would run on CUDA cores at a fraction of tensor-core throughput.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     # Initialize checkpoint directory and wandb
     resuming = False
     if config.resume:
@@ -568,7 +575,9 @@ def train_loop(config: _config.TrainConfig):
             logging.info("EMA: disabled (config.ema_decay is None)")
         else:
             logging.info(f"EMA: disabled via OPENPI_PYTORCH_EMA (config.ema_decay={config.ema_decay})")
-        logging.info(f"Training precision: {model_cfg.dtype}")
+        logging.info(
+            f"Training precision: {model_cfg.dtype} (TF32 matmuls: {torch.backends.cuda.matmul.allow_tf32})"
+        )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
