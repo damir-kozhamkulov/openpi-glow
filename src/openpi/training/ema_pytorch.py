@@ -85,7 +85,10 @@ class ParameterEma:
                 continue
             source = param.detach()
             if source.device != shadow.device:
-                source = source.to(shadow.device, non_blocking=True)
+                # Blocking copy. A non_blocking device-to-host copy returns before the host
+                # memory is populated, and `add_` below reads it immediately - on large
+                # tensors that read races the transfer and corrupts the accumulator.
+                source = source.to(shadow.device)
             # mul_ + add_ rather than lerp_: add_ promotes a bfloat16 `source` inside the
             # kernel, so no float32 temporary the size of the parameter is ever materialized.
             shadow.mul_(self.decay).add_(source, alpha=1.0 - self.decay)
