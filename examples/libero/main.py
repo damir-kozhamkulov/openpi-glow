@@ -74,6 +74,9 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    # Episodes cut short because the policy server could not be reached. Their outcome is not a
+    # policy result, so a run with any of them is invalid regardless of the rate it computes.
+    aborted_episodes = []
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -159,6 +162,8 @@ def eval_libero(args: Args) -> None:
 
                 except Exception as e:
                     logging.error(f"Caught exception: {e}")
+                    if isinstance(e, _websocket_client_policy.PolicyServerUnreachable):
+                        aborted_episodes.append(total_episodes + 1)
                     break
 
             task_episodes += 1
@@ -184,6 +189,15 @@ def eval_libero(args: Args) -> None:
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    if aborted_episodes:
+        # Exit non-zero: the rate above counts unreachable-server episodes as failures, so it
+        # understates the policy by an unknown amount and must not be reported.
+        raise RuntimeError(
+            f"RUN INVALID: {len(aborted_episodes)} of {total_episodes} episodes were aborted because the policy "
+            f"server was unreachable (first at episode {aborted_episodes[0]}). The success rate above is not a "
+            f"policy result."
+        )
 
 
 def _get_libero_env(task, resolution, seed):
