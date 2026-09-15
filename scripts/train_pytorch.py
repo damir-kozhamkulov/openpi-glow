@@ -23,6 +23,7 @@ Multi-Node Training:
 
 """
 
+import contextlib
 import dataclasses
 import gc
 import logging
@@ -156,6 +157,21 @@ def get_model_parameters(model):
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model.parameters()
     )
+
+
+def resolve_grad_accum_steps() -> int:
+    """Micro-batches per optimizer step, from `OPENPI_GRAD_ACCUM_STEPS` (default 1).
+
+    `config.batch_size` stays the batch an optimizer step sees, so the recipe's batch/LR pairing
+    is unchanged: the data loader is built at `batch_size // accum_steps` and the gradients of
+    that many micro-batches are summed before stepping. This trades wall time for memory, which
+    is what puts the recipe's batch 256 within reach of 80 GB GPUs at float32.
+    """
+    raw = os.environ.get("OPENPI_GRAD_ACCUM_STEPS", "1").strip()
+    steps = int(raw)
+    if steps < 1:
+        raise ValueError(f"OPENPI_GRAD_ACCUM_STEPS must be >= 1, got {raw!r}")
+    return steps
 
 
 def resolve_ema_decay(config: _config.TrainConfig) -> float | None:
@@ -410,18 +426,28 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
-    effective_batch_size = config.batch_size // world_size
+    accum_steps = resolve_grad_accum_steps()
+    if config.batch_size % (world_size * accum_steps) != 0:
+        raise ValueError(
+            f"batch_size {config.batch_size} must divide evenly by world_size {world_size} x "
+            f"grad accumulation {accum_steps}"
+        )
+    # The loader is built at the micro-batch size; gradients of `accum_steps` micro-batches are
+    # summed, so an optimizer step still sees config.batch_size samples.
+    micro_batch_config = dataclasses.replace(config, batch_size=config.batch_size // accum_steps)
+    effective_batch_size = micro_batch_config.batch_size // world_size
     logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+        f"Using batch size per GPU: {effective_batch_size} x {accum_steps} accumulation step(s) "
+        f"(total batch size per optimizer step across {world_size} GPUs: {config.batch_size})"
     )
 
-    # Pass the original batch size to data loader - it will handle DDP splitting internally
-    loader, data_config = build_datasets(config)
+    # Pass the micro-batch size to data loader - it will handle DDP splitting internally
+    loader, data_config = build_datasets(micro_batch_config)
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
         # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
+        sample_data_loader = _data.create_data_loader(micro_batch_config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
         observation, actions = sample_batch
@@ -466,7 +492,11 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    # The config picks the module: PI0Pytorch, or a variant such as GLOW's GlowPI0Pytorch.
+    model = (
+        model_cfg.create_pytorch() if hasattr(model_cfg, "create_pytorch")
+        else openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
+    ).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -578,6 +608,12 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Training precision: {model_cfg.dtype} (TF32 matmuls: {torch.backends.cuda.matmul.allow_tf32})"
         )
+        episode_subset = _data.resolve_train_episodes()
+        logging.info(
+            f"Batch: {config.batch_size} per optimizer step "
+            f"({effective_batch_size}/GPU x {world_size} GPUs x {accum_steps} accumulation); "
+            f"episodes: {'all' if episode_subset is None else len(episode_subset)}"
+        )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -586,10 +622,16 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    epoch = 0
+    micro_step = 0
+    accum_loss = 0.0
+    accum_terms = {}
+
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
+            loader.set_epoch(epoch)
+        epoch += 1
 
         for observation, actions in loader:
             # Check if we've reached the target number of steps
@@ -601,26 +643,56 @@ def train_loop(config: _config.TrainConfig):
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+            # Update LR once per optimizer step, at the start of an accumulation cycle.
+            if micro_step == 0:
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            # DDP allreduces gradients on every backward; skip that on the micro-batches that
+            # are not the last of the cycle, so one optimizer step costs one allreduce.
+            is_last_micro_batch = (micro_step + 1) == accum_steps
+            sync_context = (
+                model.no_sync() if use_ddp and not is_last_micro_batch else contextlib.nullcontext()
+            )
 
-            loss = losses.mean()
+            with sync_context:
+                # Forward pass
+                losses = model(observation, actions)
+                # A model may return {"loss": scalar, <term>: scalar, ...} (GLOW: flow + subtask
+                # CE); the stock model returns the per-element flow loss.
+                terms = {}
+                if isinstance(losses, dict):
+                    loss = losses["loss"]
+                    terms = {k: float(v) for k, v in losses.items() if k != "loss"}
+                else:
+                    # Ensure losses is a tensor and handle different return types
+                    if isinstance(losses, list | tuple):
+                        losses = torch.stack(losses)
+                    elif not isinstance(losses, torch.Tensor):
+                        losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                    loss = losses.mean()
 
-            # Backward pass
-            loss.backward()
+                # Backward pass. Scaling by the cycle length makes the accumulated gradient the
+                # mean over all config.batch_size samples, not their sum.
+                (loss / accum_steps).backward()
+
+            accum_loss += loss.item() / accum_steps
+            for k, v in terms.items():
+                accum_terms[k] = accum_terms.get(k, 0.0) + v / accum_steps
+            micro_step += 1
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
+
+            if not is_last_micro_batch:
+                continue
+
+            micro_step = 0
+            loss_value = accum_loss
+            term_values = accum_terms
+            accum_loss = 0.0
+            accum_terms = {}
 
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
@@ -645,9 +717,10 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": loss_value,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        **{f"term/{k}": v for k, v in term_values.items()},
                     }
                 )
 
@@ -670,11 +743,21 @@ def train_loop(config: _config.TrainConfig):
                 # accumulator is not moving.
                 ema_distance = ema.relative_distance(model) if ema is not None else None
 
+                # Extra loss terms (GLOW: flow, subtask_ce, ce_samples), averaged over the
+                # steps that reported them.
+                term_keys = sorted({k for info in infos for k in info if k.startswith("term/")})
+                avg_terms = {
+                    k[len("term/") :]: sum(info[k] for info in infos if k in info) / sum(1 for info in infos if k in info)
+                    for k in term_keys
+                }
+
                 log_line = f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e}"
                 if avg_grad_norm is not None:
                     log_line += f" grad_norm={avg_grad_norm:.2f}"
                 if ema_distance is not None:
                     log_line += f" ema_dist={ema_distance:.2e}"
+                for k, v in avg_terms.items():
+                    log_line += f" {k}={v:.4f}"
                 logging.info(f"{log_line} time={elapsed:.1f}s")
 
                 # Log to wandb
@@ -689,6 +772,7 @@ def train_loop(config: _config.TrainConfig):
                         log_payload["grad_norm"] = avg_grad_norm
                     if ema_distance is not None:
                         log_payload["ema_distance"] = ema_distance
+                    log_payload.update(avg_terms)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -702,7 +786,7 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {"loss": f"{loss_value:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
 
     # Close progress bar

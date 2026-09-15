@@ -127,6 +127,31 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def resolve_train_episodes() -> list[int] | None:
+    """Episode subset to train on, from `OPENPI_TRAIN_EPISODES`.
+
+    Accepts a half-open range `start:stop` or a comma-separated list of indices; unset or empty
+    means the whole dataset. Restricting the episodes does not change the assets path, so
+    `norm_stats` computed over the full dataset stay in use and checkpoints remain compatible
+    with the released ones.
+
+    For `physical-intelligence/libero`, LIBERO-10 is `0:379` (task indices 0-9, 101,469 frames).
+    """
+    spec = os.environ.get("OPENPI_TRAIN_EPISODES", "").strip()
+    if not spec:
+        return None
+    if ":" in spec:
+        start_str, _, stop_str = spec.partition(":")
+        start, stop = int(start_str), int(stop_str)
+        if start < 0 or stop <= start:
+            raise ValueError(f"OPENPI_TRAIN_EPISODES range must be start:stop with stop > start >= 0, got {spec!r}")
+        return list(range(start, stop))
+    episodes = [int(part) for part in spec.split(",") if part.strip()]
+    if not episodes:
+        raise ValueError(f"OPENPI_TRAIN_EPISODES parsed to an empty episode list: {spec!r}")
+    return episodes
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,12 +162,17 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    episodes = resolve_train_episodes()
+    if episodes is not None:
+        logging.info(f"Training on an episode subset: {len(episodes)} episodes ({episodes[0]}..{episodes[-1]})")
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        episodes=episodes,
     )
 
     if data_config.prompt_from_task:

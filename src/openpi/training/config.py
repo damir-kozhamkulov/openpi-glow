@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -13,6 +14,9 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.glow.model_config as glow_model_config
+import openpi.glow.plan_pack as _plan_pack
+import openpi.glow.plan_prompt as _plan_prompt
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -353,6 +357,83 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
+    """LIBERO pipeline plus GLOW's plan clause and subtask target.
+
+    Differences from `LeRobotLiberoDataConfig`: the repack keeps `episode_index` / `frame_index`
+    so the active plan can be looked up, and the model transforms insert `GlowPlanPrompt` before
+    the stock tokenizer and `GlowTokenizeSubtask` after it. Everything else (images, state,
+    actions, normalization, tokenizer, max_token_len) is the stock pi05 pipeline.
+    """
+
+    # Plan pack path; None resolves $OPENPI_PLAN_PACK, then the in-image default.
+    plan_pack_path: str | None = None
+    # Probability of serving a training sample without the clause (it then carries the subtask
+    # target instead). Required: every row states it, so no row can inherit 0.0 by accident.
+    plan_dropout_p: float | None = None
+    # Carry the digitized aggregate anchors in the clause (ablation: instruction only).
+    plan_anchors: bool = True
+    # Also carry the next stage's anchors in the `Next:` clause.
+    plan_lookahead_anchors: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.plan_dropout_p is None:
+            raise ValueError("LeRobotLiberoGlowDataConfig.plan_dropout_p must be set explicitly (e.g. 0.3)")
+        if model_config.model_type != ModelType.PI05:
+            raise ValueError("GLOW is defined for the pi05 model type")
+        assert isinstance(model_config, pi0_config.Pi0Config)
+        base = super().create(assets_dirs, model_config)
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                    }
+                )
+            ]
+        )
+        pack = _plan_pack.PlanPack.load(self.plan_pack_path)
+        # Serving takes only a config name, so the anchors-off diagnostic (evaluate a checkpoint
+        # trained with anchors on clauses without them) is switched through the environment.
+        anchors = self.plan_anchors
+        if (env_anchors := os.environ.get("OPENPI_PLAN_ANCHORS", "").strip()) != "":
+            anchors = env_anchors.lower() in ("1", "true", "yes", "on")
+            logging.info(f"OPENPI_PLAN_ANCHORS={env_anchors!r}: plan clause anchors {'on' if anchors else 'OFF'}")
+        # Splice the two GLOW transforms into the stock pi05 list the parent already built - the
+        # clause rewrite immediately before the tokenizer, the target block immediately after -
+        # and reuse that tokenizer, so the SentencePiece model is loaded once.
+        stock = list(base.model_transforms.inputs)
+        at_tokenize = [n for n, t in enumerate(stock) if isinstance(t, _transforms.TokenizePrompt)]
+        if len(at_tokenize) != 1:
+            raise ValueError(f"expected one TokenizePrompt in the pi05 model transforms, got {len(at_tokenize)}")
+        i = at_tokenize[0]
+        model_transforms = dataclasses.replace(
+            base.model_transforms,
+            inputs=[
+                *stock[:i],
+                _plan_prompt.GlowPlanPrompt(
+                    pack,
+                    dropout_p=self.plan_dropout_p,
+                    anchors=anchors,
+                    lookahead_anchors=self.plan_lookahead_anchors,
+                ),
+                stock[i],
+                _plan_prompt.GlowTokenizeSubtask(stock[i].tokenizer),
+                *stock[i + 1 :],
+            ],
+        )
+        return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -747,6 +828,36 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # GLOW: pi05_libero with the plan clause in the prompt and the subtask CE head. Identical
+    # recipe (batch, schedule, optimizer, EMA, weights); rows differ only in the GLOW fields:
+    #   --data.plan-dropout-p 0.3         held constant across every clause-carrying row
+    #   --model.subtask-ce-weight 0.1     0 = plan clause only (no CE pass)
+    #   --data.no-plan-anchors            instruction-only clause
+    # norm_stats are shared with pi05_libero via --data.assets.assets-dir (the entrypoint sets it).
+    TrainConfig(
+        name="pi05_libero_glow",
+        model=glow_model_config.GlowPi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.1
+        ),
+        data=LeRobotLiberoGlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            plan_dropout_p=0.3,
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(

@@ -1,9 +1,12 @@
 import collections
 import dataclasses
+import json
 import logging
 import math
 import pathlib
+from typing import Optional
 
+import glow_stage_tracker
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
@@ -16,6 +19,7 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+GLOW_PLAN_OFF = -1  # plan_index that tells a GLOW policy server to leave the clause out
 
 
 @dataclasses.dataclass
@@ -44,10 +48,29 @@ class Args:
 
     seed: int = 7  # Random Seed (for reproducibility)
 
+    #################################################################################################################
+    # GLOW plan state (unset = stock client, nothing extra is sent)
+    #################################################################################################################
+    # Plan pack (build_plan_pack.py). When set, a proprioceptive stage tracker runs on the executed
+    # gripper commands and every observation carries its plan_index; a pi05_libero_glow server
+    # requires it. Tasks missing from the pack abort the run rather than silently sending nothing.
+    plan_pack: Optional[str] = None
+    # Diagnostic: keep tracking (and logging) the stage but send plan_index = -1, so the server
+    # renders the stock prompt. Measures whether the policy uses the clause at all.
+    plan_off: bool = False
+    # Frames a grasp must be held before its release advances the plan.
+    plan_hold_min: int = glow_stage_tracker.HOLD_MIN
+
 
 def eval_libero(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
+
+    plan_pack = None
+    if args.plan_pack is not None:
+        with open(args.plan_pack, encoding="utf-8") as f:
+            plan_pack = json.load(f)
+        logging.info(f"GLOW plan pack: {args.plan_pack} ({len(plan_pack['tasks'])} tasks); plan_off={args.plan_off}")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -87,6 +110,12 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
+        num_plans = None
+        if plan_pack is not None:
+            if str(task_description) not in plan_pack["tasks"]:
+                raise KeyError(f"task {task_description!r} is not in the plan pack {args.plan_pack}")
+            num_plans = int(plan_pack["tasks"][str(task_description)]["K"])
+
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
@@ -95,6 +124,9 @@ def eval_libero(args: Args) -> None:
             # Reset environment
             env.reset()
             action_plan = collections.deque()
+            tracker = None
+            if num_plans is not None:
+                tracker = glow_stage_tracker.StageTracker(num_plans, hold_min=args.plan_hold_min)
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -142,6 +174,13 @@ def eval_libero(args: Args) -> None:
                             ),
                             "prompt": str(task_description),
                         }
+                        if tracker is not None:
+                            # Plan active for the next executed frame: releases seen so far.
+                            element["plan_index"] = GLOW_PLAN_OFF if args.plan_off else tracker.plan_index
+                            logging.info(
+                                f"plan_index={tracker.plan_index} frame={tracker.frame} "
+                                f"releases={tracker.releases}"
+                            )
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
@@ -154,6 +193,8 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+                    if tracker is not None:
+                        tracker.observe(action[6])  # the gripper command just executed
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -180,6 +221,12 @@ def eval_libero(args: Args) -> None:
 
             # Log current results
             logging.info(f"Success: {done}")
+            if tracker is not None:
+                # One line per episode for the stage-resolved failure analysis.
+                logging.info(
+                    f"plan trace: task={task_id} episode={episode_idx} success={done} frames={tracker.frame} "
+                    f"releases={tracker.releases} final_plan_index={tracker.plan_index} of {num_plans}"
+                )
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 

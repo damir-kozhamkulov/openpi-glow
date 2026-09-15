@@ -80,6 +80,12 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # GLOW plan-state keys, consumed by the GlowPlanPrompt model transform: the dataset's
+        # episode/frame at training, the client's stage tracker at inference. Absent otherwise.
+        for key in ("episode_index", "frame_index", "plan_index"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 

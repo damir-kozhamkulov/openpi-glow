@@ -60,6 +60,12 @@ class Pi0Config(_model.BaseModelConfig):
 
         return Pi0(self, rngs=nnx.Rngs(rng))
 
+    def create_pytorch(self):
+        """The PyTorch module for this config; subclasses may return a variant."""
+        from openpi.models_pytorch import pi0_pytorch
+
+        return pi0_pytorch.PI0Pytorch(self)
+
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)

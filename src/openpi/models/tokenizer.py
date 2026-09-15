@@ -47,6 +47,11 @@ class PaligemmaTokenizer:
 
         return np.asarray(tokens), np.asarray(mask)
 
+    def encode_answer(self, text: str) -> list[int]:
+        """Tokens of an answer block placed after the prompt: no BOS, EOS-terminated."""
+        cleaned_text = text.strip().replace("_", " ").replace("\n", " ")
+        return self._tokenizer.encode(cleaned_text, add_bos=False, add_eos=True)
+
 
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
