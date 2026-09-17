@@ -174,6 +174,38 @@ def resolve_grad_accum_steps() -> int:
     return steps
 
 
+def skip_grad_sync(*, use_ddp: bool, is_last_micro_batch: bool, grads_allocated: bool) -> bool:
+    """Whether a micro-batch's backward runs under DDP's `no_sync()`.
+
+    Only the last micro-batch of an accumulation cycle needs the allreduce, but `no_sync()` is
+    used only once the gradients exist as views into DDP's allreduce buckets, which
+    `gradient_as_bucket_view=True` makes them on the first synced backward. A backward under
+    `no_sync()` into unallocated gradients allocates a second full set of gradients beside the
+    buckets: one model's worth of parameters, ~13.7 GB for pi05 at float32, held through the
+    rest of the cycle on top of the AdamW moments. Until then every micro-batch syncs. The
+    accumulated gradient is the same either way: the cross-rank average is linear, and a synced
+    partial sum is identical on every rank.
+    """
+    return use_ddp and not is_last_micro_batch and grads_allocated
+
+
+def zero_gradients(model: torch.nn.Module, optim: torch.optim.Optimizer, *, keep_allocated: bool) -> None:
+    """Reset gradients after an optimizer step.
+
+    `keep_allocated` zeroes them in place, so gradients that are DDP bucket views stay views and
+    the next cycle's early micro-batches accumulate into the buckets (see `skip_grad_sync`).
+    Otherwise the gradients are freed.
+    """
+    if keep_allocated:
+        optim.zero_grad(set_to_none=False)
+        return
+    optim.zero_grad(set_to_none=True)
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.detach_()
+            param.grad = None
+
+
 def resolve_ema_decay(config: _config.TrainConfig) -> float | None:
     """EMA decay for this run: the config's `ema_decay`, with an env-var off switch.
 
@@ -626,6 +658,8 @@ def train_loop(config: _config.TrainConfig):
     micro_step = 0
     accum_loss = 0.0
     accum_terms = {}
+    # False until an optimizer step has left the gradients allocated (see `zero_gradients`).
+    grads_allocated = False
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
@@ -649,10 +683,15 @@ def train_loop(config: _config.TrainConfig):
                     pg["lr"] = lr_schedule(global_step)
 
             # DDP allreduces gradients on every backward; skip that on the micro-batches that
-            # are not the last of the cycle, so one optimizer step costs one allreduce.
+            # are not the last of the cycle once the gradients are allocated, so an optimizer
+            # step costs one allreduce.
             is_last_micro_batch = (micro_step + 1) == accum_steps
             sync_context = (
-                model.no_sync() if use_ddp and not is_last_micro_batch else contextlib.nullcontext()
+                model.no_sync()
+                if skip_grad_sync(
+                    use_ddp=use_ddp, is_last_micro_batch=is_last_micro_batch, grads_allocated=grads_allocated
+                )
+                else contextlib.nullcontext()
             )
 
             with sync_context:
@@ -705,13 +744,9 @@ def train_loop(config: _config.TrainConfig):
             if ema is not None:
                 ema.update(model)
 
-            optim.zero_grad(set_to_none=True)
-
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+            # Without accumulation the gradients are freed; with it they stay allocated.
+            zero_gradients(model, optim, keep_allocated=accum_steps > 1)
+            grads_allocated = accum_steps > 1
 
             # Collect stats
             if is_main:
