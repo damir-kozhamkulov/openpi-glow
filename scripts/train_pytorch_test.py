@@ -18,6 +18,22 @@ _OPTIMIZER_STEPS = 3
 _MICRO_BATCH = 4
 
 
+def test_ddp_timeout_defaults_to_an_hour(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OPENPI_DDP_TIMEOUT_MIN", raising=False)
+    assert train_pytorch.resolve_ddp_timeout() == datetime.timedelta(minutes=60)
+
+
+def test_ddp_timeout_reads_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENPI_DDP_TIMEOUT_MIN", "90")
+    assert train_pytorch.resolve_ddp_timeout() == datetime.timedelta(minutes=90)
+
+
+def test_ddp_timeout_rejects_non_positive(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENPI_DDP_TIMEOUT_MIN", "0")
+    with pytest.raises(ValueError, match="OPENPI_DDP_TIMEOUT_MIN"):
+        train_pytorch.resolve_ddp_timeout()
+
+
 def _make_model() -> torch.nn.Module:
     torch.manual_seed(0)
     return torch.nn.Sequential(torch.nn.Linear(6, 16), torch.nn.Tanh(), torch.nn.Linear(16, 1)).double()

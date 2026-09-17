@@ -25,6 +25,7 @@ Multi-Node Training:
 
 import contextlib
 import dataclasses
+import datetime
 import gc
 import logging
 import os
@@ -109,7 +110,7 @@ def setup_ddp():
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        torch.distributed.init_process_group(backend=backend, init_method="env://", timeout=resolve_ddp_timeout())
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
@@ -172,6 +173,21 @@ def resolve_grad_accum_steps() -> int:
     if steps < 1:
         raise ValueError(f"OPENPI_GRAD_ACCUM_STEPS must be >= 1, got {raw!r}")
     return steps
+
+
+def resolve_ddp_timeout() -> datetime.timedelta:
+    """Collective timeout for the process group, from `OPENPI_DDP_TIMEOUT_MIN` (default 60).
+
+    Only rank 0 writes checkpoints. The other ranks carry on into the next step and wait for it
+    in that step's first collective, so the timeout has to cover a whole save: a float32 pi05
+    checkpoint with AdamW state is 37.7 GiB and takes ~9 min to write to the PVC, close to
+    NCCL's 10-minute default.
+    """
+    raw = os.environ.get("OPENPI_DDP_TIMEOUT_MIN", "60").strip()
+    minutes = int(raw)
+    if minutes < 1:
+        raise ValueError(f"OPENPI_DDP_TIMEOUT_MIN must be >= 1, got {raw!r}")
+    return datetime.timedelta(minutes=minutes)
 
 
 def skip_grad_sync(*, use_ddp: bool, is_last_micro_batch: bool, grads_allocated: bool) -> bool:
@@ -616,6 +632,7 @@ def train_loop(config: _config.TrainConfig):
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
+            + (f" | collective timeout {resolve_ddp_timeout()}" if use_ddp else "")
         )
         logging.info(
             f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
