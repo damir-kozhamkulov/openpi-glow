@@ -48,6 +48,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 import openpi.training.ema_pytorch as _ema
+import openpi.training.fsdp_pytorch as _fsdp
 
 # Checkpoint layout. `model.safetensors` holds the weights evaluation loads
 # (`openpi/policies/policy_config.py` looks it up by exactly this name): the EMA-averaged
@@ -237,13 +238,20 @@ def resolve_ema_decay(config: _config.TrainConfig) -> float | None:
     return config.ema_decay
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
-    if not is_main:
-        return
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None, *, fsdp=False):
+    """Save a checkpoint with model state, optimizer state, and metadata.
 
+    Under FSDP every rank must call this: gathering the sharded state is collective. The files
+    are the same as a single-process run's (see openpi.training.fsdp_pytorch).
+    """
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+        if fsdp:
+            model_state = _fsdp.full_model_state_dict(model, is_main=is_main)
+            optimizer_state = _fsdp.full_optimizer_state_dict(optimizer, is_main=is_main)
+        if not is_main:
+            return
+
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -255,7 +263,10 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
 
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        if ema is None:
+        if fsdp:
+            _fsdp.save_model_file(model_state, tmp_ckpt_dir / MODEL_FILENAME)
+            del model_state
+        elif ema is None:
             safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / MODEL_FILENAME)
         else:
             # Raw optimizer weights first (resume reads these), then the averaged weights
@@ -266,7 +277,9 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
                 safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / MODEL_FILENAME)
 
         # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+        torch.save(optimizer_state if fsdp else optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+        if fsdp:
+            del optimizer_state
 
         # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
         metadata = {
@@ -296,8 +309,40 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
-    """Load the latest checkpoint and return the global step."""
+def load_model_weights(model_to_load, ckpt_dir, device, ema=None):
+    """Load a checkpoint's weights into an unwrapped model: the raw weights when the checkpoint
+    has them, seeding `ema` from the averaged ones first."""
+    safetensors_path = ckpt_dir / MODEL_FILENAME
+    raw_safetensors_path = ckpt_dir / RAW_MODEL_FILENAME
+
+    if not safetensors_path.exists():
+        raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+
+    safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+    if ema is not None:
+        # `model.safetensors` holds the averaged weights: seed the accumulator from them
+        # before the raw weights are loaded over the top of the model. The file stores
+        # them in the model dtype, so the float32 accumulator is re-rounded once here.
+        ema.copy_from(model_to_load)
+    if raw_safetensors_path.exists():
+        safetensors.torch.load_model(model_to_load, raw_safetensors_path, device=str(device))
+        logging.info(f"Loaded model state from safetensors format (raw weights from {RAW_MODEL_FILENAME})")
+    elif ema is not None:
+        logging.warning(
+            f"{RAW_MODEL_FILENAME} not found in {ckpt_dir}: this checkpoint was written before EMA support. "
+            "Resuming from its weights and seeding the EMA accumulator with them."
+        )
+    else:
+        logging.info("Loaded model state from safetensors format")
+
+
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None, *, fsdp=False):
+    """Load the latest checkpoint and return the global step.
+
+    Under FSDP the weights must already be in the model - `load_model_weights` before
+    sharding - and only the optimizer state and metadata load here, each rank reading its own
+    shard of the optimizer state.
+    """
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -317,31 +362,12 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
         log_memory_usage(device, latest_step, "before_loading_checkpoint")
 
     try:
-        # Load model state with error handling
-        logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / MODEL_FILENAME
-        raw_safetensors_path = ckpt_dir / RAW_MODEL_FILENAME
-
-        if not safetensors_path.exists():
-            raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
-
-        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-        if ema is not None:
-            # `model.safetensors` holds the averaged weights: seed the accumulator from them
-            # before the raw weights are loaded over the top of the model. The file stores
-            # them in the model dtype, so the float32 accumulator is re-rounded once here.
-            ema.copy_from(model_to_load)
-        if raw_safetensors_path.exists():
-            safetensors.torch.load_model(model_to_load, raw_safetensors_path, device=str(device))
-            logging.info(f"Loaded model state from safetensors format (raw weights from {RAW_MODEL_FILENAME})")
-        elif ema is not None:
-            logging.warning(
-                f"{RAW_MODEL_FILENAME} not found in {ckpt_dir}: this checkpoint was written before EMA support. "
-                "Resuming from its weights and seeding the EMA accumulator with them."
-            )
+        if fsdp:
+            logging.info("Model state was loaded before sharding")
         else:
-            logging.info("Loaded model state from safetensors format")
+            logging.info("Loading model state...")
+            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+            load_model_weights(model_to_load, ckpt_dir, device, ema=ema)
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -351,14 +377,15 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
         logging.info("Loading optimizer state...")
         optimizer_path = ckpt_dir / "optimizer.pt"
 
-        if optimizer_path.exists():
-            optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
-            logging.info("Loaded optimizer state from pt format")
-        else:
+        if not optimizer_path.exists():
             raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
-
-        optimizer.load_state_dict(optimizer_state_dict)
-        del optimizer_state_dict
+        if fsdp:
+            _fsdp.load_optimizer_state_dict(optimizer, optimizer_path)
+        else:
+            optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
+            optimizer.load_state_dict(optimizer_state_dict)
+            del optimizer_state_dict
+        logging.info("Loaded optimizer state from pt format")
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
@@ -427,6 +454,11 @@ def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+    # Replicated (DDP) or sharded (FSDP) across GPUs; one process trains unwrapped either way.
+    use_fsdp = use_ddp and _fsdp.resolve_parallelism() == "fsdp"
+    if use_fsdp and resolve_ema_decay(config) is not None:
+        # The accumulator mirrors whole parameters on the saving rank; FSDP never holds them there.
+        raise ValueError("EMA is not supported with OPENPI_PARALLEL=fsdp; set OPENPI_PYTORCH_EMA=0")
 
     if config.pytorch_training_precision == "float32":
         # float32 weights with TF32 tensor-core matmuls - the float32 counterpart of the JAX
@@ -567,7 +599,21 @@ def train_loop(config: _config.TrainConfig):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
-    if use_ddp:
+    if use_fsdp:
+        # Weights load into the unsharded model, which sharding then splits across the ranks:
+        # the run's newest checkpoint when resuming, the fine-tuning init otherwise.
+        if resuming:
+            ckpt_dir = config.checkpoint_dir / f"{get_latest_checkpoint_step(config.checkpoint_dir)}"
+            logging.info(f"Loading weights from: {ckpt_dir}")
+            load_model_weights(model, ckpt_dir, device)
+        elif config.pytorch_weight_path is not None:
+            logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+            model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+            safetensors.torch.load_model(model, model_path, device=str(device))
+        model = _fsdp.shard_model(model, _fsdp.build_mesh(device))
+        if is_main and torch.cuda.is_available():
+            log_memory_usage(device, 0, "after_sharding")
+    elif use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
@@ -577,7 +623,7 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
+    if not use_fsdp and config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
@@ -613,7 +659,7 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema=ema)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema=ema, fsdp=use_fsdp)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -633,6 +679,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
             + (f" | collective timeout {resolve_ddp_timeout()}" if use_ddp else "")
+            + (f" | {'fsdp (sharded)' if use_fsdp else 'ddp'}" if use_ddp else "")
         )
         logging.info(
             f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
@@ -702,11 +749,14 @@ def train_loop(config: _config.TrainConfig):
             # DDP allreduces gradients on every backward; skip that on the micro-batches that
             # are not the last of the cycle once the gradients are allocated, so an optimizer
             # step costs one allreduce.
+            # FSDP reduce-scatters every micro-batch into the gradient shards instead.
             is_last_micro_batch = (micro_step + 1) == accum_steps
             sync_context = (
                 model.no_sync()
                 if skip_grad_sync(
-                    use_ddp=use_ddp, is_last_micro_batch=is_last_micro_batch, grads_allocated=grads_allocated
+                    use_ddp=use_ddp and not use_fsdp,
+                    is_last_micro_batch=is_last_micro_batch,
+                    grads_allocated=grads_allocated,
                 )
                 else contextlib.nullcontext()
             )
@@ -732,6 +782,9 @@ def train_loop(config: _config.TrainConfig):
                 # mean over all config.batch_size samples, not their sum.
                 (loss / accum_steps).backward()
 
+            if use_fsdp:
+                _fsdp.reshard(model)
+
             accum_loss += loss.item() / accum_steps
             for k, v in terms.items():
                 accum_terms[k] = accum_terms.get(k, 0.0) + v / accum_steps
@@ -751,7 +804,8 @@ def train_loop(config: _config.TrainConfig):
             accum_terms = {}
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            clip = _fsdp.clip_grad_norm_ if use_fsdp else torch.nn.utils.clip_grad_norm_
+            grad_norm = clip(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
@@ -832,7 +886,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema, fsdp=use_fsdp)
 
             # Update progress bar
             if pbar is not None:
