@@ -43,12 +43,16 @@ class GlowPlanPrompt(DataTransformFn):
     # Probability that a TRAINING sample is served without the clause (the sample then carries
     # the subtask target instead). No default on purpose: every config states it.
     dropout_p: float
+    # Clause layout, one of plan_pack.CLAUSES.
+    clause: str = "stage"
     anchors: bool = True
     lookahead_anchors: bool = False
 
     def __post_init__(self):
         if not 0.0 <= self.dropout_p <= 1.0:
             raise ValueError(f"dropout_p must be in [0, 1], got {self.dropout_p}")
+        if self.clause not in _plan_pack.CLAUSES:
+            raise ValueError(f"clause must be one of {_plan_pack.CLAUSES}, got {self.clause!r}")
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.get("prompt")) is None:
@@ -81,7 +85,11 @@ class GlowPlanPrompt(DataTransformFn):
 
         if not dropped:
             data["prompt"] = self.pack.render_clause(
-                prompt, plan_index, anchors=self.anchors, lookahead_anchors=self.lookahead_anchors
+                prompt,
+                plan_index,
+                clause=self.clause,
+                anchors=self.anchors,
+                lookahead_anchors=self.lookahead_anchors,
             )
         elif training:
             data["glow_subtask"] = self.pack.subtask(prompt, plan_index)

@@ -65,14 +65,35 @@ def _expected(raw, tasks, chain, ep, frame, anchors=True):
     k = max(i for i, r in enumerate(rows) if int(r["start_frame"]) <= frame)
     task = tasks[int(rows[0]["task_index"])]
     st = raw["tasks"][task]["stages"][k]
-    s = f"{task}. Plan {k + 1} of {len(rows)}: {rows[k]['naming_instruction']}"
+    s = f"{task}. Plan {k + 1} of {len(rows)}: {rows[k]['subgoal_operation']}"
     if anchors:
         if st["object_anchor"]:
             s += "; object " + " ".join(map(str, st["object_anchor"]["bins"]))
         if st["target_anchor"]:
             s += "; target " + " ".join(map(str, st["target_anchor"]["bins"]))
     if k + 1 < len(rows):
-        s += f". Next: {rows[k + 1]['naming_instruction']}"
+        s += f". Next: {rows[k + 1]['subgoal_operation']}"
+    return s, k, task
+
+
+def _expected_module(raw, tasks, chain, ep, frame, anchors=True):
+    rows = chain[ep]
+    k = max(i for i, r in enumerate(rows) if int(r["start_frame"]) <= frame)
+    task = tasks[int(rows[0]["task_index"])]
+    st = raw["tasks"][task]["stages"][k]
+    r = rows[k]
+    s = f"{task}. Stage {k + 1} of {len(rows)} [{r['runtime_key']}]: {r['subgoal_operation']}. {r['atom']}"
+    for role, noun, anchor in (
+        ("object", r["object_noun"], st["object_anchor"]),
+        ("target", r["target_noun"], st["target_anchor"]),
+    ):
+        parts = [noun] if noun else []
+        if anchors and anchor:
+            parts.append(" ".join(map(str, anchor["bins"])))
+        if parts:
+            s += f"; {role} " + " ".join(parts)
+    if k + 1 < len(rows):
+        s += f". Next: {rows[k + 1]['subgoal_operation']}"
     return s, k, task
 
 
@@ -129,6 +150,68 @@ def test_clause_strings_on_boundary_frames(pack, raw, tasks, chain):
         {"prompt": tasks[0], "episode_index": np.int64(ep0), "frame_index": np.int64(0)}
     )
     assert out["prompt"] == _expected(raw, tasks, chain, ep0, 0, anchors=False)[0]
+
+
+def test_module_clause_on_boundary_frames(pack, raw, tasks, chain):
+    t = _plan_prompt.GlowPlanPrompt(pack, dropout_p=0.0, clause="module")
+    t_off = _plan_prompt.GlowPlanPrompt(pack, dropout_p=0.0, clause="module", anchors=False)
+    first_ep = {}
+    for ep in sorted(chain):
+        first_ep.setdefault(int(chain[ep][0]["task_index"]), ep)
+    checked = 0
+    for ep in first_ep.values():
+        rows = chain[ep]
+        n = int(rows[-1]["end_frame"]) + 1
+        probes = {0, n - 1, n // 2}
+        for r in rows[1:]:
+            probes |= {int(r["start_frame"]) - 1, int(r["start_frame"])}
+        for fr in sorted(probes):
+            exp, k, task = _expected_module(raw, tasks, chain, ep, fr)
+            sample = {"prompt": task, "episode_index": np.int64(ep), "frame_index": np.int64(fr)}
+            assert t(dict(sample))["prompt"] == exp
+            assert t_off(dict(sample))["prompt"] == _expected_module(raw, tasks, chain, ep, fr, anchors=False)[0]
+            assert f"Stage {k + 1} of " in exp and f"[{rows[k]['runtime_key']}]" in exp
+            checked += 1
+    assert checked >= 40
+    # Task 6's two stages share instruction, atom and nouns; the runtime_key tells them apart.
+    six = [pack.render_clause(tasks[6], k, clause="module", anchors=False) for k in range(2)]
+    assert six[0] != six[1] and "moka_pot_2" in six[0] and "moka_pot_1" in six[1]
+    # Close stages carry no target noun or bins: no target fragment.
+    assert "; target" not in pack.render_clause(tasks[2], 1, clause="module")
+    assert pack.render_clause(tasks[0], 0, clause="stage") == pack.render_clause(tasks[0], 0)
+    with pytest.raises(ValueError):
+        pack.render_clause(tasks[0], 0, clause="bogus")
+    with pytest.raises(ValueError):
+        _plan_prompt.GlowPlanPrompt(pack, dropout_p=0.0, clause="bogus")
+    assert t({"prompt": tasks[0], "plan_index": _plan_pack.PLAN_OFF})["prompt"] == tasks[0]
+
+
+def test_module_clause_token_budget(pack):
+    from openpi.models import tokenizer as _tokenizer
+
+    tok = _tokenizer.PaligemmaTokenizer(200)
+    longest = max(
+        int(tok.tokenize(pack.render_clause(task, k, clause="module"))[1].sum())
+        for task, e in pack.tasks.items()
+        for k in range(e.num_plans)
+    )
+    longest_block = max(len(tok.encode_answer(s.subgoal_operation)) for e in pack.tasks.values() for s in e.stages)
+    # A dropped sample carries the stock prompt plus the block, never the clause plus the block.
+    assert longest < 200, longest
+    assert longest_block < 30, longest_block
+
+
+def test_module_config():
+    import openpi.training.config as _config
+
+    cfg = _config.get_config("pi05_libero_glow_module")
+    stock = _config.get_config("pi05_libero_glow")
+    assert cfg.data.plan_clause == "module" and stock.data.plan_clause == "stage"
+    assert cfg.model.subtask_ce_weight == 0.0 and cfg.data.plan_dropout_p == stock.data.plan_dropout_p
+    # Everything but the clause layout and lambda is the pi05_libero_glow row.
+    assert dataclasses.replace(cfg.data, plan_clause="stage") == stock.data
+    assert dataclasses.replace(cfg.model, subtask_ce_weight=stock.model.subtask_ce_weight) == stock.model
+    assert dataclasses.replace(cfg, name=stock.name, model=stock.model, data=stock.data) == stock
 
 
 def test_dropout(pack, tasks, chain):

@@ -374,6 +374,9 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     # Probability of serving a training sample without the clause (it then carries the subtask
     # target instead). Required: every row states it, so no row can inherit 0.0 by accident.
     plan_dropout_p: float | None = None
+    # Clause layout, one of plan_pack.CLAUSES: "stage" (instruction + anchors) or "module" (the
+    # planning module's Spatial and Temporal fields).
+    plan_clause: str = "stage"
     # Carry the digitized aggregate anchors in the clause (ablation: instruction only).
     plan_anchors: bool = True
     # Also carry the next stage's anchors in the `Next:` clause.
@@ -425,6 +428,7 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                 _plan_prompt.GlowPlanPrompt(
                     pack,
                     dropout_p=self.plan_dropout_p,
+                    clause=self.plan_clause,
                     anchors=anchors,
                     lookahead_anchors=self.plan_lookahead_anchors,
                 ),
@@ -858,6 +862,34 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             plan_dropout_p=0.3,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # GLOW planning module as input: pi05_libero_glow with the "module" clause (Spatial: atom,
+    # subgoal_operation, object / target nouns and anchors; Temporal: stage k of K, runtime_key)
+    # and no CE pass. The 30% plan-dropped samples train on the stock prompt.
+    TrainConfig(
+        name="pi05_libero_glow_module",
+        model=glow_model_config.GlowPi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.0
+        ),
+        data=LeRobotLiberoGlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            plan_dropout_p=0.3,
+            plan_clause="module",
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
