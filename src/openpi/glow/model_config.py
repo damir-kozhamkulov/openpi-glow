@@ -1,4 +1,4 @@
-"""Model config for GLOW: pi05 plus the subtask cross-entropy head (PyTorch path only)."""
+"""Model config for GLOW: pi05 that predicts its plan state (PyTorch path only)."""
 
 import dataclasses
 
@@ -9,8 +9,8 @@ from openpi.models import pi0_config
 
 @dataclasses.dataclass(frozen=True)
 class GlowPi0Config(pi0_config.Pi0Config):
-    # Weight of the subtask cross-entropy term. 0 skips the CE pass entirely, so a row with
-    # subtask_ce_weight=0 trains the stock flow objective on the plan-clause prompts.
+    # Weight (lambda) of the plan cross-entropy term. 0 trains the flow loss alone, the plan block
+    # still in the prefix as teacher-forced conditioning.
     subtask_ce_weight: float = 0.0
 
     def create(self, rng):

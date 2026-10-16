@@ -4,7 +4,7 @@ import json
 import logging
 import math
 import pathlib
-from typing import Optional
+from typing import Literal, Optional
 
 import glow_stage_tracker
 import imageio
@@ -19,7 +19,6 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
-GLOW_PLAN_OFF = -1  # plan_index that tells a GLOW policy server to leave the clause out
 
 
 @dataclasses.dataclass
@@ -51,14 +50,16 @@ class Args:
     #################################################################################################################
     # GLOW plan state (unset = stock client, nothing extra is sent)
     #################################################################################################################
-    # Plan pack (build_plan_pack.py). When set, a proprioceptive stage tracker runs on the executed
-    # gripper commands and every observation carries its plan_index; a pi05_libero_glow server
-    # requires it. Tasks missing from the pack abort the run rather than silently sending nothing.
+    # Plan pack (build_plan_pack.py). When set, every observation carries the plan state a
+    # pi05_libero_glow_* server requires (glow_stage_tracker.PlanEcho), and a proprioceptive stage
+    # tracker runs alongside for comparison. Tasks missing from the pack abort the run rather than
+    # silently sending nothing.
     plan_pack: Optional[str] = None
-    # Diagnostic: keep tracking (and logging) the stage but send plan_index = -1, so the server
-    # renders the stock prompt. Measures whether the policy uses the clause at all.
-    plan_off: bool = False
-    # Frames a grasp must be held before its release advances the plan.
+    # self: the model chooses each plan and reads its own choice back; oracle: the tracker's stage
+    # is the plan; forced: --plan-forced-index is the plan throughout (clamped to a task's last stage).
+    plan_mode: Literal["self", "oracle", "forced"] = "self"
+    plan_forced_index: Optional[int] = None
+    # Frames a grasp must be held before its release advances the tracker.
     plan_hold_min: int = glow_stage_tracker.HOLD_MIN
 
 
@@ -68,9 +69,14 @@ def eval_libero(args: Args) -> None:
 
     plan_pack = None
     if args.plan_pack is not None:
+        if args.plan_mode == "forced" and args.plan_forced_index is None:
+            raise ValueError("--plan-mode forced needs --plan-forced-index")
         with open(args.plan_pack, encoding="utf-8") as f:
             plan_pack = json.load(f)
-        logging.info(f"GLOW plan pack: {args.plan_pack} ({len(plan_pack['tasks'])} tasks); plan_off={args.plan_off}")
+        logging.info(
+            f"GLOW plan pack: {args.plan_pack} ({len(plan_pack['tasks'])} tasks); plan_mode={args.plan_mode}"
+            + (f" forced_index={args.plan_forced_index}" if args.plan_mode == "forced" else "")
+        )
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -124,9 +130,11 @@ def eval_libero(args: Args) -> None:
             # Reset environment
             env.reset()
             action_plan = collections.deque()
-            tracker = None
+            plan = None
             if num_plans is not None:
-                tracker = glow_stage_tracker.StageTracker(num_plans, hold_min=args.plan_hold_min)
+                plan = glow_stage_tracker.PlanEcho(
+                    args.plan_mode, num_plans, forced_index=args.plan_forced_index, hold_min=args.plan_hold_min
+                )
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -174,16 +182,19 @@ def eval_libero(args: Args) -> None:
                             ),
                             "prompt": str(task_description),
                         }
-                        if tracker is not None:
-                            # Plan active for the next executed frame: releases seen so far.
-                            element["plan_index"] = GLOW_PLAN_OFF if args.plan_off else tracker.plan_index
-                            logging.info(
-                                f"plan_index={tracker.plan_index} frame={tracker.frame} "
-                                f"releases={tracker.releases}"
-                            )
+                        if plan is not None:
+                            element.update(plan.request())
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        response = client.infer(element)
+                        action_chunk = response["actions"]
+                        if plan is not None:
+                            used = plan.update(response)
+                            logp = response.get("plan_logp")
+                            logging.info(
+                                f"plan query: frame={plan.tracker.frame} plan={used} tracker={plan.tracker.plan_index} "
+                                f"logp={None if logp is None else np.round(np.asarray(logp, dtype=float), 3).tolist()}"
+                            )
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -193,8 +204,8 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
-                    if tracker is not None:
-                        tracker.observe(action[6])  # the gripper command just executed
+                    if plan is not None:
+                        plan.observe(action[6])  # the gripper command just executed
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -221,11 +232,11 @@ def eval_libero(args: Args) -> None:
 
             # Log current results
             logging.info(f"Success: {done}")
-            if tracker is not None:
+            if plan is not None:
                 # One line per episode for the stage-resolved failure analysis.
                 logging.info(
-                    f"plan trace: task={task_id} episode={episode_idx} success={done} frames={tracker.frame} "
-                    f"releases={tracker.releases} final_plan_index={tracker.plan_index} of {num_plans}"
+                    f"plan trace: task={task_id} episode={episode_idx} success={done} "
+                    f"frames={plan.tracker.frame} {plan.trace()}"
                 )
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")

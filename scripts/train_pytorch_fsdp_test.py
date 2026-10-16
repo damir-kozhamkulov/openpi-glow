@@ -32,7 +32,6 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 from openpi.glow.model_config import GlowPi0Config
 import openpi.models_pytorch.gemma_pytorch as gemma_pytorch
 from openpi.models_pytorch.glow_pi0_pytorch import GlowPI0Pytorch
-from openpi.models_pytorch.glow_pi0_pytorch import _select_rows
 from openpi.models_pytorch.glow_pi0_pytorch_test import B
 from openpi.models_pytorch.glow_pi0_pytorch_test import _cfg
 from openpi.models_pytorch.glow_pi0_pytorch_test import _make_obs
@@ -101,11 +100,28 @@ def _make_model(ce_weight: float) -> torch.nn.Module:
     return model
 
 
+def _select_rows(observation, selected):
+    """The observation restricted to the `selected` batch rows."""
+
+    def sel(x):
+        return None if x is None else x[selected]
+
+    return observation.replace(
+        images={k: v[selected] for k, v in observation.images.items()},
+        image_masks={k: v[selected] for k, v in observation.image_masks.items()},
+        state=observation.state[selected],
+        tokenized_prompt=sel(observation.tokenized_prompt),
+        tokenized_prompt_mask=sel(observation.tokenized_prompt_mask),
+        token_ar_mask=sel(observation.token_ar_mask),
+        token_loss_mask=sel(observation.token_loss_mask),
+    )
+
+
 def _batch(step: int, rows: slice):
-    """Step `step`'s batch of 4 restricted to `rows`. Rows 0 and 2 carry a 6-token subtask
-    block, so each half holds the same number of CE targets and the per-rank CE means average
+    """Step `step`'s batch of 4 restricted to `rows`. Every row carries a plan block of the same
+    length, so each half holds the same number of CE targets and the per-rank CE means average
     to the full-batch mean."""
-    obs = _make_obs(100 + step, with_block=True, block_rows=(0, 2))
+    obs = _make_obs(100 + step, block_seed=1100 + step)
     g = torch.Generator().manual_seed(200 + step)
     actions = torch.randn(B, 10, 32, generator=g)
     noise = torch.randn(B, 10, 32, generator=g)
@@ -304,8 +320,8 @@ def test_checkpoint_files_match_single_process_format(runs):
 
 
 def test_accumulation_matches_full_batch(tmp_path):
-    # Flow loss only: with the CE term, micro-batches that hold no subtask target weight the CE
-    # differently from the full batch whatever the parallelism.
+    # Flow loss only: the CE term is a mean over target tokens, so micro-batch means reproduce the
+    # full-batch mean only when every micro-batch holds the same number of them.
     reference = _reference(tmp_path, 0.0)
     accumulated = _run_fsdp(tmp_path, 0.0, "accum")
     torch.testing.assert_close(accumulated["grad_norm"], reference["grad_norm"], rtol=1e-4, atol=0)

@@ -5,7 +5,6 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
-import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -361,31 +360,29 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
-    """LIBERO pipeline plus GLOW's plan clause and subtask target.
+    """LIBERO pipeline plus GLOW's plan state: previous plan in the prompt, current plan as target.
 
     Differences from `LeRobotLiberoDataConfig`: the repack keeps `episode_index` / `frame_index`
-    so the active plan can be looked up, and the model transforms insert `GlowPlanPrompt` before
-    the stock tokenizer and `GlowTokenizeSubtask` after it. Everything else (images, state,
-    actions, normalization, tokenizer, max_token_len) is the stock pi05 pipeline.
+    so the plan state can be looked up, and the model transforms insert `GlowPlanState` before
+    the stock tokenizer and `GlowTokenizePlan` after it. Everything else (images, state, actions,
+    normalization, tokenizer, max_token_len) is the stock pi05 pipeline.
     """
 
     # Plan pack path; None resolves $OPENPI_PLAN_PACK, then the in-image default.
     plan_pack_path: str | None = None
-    # Probability of serving a training sample without the clause (it then carries the subtask
-    # target instead). Required: every row states it, so no row can inherit 0.0 by accident.
-    plan_dropout_p: float | None = None
-    # Clause layout, one of plan_pack.CLAUSES: "stage" (instruction + anchors) or "module" (the
-    # planning module's Spatial and Temporal fields).
-    plan_clause: str = "stage"
-    # Carry the digitized aggregate anchors in the clause (ablation: instruction only).
+    # Frames between the input plan and the target plan. Required, like plan_corrupt_p: every row
+    # states both, so no row inherits a value by accident.
+    plan_delta: int | None = None
+    # Probability that a training sample's input plan is replaced by another stage of its task.
+    plan_corrupt_p: float | None = None
+    # Grounding in the rendered plans: the object / target nouns and their digitized anchor bins.
+    plan_nouns: bool = True
     plan_anchors: bool = True
-    # Also carry the next stage's anchors in the `Next:` clause.
-    plan_lookahead_anchors: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.plan_dropout_p is None:
-            raise ValueError("LeRobotLiberoGlowDataConfig.plan_dropout_p must be set explicitly (e.g. 0.3)")
+        if self.plan_delta is None or self.plan_corrupt_p is None:
+            raise ValueError("LeRobotLiberoGlowDataConfig.plan_delta and plan_corrupt_p must be set explicitly")
         if model_config.model_type != ModelType.PI05:
             raise ValueError("GLOW is defined for the pi05 model type")
         assert isinstance(model_config, pi0_config.Pi0Config)
@@ -407,15 +404,9 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
             ]
         )
         pack = _plan_pack.PlanPack.load(self.plan_pack_path)
-        # Serving takes only a config name, so the anchors-off diagnostic (evaluate a checkpoint
-        # trained with anchors on clauses without them) is switched through the environment.
-        anchors = self.plan_anchors
-        if (env_anchors := os.environ.get("OPENPI_PLAN_ANCHORS", "").strip()) != "":
-            anchors = env_anchors.lower() in ("1", "true", "yes", "on")
-            logging.info(f"OPENPI_PLAN_ANCHORS={env_anchors!r}: plan clause anchors {'on' if anchors else 'OFF'}")
         # Splice the two GLOW transforms into the stock pi05 list the parent already built - the
-        # clause rewrite immediately before the tokenizer, the target block immediately after -
-        # and reuse that tokenizer, so the SentencePiece model is loaded once.
+        # prompt rewrite immediately before the tokenizer, the plan block immediately after - and
+        # reuse that tokenizer, so the SentencePiece model is loaded once.
         stock = list(base.model_transforms.inputs)
         at_tokenize = [n for n, t in enumerate(stock) if isinstance(t, _transforms.TokenizePrompt)]
         if len(at_tokenize) != 1:
@@ -425,15 +416,15 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
             base.model_transforms,
             inputs=[
                 *stock[:i],
-                _plan_prompt.GlowPlanPrompt(
+                _plan_prompt.GlowPlanState(
                     pack,
-                    dropout_p=self.plan_dropout_p,
-                    clause=self.plan_clause,
-                    anchors=anchors,
-                    lookahead_anchors=self.plan_lookahead_anchors,
+                    delta=self.plan_delta,
+                    corrupt_p=self.plan_corrupt_p,
+                    nouns=self.plan_nouns,
+                    anchors=self.plan_anchors,
                 ),
                 stock[i],
-                _plan_prompt.GlowTokenizeSubtask(stock[i].tokenizer),
+                _plan_prompt.GlowTokenizePlan(stock[i].tokenizer),
                 *stock[i + 1 :],
             ],
         )
@@ -846,14 +837,13 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-    # GLOW: pi05_libero with the plan clause in the prompt and the subtask CE head. Identical
-    # recipe (batch, schedule, optimizer, EMA, weights); rows differ only in the GLOW fields:
-    #   --data.plan-dropout-p 0.3         held constant across every clause-carrying row
-    #   --model.subtask-ce-weight 0.1     0 = plan clause only (no CE pass)
-    #   --data.no-plan-anchors            instruction-only clause
+    # GLOW unified model: pi05_libero whose prompt carries the plan state delta frames earlier
+    # ("{task}. Was: {plan}") and which predicts the current plan ("Now: {plan}", cross-entropy
+    # weighted by subtask_ce_weight) jointly with the actions. Identical recipe otherwise (batch,
+    # schedule, optimizer, EMA, weights). plan_delta = 5 is the LIBERO client's replan interval.
     # norm_stats are shared with pi05_libero via --data.assets.assets-dir (the entrypoint sets it).
     TrainConfig(
-        name="pi05_libero_glow",
+        name="pi05_libero_glow_unified",
         model=glow_model_config.GlowPi0Config(
             pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.1
         ),
@@ -861,7 +851,8 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            plan_dropout_p=0.3,
+            plan_delta=5,
+            plan_corrupt_p=0.25,
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -876,20 +867,21 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-    # GLOW planning module as input: pi05_libero_glow with the "module" clause (Spatial: atom,
-    # subgoal_operation, object / target nouns and anchors; Temporal: stage k of K, runtime_key)
-    # and no CE pass. The 30% plan-dropped samples train on the stock prompt.
+    # Grounding ablation: pi05_libero_glow_unified with the object / target nouns and anchor bins
+    # removed from every rendered plan (input and target alike).
     TrainConfig(
-        name="pi05_libero_glow_module",
+        name="pi05_libero_glow_unified_nogrounding",
         model=glow_model_config.GlowPi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.0
+            pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.1
         ),
         data=LeRobotLiberoGlowDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            plan_dropout_p=0.3,
-            plan_clause="module",
+            plan_delta=5,
+            plan_corrupt_p=0.25,
+            plan_nouns=False,
+            plan_anchors=False,
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(

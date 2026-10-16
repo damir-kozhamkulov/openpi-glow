@@ -80,9 +80,10 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
-        # GLOW plan-state keys, consumed by the GlowPlanPrompt model transform: the dataset's
-        # episode/frame at training, the client's stage tracker at inference. Absent otherwise.
-        for key in ("episode_index", "frame_index", "plan_index"):
+        # GLOW plan-state keys, consumed by the GlowPlanState model transform: the dataset's
+        # episode/frame at training; at inference the model's previous plan as echoed by the
+        # client, plus an optional oracle plan. Absent otherwise.
+        for key in ("episode_index", "frame_index", "prev_plan_index", "oracle_plan_index"):
             if key in data:
                 inputs[key] = data[key]
 
@@ -103,4 +104,10 @@ class LiberoOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][..., :7])}
+        out = {"actions": np.asarray(data["actions"][..., :7])}
+        # GLOW: the model's plan choice (a plan index when every stage was a candidate) and the
+        # candidate scores; the client echoes the choice back as the next query's previous plan.
+        for key in ("plan_choice", "plan_logp"):
+            if key in data:
+                out[key] = np.asarray(data[key])
+        return out

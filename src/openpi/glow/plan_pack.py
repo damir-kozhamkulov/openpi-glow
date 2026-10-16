@@ -1,8 +1,10 @@
 """The plan pack: per-task plan chains with evaluation-legal anchors, and per-episode stage ranges.
 
 Built by glow_repo/scripts/build_plan_pack.py (format "glow-plan-pack/1"). Training looks up the
-active plan by (episode_index, frame_index); the evaluation client tracks it with the gripper and
-sends plan_index. Both render the clause through `render_clause`, so the two cannot drift.
+plan state at any frame by (episode_index, frame_index); at evaluation the plan state comes from
+the model's own previous prediction (or the client's stage tracker, as an oracle). Every plan
+string, input or target, training or evaluation, is rendered by `render_plan`, so they cannot
+drift.
 """
 
 import bisect
@@ -14,14 +16,6 @@ import pathlib
 FORMAT = "glow-plan-pack/1"
 DEFAULT_PATH = "/app/glow/plan_pack.json"
 ENV_VAR = "OPENPI_PLAN_PACK"
-PLAN_OFF = -1  # plan_index value the client sends to force the clause off (diagnostic)
-# Clause layouts `render_clause` can produce:
-#   stage   "{task}. Plan k of K: {subgoal_operation}; object x y z; target x y z. Next: ..."
-#   module  the planning module's Spatial fields (atom, subgoal_operation, object / target nouns
-#           and anchors) and Temporal fields (stage k of K, runtime_key):
-#           "{task}. Stage k of K [{runtime_key}]: {subgoal_operation}. {atom}; object {noun} x y z;
-#           target {noun} x y z. Next: ..."
-CLAUSES = ("stage", "module")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,58 +126,29 @@ class PlanPack:
             ) from None
         return episode.plan_index(frame_index)
 
-    def subtask(self, prompt: str, plan_index: int) -> str:
-        return self.task(prompt).stages[plan_index].subgoal_operation
+    def render_plan(self, prompt: str, plan_index: int, *, nouns: bool = True, anchors: bool = True) -> str:
+        """The plan state at `plan_index` of `prompt`'s task, without the task string:
 
-    def render_clause(
-        self,
-        prompt: str,
-        plan_index: int,
-        *,
-        clause: str = "stage",
-        anchors: bool = True,
-        lookahead_anchors: bool = False,
-    ) -> str:
-        """The prompt with the plan at `plan_index` appended, in the `clause` layout (see CLAUSES).
+            "Stage k of K [{runtime_key}]: {subgoal_operation}. {atom}; object {noun} x y z; target {noun} x y z"
 
-        The `Next:` clause is omitted at the final stage (and for K = 1). Anchor bins are omitted
-        where the stage has none, and a module-layout object / target fragment where the stage has
-        neither a noun nor bins. plan_index == PLAN_OFF returns the stock prompt.
+        Temporal fields (stage k of K, runtime_key) first, so the stage decision precedes the
+        fields it determines; then the Spatial fields (subgoal_operation, atom, grounding).
+        `nouns` / `anchors` drop the grounded nouns / the digitized anchor bins; an object or
+        target fragment left with neither is omitted, as is one for a stage without that role.
         """
-        if clause not in CLAUSES:
-            raise ValueError(f"clause must be one of {CLAUSES}, got {clause!r}")
-        if plan_index == PLAN_OFF:
-            return prompt
         task = self.task(prompt)
         if not 0 <= plan_index < task.num_plans:
             raise IndexError(f"plan_index {plan_index} outside 0..{task.num_plans - 1} for {prompt!r}")
         stage = task.stages[plan_index]
-        if clause == "module":
-            text = (
-                f"{prompt}. Stage {plan_index + 1} of {task.num_plans} [{stage.runtime_key}]: "
-                f"{stage.subgoal_operation}. {stage.atom}"
-            )
-            text += _grounding_fragment("object", stage.object_noun, stage.object_bins if anchors else None)
-            text += _grounding_fragment("target", stage.target_noun, stage.target_bins if anchors else None)
-        else:
-            text = f"{prompt}. Plan {plan_index + 1} of {task.num_plans}: {stage.subgoal_operation}"
-            if anchors:
-                text += _anchor_fragments(stage)
-        if plan_index + 1 < task.num_plans:
-            nxt = task.stages[plan_index + 1]
-            text += f". Next: {nxt.subgoal_operation}"
-            if anchors and lookahead_anchors:
-                text += _anchor_fragments(nxt)
+        text = (
+            f"Stage {plan_index + 1} of {task.num_plans} [{stage.runtime_key}]: {stage.subgoal_operation}. {stage.atom}"
+        )
+        for role, noun, bins in (
+            ("object", stage.object_noun, stage.object_bins),
+            ("target", stage.target_noun, stage.target_bins),
+        ):
+            text += _grounding_fragment(role, noun if nouns else "", bins if anchors else None)
         return text
-
-
-def _anchor_fragments(stage: Stage) -> str:
-    text = ""
-    if stage.object_bins is not None:
-        text += "; object " + " ".join(str(b) for b in stage.object_bins)
-    if stage.target_bins is not None:
-        text += "; target " + " ".join(str(b) for b in stage.target_bins)
-    return text
 
 
 def _grounding_fragment(role: str, noun: str, bins: tuple[int, int, int] | None) -> str:

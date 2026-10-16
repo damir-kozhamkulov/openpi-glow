@@ -764,8 +764,8 @@ def train_loop(config: _config.TrainConfig):
             with sync_context:
                 # Forward pass
                 losses = model(observation, actions)
-                # A model may return {"loss": scalar, <term>: scalar, ...} (GLOW: flow + subtask
-                # CE); the stock model returns the per-element flow loss.
+                # A model may return {"loss": scalar, <term>: scalar, ...} (GLOW: flow + plan CE);
+                # the stock model returns the per-element flow loss.
                 terms = {}
                 if isinstance(losses, dict):
                     loss = losses["loss"]
@@ -849,8 +849,8 @@ def train_loop(config: _config.TrainConfig):
                 # accumulator is not moving.
                 ema_distance = ema.relative_distance(model) if ema is not None else None
 
-                # Extra loss terms (GLOW: flow, subtask_ce, ce_samples), averaged over the
-                # steps that reported them.
+                # Extra loss terms (GLOW: flow, plan_ce, plan_token_acc, plan_exact, ce_samples),
+                # averaged over the steps that reported them.
                 term_keys = sorted({k for info in infos for k in info if k.startswith("term/")})
                 avg_terms = {
                     k[len("term/") :]: sum(info[k] for info in infos if k in info) / sum(1 for info in infos if k in info)
