@@ -13,11 +13,26 @@ next query's previous plan. Modes:
   self    the server scores every stage and returns its choice (`plan_choice`)
   oracle  the tracker's stage is sent as `oracle_plan_index` and used as the plan
   forced  a fixed stage is sent as `oracle_plan_index` (counterfactual: do actions follow it?)
-The tracker runs in every mode, so the model's plan can be compared against it.
+The tracker runs in every mode, so the model's plan can be compared against it. When the plans
+come from another task than the environment's (steering), `tracker_plans` is the environment
+task's stage count and `num_plans` the plan task's.
 """
 
 HOLD_MIN = 30
 PLAN_MODES = ("self", "oracle", "forced")
+
+
+def plan_task_for(task_names, task_id, offset):
+    """The task whose plans steer environment task `task_id`: suite task (task_id + offset) mod n.
+
+    offset 0 is the environment's own task; any other offset in 1..n-1 is a derangement (no task
+    keeps its own plans).
+    """
+    if not task_names:
+        raise ValueError("task_names is empty")
+    if offset < 0:
+        raise ValueError("offset must be >= 0, got {}".format(offset))
+    return task_names[(task_id + offset) % len(task_names)]
 
 
 class StageTracker:
@@ -59,7 +74,7 @@ class StageTracker:
 
 
 class PlanEcho:
-    def __init__(self, mode, num_plans, forced_index=None, hold_min=HOLD_MIN):
+    def __init__(self, mode, num_plans, forced_index=None, hold_min=HOLD_MIN, tracker_plans=None):
         if mode not in PLAN_MODES:
             raise ValueError("mode must be one of {}, got {!r}".format(PLAN_MODES, mode))
         if mode == "forced":
@@ -70,7 +85,7 @@ class PlanEcho:
         self.mode = mode
         self.num_plans = num_plans
         self.forced_index = forced_index
-        self.tracker = StageTracker(num_plans, hold_min=hold_min)
+        self.tracker = StageTracker(num_plans if tracker_plans is None else tracker_plans, hold_min=hold_min)
         self.prev = 0
         self.queries = 0
         self.agreements = 0  # queries whose plan equals the tracker's stage

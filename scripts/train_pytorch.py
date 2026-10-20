@@ -704,7 +704,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Training precision: {model_cfg.dtype} (TF32 matmuls: {torch.backends.cuda.matmul.allow_tf32})"
         )
-        episode_subset = _data.resolve_train_episodes()
+        episode_subset = _data.resolve_train_episodes(data_config.train_episodes)
         logging.info(
             f"Batch: {config.batch_size} per optimizer step "
             f"({effective_batch_size}/GPU x {world_size} GPUs x {accum_steps} accumulation); "

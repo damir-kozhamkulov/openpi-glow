@@ -69,3 +69,27 @@ def test_forced_mode():
     assert echo.update({"plan_choice": 0}) == 1
     assert echo.request() == {"prev_plan_index": 1, "oracle_plan_index": 1}
     assert echo.agreements == 0  # the tracker is still at stage 1
+
+
+def test_steering_counts_plans_and_tracks_the_environment():
+    """A steering task's plans index num_plans; the tracker counts the environment task's stages."""
+    echo = gst.PlanEcho("forced", 1, forced_index=0, tracker_plans=2)
+    assert echo.num_plans == 1 and echo.tracker.num_plans == 2
+    for t in range(gst.HOLD_MIN + 2):
+        echo.observe(1.0 if t <= gst.HOLD_MIN else -1.0)  # one qualifying grasp-release cycle
+    assert echo.tracker.plan_index == 1  # the environment advanced; the steering plan stays at 0
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0}
+    assert echo.update({}) == 0 and echo.agreements == 0
+    assert gst.PlanEcho("self", 2).tracker.num_plans == 2  # default: the plans' own count
+
+
+def test_plan_task_for_is_a_derangement():
+    names = ["a", "b", "c"]
+    assert [gst.plan_task_for(names, i, 0) for i in range(3)] == names  # offset 0: own plans
+    shifted = [gst.plan_task_for(names, i, 1) for i in range(3)]
+    assert shifted == ["b", "c", "a"] and all(s != n for s, n in zip(shifted, names))
+    assert gst.plan_task_for(names, 2, 4) == "a"  # wraps
+    with pytest.raises(ValueError):
+        gst.plan_task_for(names, 0, -1)
+    with pytest.raises(ValueError):
+        gst.plan_task_for([], 0, 1)

@@ -127,17 +127,22 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def resolve_train_episodes() -> list[int] | None:
-    """Episode subset to train on, from `OPENPI_TRAIN_EPISODES`.
+def resolve_train_episodes(default: str | None = None) -> list[int] | None:
+    """Episode subset to train on, from `OPENPI_TRAIN_EPISODES`, else `default` (the config's).
 
     Accepts a half-open range `start:stop` or a comma-separated list of indices; unset or empty
     means the whole dataset. Restricting the episodes does not change the assets path, so
     `norm_stats` computed over the full dataset stay in use and checkpoints remain compatible
     with the released ones.
 
-    For `physical-intelligence/libero`, LIBERO-10 is `0:379` (task indices 0-9, 101,469 frames).
+    The subset must be episodes 0..n-1: the pinned LeRobot looks a sample's episode up in its
+    per-episode index table by absolute episode number, so any other subset fails (or reads the
+    wrong rows) once an episode number reaches the subset's size.
+
+    For `physical-intelligence/libero`, LIBERO-10 is `0:379` (task indices 0-9, 101,469 frames)
+    and LIBERO-10 + LIBERO-Goal is `0:807`.
     """
-    spec = os.environ.get("OPENPI_TRAIN_EPISODES", "").strip()
+    spec = (os.environ.get("OPENPI_TRAIN_EPISODES", "").strip() or (default or "")).strip()
     if not spec:
         return None
     if ":" in spec:
@@ -145,10 +150,16 @@ def resolve_train_episodes() -> list[int] | None:
         start, stop = int(start_str), int(stop_str)
         if start < 0 or stop <= start:
             raise ValueError(f"OPENPI_TRAIN_EPISODES range must be start:stop with stop > start >= 0, got {spec!r}")
-        return list(range(start, stop))
-    episodes = [int(part) for part in spec.split(",") if part.strip()]
-    if not episodes:
-        raise ValueError(f"OPENPI_TRAIN_EPISODES parsed to an empty episode list: {spec!r}")
+        episodes = list(range(start, stop))
+    else:
+        episodes = [int(part) for part in spec.split(",") if part.strip()]
+        if not episodes:
+            raise ValueError(f"OPENPI_TRAIN_EPISODES parsed to an empty episode list: {spec!r}")
+    if episodes != list(range(len(episodes))):
+        raise ValueError(
+            f"episode subset {spec!r} is not episodes 0..n-1, which the pinned LeRobot requires "
+            "(it indexes its per-episode table by absolute episode number)"
+        )
     return episodes
 
 
@@ -162,7 +173,7 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    episodes = resolve_train_episodes()
+    episodes = resolve_train_episodes(data_config.train_episodes)
     if episodes is not None:
         logging.info(f"Training on an episode subset: {len(episodes)} episodes ({episodes[0]}..{episodes[-1]})")
 

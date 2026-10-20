@@ -93,6 +93,10 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Episode subset to train on, as OPENPI_TRAIN_EPISODES spells it ("start:stop" or a comma
+    # list); the environment variable overrides it. None: the whole dataset.
+    train_episodes: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -174,6 +178,8 @@ class DataConfigFactory(abc.ABC):
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
+    # Episode subset (DataConfig.train_episodes); None: the whole dataset.
+    train_episodes: str | None = None
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -188,6 +194,7 @@ class DataConfigFactory(abc.ABC):
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            train_episodes=self.train_episodes,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -366,6 +373,9 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     so the plan state can be looked up, and the model transforms insert `GlowPlanState` before
     the stock tokenizer and `GlowTokenizePlan` after it. Everything else (images, state, actions,
     normalization, tokenizer, max_token_len) is the stock pi05 pipeline.
+
+    `plan_as_prompt` instead inserts `GlowPlanAsPrompt` before the tokenizer: the active plan
+    replaces the prompt, with no previous plan and no plan block.
     """
 
     # Plan pack path; None resolves $OPENPI_PLAN_PACK, then the in-image default.
@@ -378,11 +388,21 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     # Grounding in the rendered plans: the object / target nouns and their digitized anchor bins.
     plan_nouns: bool = True
     plan_anchors: bool = True
+    # Append the plan block twice, the second copy for the actions; must match the model's
+    # GlowPi0Config.plan_bottleneck.
+    plan_bottleneck: bool = False
+    # The active plan is the whole prompt (the task string is dropped); plan_delta and
+    # plan_corrupt_p do not apply.
+    plan_as_prompt: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.plan_delta is None or self.plan_corrupt_p is None:
+        if self.plan_as_prompt and self.plan_bottleneck:
+            raise ValueError("LeRobotLiberoGlowDataConfig: plan_as_prompt and plan_bottleneck exclude each other")
+        if not self.plan_as_prompt and (self.plan_delta is None or self.plan_corrupt_p is None):
             raise ValueError("LeRobotLiberoGlowDataConfig.plan_delta and plan_corrupt_p must be set explicitly")
+        if bool(getattr(model_config, "plan_bottleneck", False)) != self.plan_bottleneck:
+            raise ValueError("LeRobotLiberoGlowDataConfig.plan_bottleneck must match the model's plan_bottleneck")
         if model_config.model_type != ModelType.PI05:
             raise ValueError("GLOW is defined for the pi05 model type")
         assert isinstance(model_config, pi0_config.Pi0Config)
@@ -412,6 +432,10 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
         if len(at_tokenize) != 1:
             raise ValueError(f"expected one TokenizePrompt in the pi05 model transforms, got {len(at_tokenize)}")
         i = at_tokenize[0]
+        if self.plan_as_prompt:
+            plan = [_plan_prompt.GlowPlanAsPrompt(pack, nouns=self.plan_nouns, anchors=self.plan_anchors), stock[i]]
+            model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
+            return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
         model_transforms = dataclasses.replace(
             base.model_transforms,
             inputs=[
@@ -424,7 +448,7 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                     anchors=self.plan_anchors,
                 ),
                 stock[i],
-                _plan_prompt.GlowTokenizePlan(stock[i].tokenizer),
+                _plan_prompt.GlowTokenizePlan(stock[i].tokenizer, action_block=self.plan_bottleneck),
                 *stock[i + 1 :],
             ],
         )
@@ -895,6 +919,100 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    # Plan bottleneck: pi05_libero_glow_unified with the actions reading language only through a
+    # copy of the plan block (GlowPI0Pytorch's module docstring), trained on LIBERO-10 + LIBERO-Goal
+    # (episodes 0-806; Goal is ten goals in one scene, so only the plan tells the actions which).
+    # Plans come from the LIBERO-10 + Goal pack. Batch 32 x 5k steps from the converged
+    # pi05_libero, with the recipe's peak LR scaled to batch 32 (5e-5 x 32/256) and a cosine decay
+    # to a tenth by the last step. max_token_len 272: the longest prompt + two plan blocks in that
+    # pack is 265 tokens.
+    # Same-data baseline for pi05_libero_glow_bottleneck: the stock pi05_libero model and pipeline
+    # on the same episodes (LIBERO-10 + LIBERO-Goal, 0-806) with the same schedule, budget and
+    # initialization, so a bottleneck row's delta is against a model that saw the same
+    # demonstrations.
+    TrainConfig(
+        name="pi05_libero_10_goal",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            train_episodes="0:807",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=6.25e-6,
+            decay_steps=5_000,
+            decay_lr=6.25e-7,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=5_000,
+    ),
+    # Plan as the prompt: the stock pi05_libero model whose only language input is the active plan
+    # (the task string is dropped), on LIBERO-10 + LIBERO-Goal with pi05_libero_10_goal's recipe.
+    # Plans are the labels at training; at evaluation the LIBERO client sends the stage (its
+    # tracker's, or a forced one) and optionally another task to steer by.
+    TrainConfig(
+        name="pi05_libero_plan_prompt",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoGlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
+            plan_as_prompt=True,
+            train_episodes="0:807",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=6.25e-6,
+            decay_steps=5_000,
+            decay_lr=6.25e-7,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=5_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_glow_bottleneck",
+        model=glow_model_config.GlowPi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            subtask_ce_weight=0.1,
+            plan_bottleneck=True,
+            max_token_len=272,
+        ),
+        data=LeRobotLiberoGlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
+            plan_delta=5,
+            plan_corrupt_p=0.25,
+            plan_bottleneck=True,
+            train_episodes="0:807",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=6.25e-6,
+            decay_steps=5_000,
+            decay_lr=6.25e-7,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=5_000,
     ),
     #
     # Fine-tuning Aloha configs.

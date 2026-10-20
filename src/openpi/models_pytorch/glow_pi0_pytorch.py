@@ -17,6 +17,18 @@ Prefix layout (openpi.glow.plan_prompt builds the tokens):
   one plan block. One prefix pass over the B*K rows scores each block by its summed token
   log-likelihood, the argmax is the chosen plan, and its row's KV cache conditions the stock
   denoising loop. K = 1 is a given plan (an oracle or forced plan, or a one-stage task).
+
+Plan bottleneck (`config.plan_bottleneck`): each row also carries a second copy of the plan, the
+action block (causal, no loss), after the planner block:
+
+    [images][task. Was: <plan t-delta> \n][Now: <plan t> eos][Now: <plan t> eos][actions]
+     V       P                             Q (planner, CE)    A (action block)
+
+and attention is cut so that language reaches the actions only as the plan's own tokens:
+V reads V; P reads V, P; Q reads V, P, Q; A reads V, A; the actions read V, A. Hiding only P from
+the actions would not do it: in the stock prefix V and P read each other, and Q reads P, so both
+carry the task string into every layer the action expert attends to. Position ids are unchanged
+(every token keeps its place in the row).
 """
 
 import math
@@ -31,6 +43,43 @@ class GlowPI0Pytorch(pi0_pytorch.PI0Pytorch):
     def __init__(self, config):
         super().__init__(config)
         self.subtask_ce_weight = float(config.subtask_ce_weight)
+        self.plan_bottleneck = bool(getattr(config, "plan_bottleneck", False))
+
+    def _hidden_language(self, lang_masks, ar_mask, loss_mask):
+        """(hidden, action): the language columns the action path must not read - the prompt and
+        the planner block - and the action-block tokens, both [B, L]; None without the bottleneck.
+
+        Groups follow the masks: the prompt is ar 0, the planner block is causal with a loss, the
+        action block is causal without one. Raises if action-block tokens arrive without the
+        bottleneck (they would be extra causal tokens the action expert reads) or if the bottleneck
+        sees a row whose planner block has no action block.
+        """
+        if ar_mask is None or loss_mask is None:
+            if self.plan_bottleneck:
+                raise ValueError("the plan bottleneck needs plan blocks (token_ar_mask / token_loss_mask)")
+            return None
+        causal = lang_masks & ar_mask.to(torch.bool)
+        planner = causal & loss_mask.to(torch.bool)
+        action = causal & ~loss_mask.to(torch.bool)
+        if not self.plan_bottleneck:
+            if bool(action.any()):
+                raise ValueError("action-block tokens (causal, no loss) need config.plan_bottleneck")
+            return None
+        if not bool((action.any(dim=1) == planner.any(dim=1)).all()):
+            raise ValueError("under the plan bottleneck every row with a planner block needs an action block")
+        return (lang_masks & ~causal) | planner, action
+
+    @staticmethod
+    def _cut_action_path(att_2d, hidden, action, num_img):
+        """Clear what the action path reads of `hidden` ([B, L] language columns): image rows,
+        action-block rows and every row after the prefix (the suffix) lose those columns."""
+        att_2d = att_2d.clone()
+        lang = slice(num_img, num_img + hidden.shape[1])
+        keep = ~hidden[:, None, :]
+        att_2d[:, :num_img, lang] &= keep
+        att_2d[:, lang, lang] &= ~(action[:, :, None] & hidden[:, None, :])
+        att_2d[:, num_img + hidden.shape[1] :, lang] &= keep
+        return att_2d
 
     def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, lang_ar_mask=None, image_repeats=1):
         """Stock `embed_prefix`, plus a language autoregressive mask and repeated image embeddings.
@@ -98,7 +147,11 @@ class GlowPI0Pytorch(pi0_pytorch.PI0Pytorch):
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks_4d = self._prepare_attention_masks_4d(pi0_pytorch.make_att_2d_masks(pad_masks, att_masks))
+        att_2d_masks = pi0_pytorch.make_att_2d_masks(pad_masks, att_masks)
+        cut = self._hidden_language(lang_masks, observation.token_ar_mask, observation.token_loss_mask)
+        if cut is not None:
+            att_2d_masks = self._cut_action_path(att_2d_masks, *cut, prefix_pad_masks.shape[1] - lang_tokens.shape[1])
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
@@ -203,9 +256,12 @@ class GlowPI0Pytorch(pi0_pytorch.PI0Pytorch):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, ar_mask, image_repeats=num_cand
         )
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
-            pi0_pytorch.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        )
+        prefix_att_2d_masks = pi0_pytorch.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        cut = self._hidden_language(lang_masks, ar_mask, loss_mask)
+        num_img = prefix_pad_masks.shape[1] - lang_tokens.shape[1]
+        if cut is not None:
+            prefix_att_2d_masks = self._cut_action_path(prefix_att_2d_masks, *cut, num_img)
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
@@ -224,13 +280,51 @@ class GlowPI0Pytorch(pi0_pytorch.PI0Pytorch):
         if num_cand > 1:
             past_key_values.batch_select_indices(rows)
         prefix_pad_masks = prefix_pad_masks[rows]
+        # What the actions attend to: the winner's prefix, minus the prompt and planner block
+        # under the bottleneck. Positions still count every prefix token (prefix_pad_masks).
+        suffix_visible = prefix_pad_masks
+        if cut is not None:
+            suffix_visible = prefix_pad_masks.clone()
+            suffix_visible[:, num_img:] &= ~cut[0][rows]
 
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
-            v_t = self.denoise_step(state, prefix_pad_masks, past_key_values, x_t, time.expand(bsize))
+            v_t = self.denoise_step(
+                state, prefix_pad_masks, past_key_values, x_t, time.expand(bsize), suffix_visible=suffix_visible
+            )
             x_t = x_t + dt * v_t
             time += dt
 
         return {"actions": x_t, "plan_choice": choice, "plan_logp": logp}
+
+    def denoise_step(self, state, prefix_pad_masks, past_key_values, x_t, timestep, suffix_visible=None):
+        """Stock `denoise_step`, except that the suffix attends to `suffix_visible` (default: the
+        whole valid prefix) while its position ids still count every valid prefix token."""
+        visible = prefix_pad_masks if suffix_visible is None else suffix_visible
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = visible[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = pi0_pytorch.make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        outputs_embeds, _ = self.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+        suffix_out = outputs_embeds[1][:, -self.config.action_horizon :].to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out)

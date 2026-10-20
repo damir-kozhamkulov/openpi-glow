@@ -82,3 +82,21 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_resolve_train_episodes(monkeypatch):
+    import pytest
+
+    monkeypatch.delenv("OPENPI_TRAIN_EPISODES", raising=False)
+    assert _data_loader.resolve_train_episodes() is None
+    assert _data_loader.resolve_train_episodes("0:807") == list(range(807))  # the config's default
+    monkeypatch.setenv("OPENPI_TRAIN_EPISODES", "0:379")
+    assert _data_loader.resolve_train_episodes("0:807") == list(range(379))  # the environment wins
+    assert _data_loader.resolve_train_episodes() == list(range(379))
+    monkeypatch.setenv("OPENPI_TRAIN_EPISODES", "0,1,2")
+    assert _data_loader.resolve_train_episodes() == [0, 1, 2]
+    # The pinned LeRobot needs episodes 0..n-1.
+    for spec in ("379:807", "1,2", "0,2"):
+        monkeypatch.setenv("OPENPI_TRAIN_EPISODES", spec)
+        with pytest.raises(ValueError):
+            _data_loader.resolve_train_episodes()

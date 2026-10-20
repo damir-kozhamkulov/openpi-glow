@@ -177,3 +177,154 @@ def test_serving_path_end_to_end(monkeypatch, tmp_path):
     # Both of task 0's stages were scored at every query, and the choice is their argmax.
     assert all(len(q["logp"]) == 2 and q["plan"] == int(np.argmax(q["logp"])) for q in queries)
     assert all(np.isfinite(q["logp"]).all() and max(q["logp"]) < 0 for q in queries)
+
+
+GOAL_PACK = REPO / "derived/plan_pack_libero10_goal.json"
+
+
+@pytest.mark.skipif(
+    not ((DATASET / "meta/info.json").exists() and GOAL_PACK.exists() and NORM_STATS.exists()),
+    reason="local LeRobot copy, LIBERO-10 + Goal pack or norm_stats not present",
+)
+def test_bottleneck_serving_path_end_to_end(monkeypatch, tmp_path):
+    """A dummy-size pi05_libero_glow_bottleneck checkpoint served as an evaluation server serves it,
+    on a LIBERO-Goal episode, plus a steered query (another goal's plan, the episode's prompt)."""
+    import dataclasses
+    import json
+    import shutil
+
+    import safetensors.torch
+    import torch
+    from transformers.models.auto import CONFIG_MAPPING
+
+    import openpi.models_pytorch.gemma_pytorch as gemma_pytorch
+    from openpi.policies import policy_config
+    import openpi.shared.download as download
+    import openpi.training.config as _config
+
+    orig = CONFIG_MAPPING["paligemma"]
+
+    def tiny():
+        cfg = orig()
+        cfg.vision_config.hidden_size = 32
+        cfg.vision_config.num_hidden_layers = 2
+        cfg.vision_config.num_attention_heads = 4
+        cfg.vision_config.patch_size = 56
+        return cfg
+
+    monkeypatch.setattr(gemma_pytorch, "CONFIG_MAPPING", {**CONFIG_MAPPING, "paligemma": tiny})
+    real_download = download.maybe_download
+    monkeypatch.setattr(
+        download, "maybe_download", lambda p, **k: real_download(p, **k) if "://" in str(p) else pathlib.Path(p)
+    )
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+
+    real = _config.get_config("pi05_libero_glow_bottleneck")
+    cfg = dataclasses.replace(
+        real,
+        model=dataclasses.replace(
+            real.model, paligemma_variant="dummy", action_expert_variant="dummy", pytorch_compile_mode=None
+        ),
+        data=dataclasses.replace(real.data, plan_pack_path=str(GOAL_PACK)),
+    )
+    monkeypatch.setattr(_config, "get_config", lambda name: cfg)
+    ckpt = tmp_path / "ckpt"
+    (ckpt / "assets/physical-intelligence/libero").mkdir(parents=True)
+    shutil.copy(NORM_STATS, ckpt / "assets/physical-intelligence/libero/norm_stats.json")
+    torch.manual_seed(0)
+    safetensors.torch.save_model(cfg.model.create_pytorch(), str(ckpt / "model.safetensors"))
+
+    # The planner over a LIBERO-Goal episode (one-stage goals: one candidate per query).
+    s = gpa.main(gpa.Args(checkpoint_dir=str(ckpt), dataset_dir=str(DATASET), episodes="379:380"))
+    o = s["overall"]
+    assert o["episodes"] == 1 and o["accuracy"] == 1.0 and o["transitions"] == 0
+
+    # Steering through the same server path: the environment's prompt, another goal's plan.
+    policy = policy_config.create_trained_policy(cfg, str(ckpt), sample_kwargs={"num_steps": 1})
+    _, _, frames = gpa.read_episode_frames(DATASET, 379, 5)
+    _, element = next(frames)
+    tasks = {}
+    with open(DATASET / "meta/tasks.jsonl", encoding="utf-8") as f:
+        for line in f:
+            e = json.loads(line)
+            tasks[e["task_index"]] = e["task"]
+    base = {**element, "prompt": tasks[10], "prev_plan_index": 0}
+    own = policy.infer({**base, "oracle_plan_index": 0})
+    steered = policy.infer({**base, "oracle_plan_index": 0, "plan_task": tasks[17]})
+    for out in (own, steered):
+        assert out["actions"].shape == (10, 7) and np.isfinite(out["actions"]).all()
+        assert int(np.asarray(out["plan_choice"])) == 0
+    # Same images and prompt, another plan: the bottlenecked actions move with the plan.
+    assert not np.allclose(own["actions"], steered["actions"])
+
+
+@pytest.mark.skipif(
+    not ((DATASET / "meta/info.json").exists() and GOAL_PACK.exists() and NORM_STATS.exists()),
+    reason="local LeRobot copy, LIBERO-10 + Goal pack or norm_stats not present",
+)
+def test_plan_prompt_serving_path(monkeypatch, tmp_path):
+    """A dummy-size pi05_libero_plan_prompt checkpoint served as an evaluation server serves it:
+    the client's stage becomes the prompt, steering changes it, and a query without one is refused."""
+    import dataclasses
+    import json
+    import shutil
+
+    import safetensors.torch
+    import torch
+    from transformers.models.auto import CONFIG_MAPPING
+
+    import openpi.models_pytorch.gemma_pytorch as gemma_pytorch
+    from openpi.models_pytorch import pi0_pytorch
+    from openpi.policies import policy_config
+    import openpi.shared.download as download
+    import openpi.training.config as _config
+
+    orig = CONFIG_MAPPING["paligemma"]
+
+    def tiny():
+        cfg = orig()
+        cfg.vision_config.hidden_size = 32
+        cfg.vision_config.num_hidden_layers = 2
+        cfg.vision_config.num_attention_heads = 4
+        cfg.vision_config.patch_size = 56
+        return cfg
+
+    monkeypatch.setattr(gemma_pytorch, "CONFIG_MAPPING", {**CONFIG_MAPPING, "paligemma": tiny})
+    real_download = download.maybe_download
+    monkeypatch.setattr(
+        download, "maybe_download", lambda p, **k: real_download(p, **k) if "://" in str(p) else pathlib.Path(p)
+    )
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+    real = _config.get_config("pi05_libero_plan_prompt")
+    cfg = dataclasses.replace(
+        real,
+        model=dataclasses.replace(
+            real.model, paligemma_variant="dummy", action_expert_variant="dummy", pytorch_compile_mode=None
+        ),
+        data=dataclasses.replace(real.data, plan_pack_path=str(GOAL_PACK)),
+    )
+    ckpt = tmp_path / "ckpt"
+    (ckpt / "assets/physical-intelligence/libero").mkdir(parents=True)
+    shutil.copy(NORM_STATS, ckpt / "assets/physical-intelligence/libero/norm_stats.json")
+    torch.manual_seed(0)
+    safetensors.torch.save_model(pi0_pytorch.PI0Pytorch(cfg.model), str(ckpt / "model.safetensors"))
+
+    policy = policy_config.create_trained_policy(cfg, str(ckpt), sample_kwargs={"num_steps": 1})
+    _, _, frames = gpa.read_episode_frames(DATASET, 379, 5)
+    _, element = next(frames)
+    tasks = {}
+    with open(DATASET / "meta/tasks.jsonl", encoding="utf-8") as f:
+        for line in f:
+            e = json.loads(line)
+            tasks[e["task_index"]] = e["task"]
+    base = {**element, "prompt": tasks[10], "prev_plan_index": 0}
+    noise = np.random.default_rng(0).standard_normal((10, 32)).astype(np.float32)
+    own = policy.infer({**base, "oracle_plan_index": 0}, noise=noise)
+    again = policy.infer({**base, "oracle_plan_index": 0}, noise=noise)
+    steered = policy.infer({**base, "oracle_plan_index": 0, "plan_task": tasks[17]}, noise=noise)
+    assert own["actions"].shape == (10, 7) and np.isfinite(own["actions"]).all()
+    assert np.allclose(own["actions"], again["actions"])
+    # Same images, same noise, another goal's plan as the prompt: other actions.
+    assert not np.allclose(own["actions"], steered["actions"])
+    with pytest.raises(ValueError):  # self mode: this model has no planner
+        policy.infer(base, noise=noise)

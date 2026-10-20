@@ -5,6 +5,8 @@ block is causal and invisible to everything before it; the action expert sees it
 trains the VLM and leaves the action expert's gradients untouched. Inference: candidate scores
 equal each candidate's own teacher-forced log-likelihood, the training pass's CE agrees with
 them, and acting from the winner's sliced KV cache equals acting on the winner given outright.
+Plan bottleneck: the prompt and the planner block cannot reach the actions (bitwise, training and
+inference), the action block can, and the planner still reads the prompt.
 
 Runs in-container with `uv pip install --python /venv-server/bin/python pytest pynvml`.
 """
@@ -325,3 +327,106 @@ def test_sample_actions_requires_a_block(models):
     _, _, glow1 = models
     with pytest.raises(ValueError):
         _sample(glow1, _make_obs(5, with_block=False, bsize=2).replace(token_ar_mask=None, token_loss_mask=None), None)
+
+
+# ---- plan bottleneck ---------------------------------------------------------------------------
+
+
+def _bottleneck_obs(seed, block_seed=1000, bsize=B, prompt_seed=None, planner_seed=None, action_seed=None):
+    """Prompt, planner block and action block per row: [prompt][Q: block][A: block copy].
+
+    `prompt_seed` / `planner_seed` / `action_seed` redraw the prompt tokens / the planner block's
+    tokens / the action block's tokens (eos kept, lengths and positions unchanged)."""
+    imgs, masks, state, tokens, tmask, ar, loss = _arrays(seed, block_seed, bsize)
+    for b in range(bsize):
+        n = N_PROMPT[b]
+        tokens[b, n + M : n + 2 * M] = tokens[b, n : n + M]
+        tmask[b, n + M : n + 2 * M] = True
+        ar[b, n + M : n + 2 * M] = 1  # causal, no loss: the action block
+        for redraw, start, length in ((prompt_seed, 0, n), (planner_seed, n, M - 1), (action_seed, n + M, M - 1)):
+            if redraw is not None:
+                g = torch.Generator().manual_seed(redraw + b)
+                tokens[b, start : start + length] = torch.randint(3, 1000, (length,), generator=g)
+    return _obs(imgs, masks, state, tokens, tmask, ar, loss)
+
+
+@pytest.fixture(scope="module")
+def bottleneck(models):
+    from openpi.models_pytorch.glow_pi0_pytorch import GlowPI0Pytorch
+
+    stock = models[0]
+    out = []
+    for weight in (0.0, 0.1):
+        m = GlowPI0Pytorch(_cfg(GlowPi0Config, subtask_ce_weight=weight, plan_bottleneck=True))
+        m.load_state_dict(stock.state_dict())
+        m.gradient_checkpointing_enable()
+        out.append(m)
+    return tuple(out)
+
+
+def test_bottleneck_cuts_language_from_the_actions(bottleneck, batch):
+    b0, _ = bottleneck
+    actions, noise, time = batch
+    ref, _ = _run(b0, _bottleneck_obs(11), actions, noise, time)
+    # The task string and the planner block cannot reach the actions: bitwise the same flow.
+    other_prompt, _ = _run(b0, _bottleneck_obs(11, prompt_seed=500), actions, noise, time)
+    other_planner, _ = _run(b0, _bottleneck_obs(11, planner_seed=600), actions, noise, time)
+    assert torch.equal(ref, other_prompt)
+    assert torch.equal(ref, other_planner)
+    # The action block's own tokens do.
+    other_action, _ = _run(b0, _bottleneck_obs(11, action_seed=700), actions, noise, time)
+    assert not torch.equal(ref, other_action)
+
+
+def test_bottleneck_planner_still_reads_the_prompt(bottleneck, batch):
+    _, b1 = bottleneck
+    actions, noise, time = batch
+    out, grads = _run(b1, _bottleneck_obs(11), actions, noise, time)
+    other, _ = _run(b1, _bottleneck_obs(11, prompt_seed=500), actions, noise, time)
+    # The plan CE covers the planner block only (B rows x M tokens) and depends on the prompt.
+    assert float(out["ce_samples"]) == float(B) and math.isfinite(float(out["plan_ce"]))
+    assert not torch.equal(out["plan_ce"], other["plan_ce"])
+    assert torch.equal(out["flow"], other["flow"])
+    # The CE still reaches no action-expert parameter.
+    _, g_flow = _run(bottleneck[0], _bottleneck_obs(11), actions, noise, time)
+    expert = [n for n in grads if n.startswith(("paligemma_with_expert.gemma_expert", "action_", "time_mlp"))]
+    assert expert and _same_grads(g_flow, grads, expert)
+
+
+def test_bottleneck_inference_matches_training_cut(bottleneck):
+    _, b1 = bottleneck
+    noise = torch.randn(2, 10, 32, generator=torch.Generator().manual_seed(3))
+    ref = _sample(b1, _bottleneck_obs(21, bsize=2), noise)
+    same = _sample(b1, _bottleneck_obs(21, bsize=2, prompt_seed=500, planner_seed=600), noise)
+    assert torch.equal(ref["actions"], same["actions"])
+    assert not torch.equal(ref["plan_logp"], same["plan_logp"])  # the planner did read them
+    moved = _sample(b1, _bottleneck_obs(21, bsize=2, action_seed=700), noise)
+    assert not torch.allclose(ref["actions"], moved["actions"])
+    # Candidates: the winner's cached row acts exactly as that row given outright.
+    rows = [_bottleneck_obs(21, s, bsize=2) for s in (1000, 2000)]
+    joined = _obs(
+        rows[0].images,
+        rows[0].image_masks,
+        rows[0].state,
+        *[
+            torch.cat([getattr(r, k) for r in rows], dim=1)
+            for k in ("tokenized_prompt", "tokenized_prompt_mask", "token_ar_mask", "token_loss_mask")
+        ],
+    )
+    scored = _sample(b1, joined, noise)
+    given = [_sample(b1, r, noise) for r in rows]
+    for b in range(2):
+        winner = int(scored["plan_choice"][b])
+        assert torch.allclose(scored["actions"][b], given[winner]["actions"][b], atol=1e-5)
+
+
+def test_bottleneck_layout_checks(models, bottleneck, batch):
+    _, glow0, _ = models
+    b0, _ = bottleneck
+    actions, noise, time = batch
+    with pytest.raises(ValueError):  # action-block tokens without the bottleneck
+        _run(glow0, _bottleneck_obs(11), actions, noise, time)
+    with pytest.raises(ValueError):  # the bottleneck without action blocks
+        _run(b0, _make_obs(11), actions, noise, time)
+    with pytest.raises(ValueError):  # the bottleneck without any plan block
+        _run(b0, _make_obs(11, with_block=False).replace(token_ar_mask=None, token_loss_mask=None), actions, noise, time)

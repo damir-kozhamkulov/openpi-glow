@@ -17,6 +17,12 @@ the client) and optionally `oracle_plan_index`:
 - without one the sample carries all K candidate blocks in plan-index order, and
   `GlowTokenizePlan` lays K token rows (prompt + candidate k) side by side, K * max_token_len
   tokens, for the model to score (Observation's shape checks admit no extra axis).
+An optional `plan_task` (a pack task string) steers: the plans - input, oracle and candidates -
+are that task's, while the prompt stays whatever the client sent (indices clamped to its stages).
+The prompt then need not be a pack task.
+
+Under the plan bottleneck `GlowTokenizePlan(action_block=True)` appends the block twice: the
+planner block (causal, loss) and the action block (causal, no loss) the actions read.
 """
 
 import dataclasses
@@ -77,9 +83,13 @@ class GlowPlanState(DataTransformFn):
         if (prompt := data.get("prompt")) is None:
             raise ValueError("GlowPlanState: prompt is required")
         prompt = _scalar(prompt)
-        task = self.pack.task(prompt)
+        plan_task = data.pop("plan_task", None)
+        plan_prompt = prompt if plan_task is None or not _scalar(plan_task) else _scalar(plan_task)
 
         if "episode_index" in data and "frame_index" in data:
+            if plan_prompt != prompt:
+                raise ValueError("GlowPlanState: plan_task is an inference-time steering input")
+            task = self.pack.task(prompt)
             episode_index = int(_scalar(data.pop("episode_index")))
             frame_index = int(_scalar(data.pop("frame_index")))
             if self.pack.episodes[episode_index].task_index != task.task_index:
@@ -94,12 +104,20 @@ class GlowPlanState(DataTransformFn):
                 prev = others[int(_rng().integers(len(others)))]
             data["glow_plan_target"] = TARGET_PREFIX + self.render(prompt, target)
         elif "prev_plan_index" in data:
-            prev = int(_scalar(data.pop("prev_plan_index")))
+            last = self.pack.task(plan_prompt).num_plans - 1
+
+            def index(value):
+                # Steering clamps the environment task's stage indices to the plan task's stages;
+                # otherwise an index past the task's last stage is a client bug and render raises.
+                i = int(_scalar(value))
+                return min(i, last) if plan_prompt != prompt else i
+
+            prev = index(data.pop("prev_plan_index"))
             oracle = data.pop("oracle_plan_index", None)
             if oracle is not None:
-                data["glow_plan_target"] = TARGET_PREFIX + self.render(prompt, int(_scalar(oracle)))
+                data["glow_plan_target"] = TARGET_PREFIX + self.render(plan_prompt, index(oracle))
             else:
-                data["glow_plan_candidates"] = [TARGET_PREFIX + self.render(prompt, k) for k in range(task.num_plans)]
+                data["glow_plan_candidates"] = [TARGET_PREFIX + self.render(plan_prompt, k) for k in range(last + 1)]
         else:
             raise ValueError(
                 "GlowPlanState: sample carries neither (episode_index, frame_index) nor prev_plan_index. "
@@ -107,7 +125,57 @@ class GlowPlanState(DataTransformFn):
                 "--args.plan-pack."
             )
 
-        data["prompt"] = f"{prompt}. {INPUT_PREFIX}{self.render(prompt, prev)}"
+        data["prompt"] = f"{prompt}. {INPUT_PREFIX}{self.render(plan_prompt, prev)}"
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class GlowPlanAsPrompt(DataTransformFn):
+    """Replace the prompt with the active plan: the plan is the model's only language input.
+
+    Runs before the stock tokenizer, in place of `GlowPlanState` + `GlowTokenizePlan`; the task
+    string is dropped. Training samples carry `episode_index` / `frame_index` and get the labeled
+    plan at the frame. Inference samples must carry `oracle_plan_index` - the stage the client's
+    tracker reports, or a forced stage - because this model has no planner to choose one; an
+    optional `plan_task` renders that task's plan instead of the prompt's (steering, index clamped
+    to its stages). `prev_plan_index`, sent by every GLOW client, is accepted and ignored.
+    """
+
+    pack: _plan_pack.PlanPack
+    nouns: bool = True
+    anchors: bool = True
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.get("prompt")) is None:
+            raise ValueError("GlowPlanAsPrompt: prompt is required")
+        prompt = _scalar(prompt)
+        plan_task = data.pop("plan_task", None)
+        plan_prompt = prompt if plan_task is None or not _scalar(plan_task) else _scalar(plan_task)
+        data.pop("prev_plan_index", None)
+
+        if "episode_index" in data and "frame_index" in data:
+            if plan_prompt != prompt:
+                raise ValueError("GlowPlanAsPrompt: plan_task is an inference-time steering input")
+            task = self.pack.task(prompt)
+            episode_index = int(_scalar(data.pop("episode_index")))
+            frame_index = int(_scalar(data.pop("frame_index")))
+            if self.pack.episodes[episode_index].task_index != task.task_index:
+                raise ValueError(
+                    f"episode {episode_index} belongs to task {self.pack.episodes[episode_index].task_index}, "
+                    f"but its prompt {prompt!r} is task {task.task_index}"
+                )
+            plan_index = self.pack.plan_index(episode_index, frame_index)
+        elif (oracle := data.pop("oracle_plan_index", None)) is not None:
+            plan_index = int(_scalar(oracle))
+            if plan_prompt != prompt:
+                plan_index = min(plan_index, self.pack.task(plan_prompt).num_plans - 1)
+        else:
+            raise ValueError(
+                "GlowPlanAsPrompt: a plan-as-prompt model has no planner; serve it with the LIBERO client's "
+                "--args.plan-mode oracle (the stage tracker's plan) or forced, which send oracle_plan_index"
+            )
+
+        data["prompt"] = self.pack.render_plan(plan_prompt, plan_index, nouns=self.nouns, anchors=self.anchors)
         return data
 
 
@@ -120,9 +188,13 @@ class GlowTokenizePlan(DataTransformFn):
     k. The block occupies
     positions that are padding in the stock layout. Never truncates: a prompt that filled
     max_token_len or a block that does not fit raises.
+
+    `action_block` (the plan bottleneck) appends the same block a second time right after the
+    first, causal and without a loss: the copy the actions read.
     """
 
     tokenizer: _tokenizer.PaligemmaTokenizer
+    action_block: bool = False
 
     def _append(self, tokens: np.ndarray, mask: np.ndarray, block: str):
         tokens, mask = tokens.copy(), mask.copy()
@@ -135,16 +207,20 @@ class GlowTokenizePlan(DataTransformFn):
         if n_prompt >= max_len:
             raise ValueError(f"GlowTokenizePlan: prompt fills max_token_len {max_len} (possibly truncated)")
         ids = self.tokenizer.encode_answer(block)
-        end = n_prompt + len(ids)
+        copies = 2 if self.action_block else 1
+        end = n_prompt + copies * len(ids)
         if end > max_len:
             raise ValueError(
-                f"GlowTokenizePlan: prompt ({n_prompt}) + plan block ({len(ids)}) tokens exceed "
+                f"GlowTokenizePlan: prompt ({n_prompt}) + {copies} x plan block ({len(ids)}) tokens exceed "
                 f"max_token_len {max_len}; refusing to truncate"
             )
-        tokens[n_prompt:end] = ids
+        mid = n_prompt + len(ids)
+        tokens[n_prompt:mid] = ids
+        if self.action_block:
+            tokens[mid:end] = ids
         mask[n_prompt:end] = True
         ar_mask[n_prompt:end] = 1
-        loss_mask[n_prompt:end] = True
+        loss_mask[n_prompt:mid] = True
         return tokens, mask, ar_mask, loss_mask
 
     def __call__(self, data: DataDict) -> DataDict:
