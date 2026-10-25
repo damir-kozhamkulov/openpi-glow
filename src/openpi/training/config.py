@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 
 import openpi.glow.model_config as glow_model_config
+import openpi.glow.module_inputs as _module_inputs
 import openpi.glow.plan_pack as _plan_pack
 import openpi.glow.plan_prompt as _plan_prompt
 import openpi.models.model as _model
@@ -376,6 +377,10 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
 
     `plan_as_prompt` instead inserts `GlowPlanAsPrompt` before the tokenizer: the active plan
     replaces the prompt, with no previous plan and no plan block.
+
+    `module_inputs` instead inserts `GlowModuleInputs` before the tokenizer: the active stage goes
+    to the model as arrays for its Spatial / Temporal encoders and the prompt is emptied (the task
+    string is dropped). The model must be a GlowModulePi0Config.
     """
 
     # Plan pack path; None resolves $OPENPI_PLAN_PACK, then the in-image default.
@@ -394,12 +399,19 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     # The active plan is the whole prompt (the task string is dropped); plan_delta and
     # plan_corrupt_p do not apply.
     plan_as_prompt: bool = False
+    # The active stage as encoder inputs (GlowModuleInputs); plan_delta and plan_corrupt_p do not
+    # apply.
+    module_inputs: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.plan_as_prompt and self.plan_bottleneck:
-            raise ValueError("LeRobotLiberoGlowDataConfig: plan_as_prompt and plan_bottleneck exclude each other")
-        if not self.plan_as_prompt and (self.plan_delta is None or self.plan_corrupt_p is None):
+        if sum((self.plan_as_prompt, self.plan_bottleneck, self.module_inputs)) > 1:
+            raise ValueError(
+                "LeRobotLiberoGlowDataConfig: plan_as_prompt, plan_bottleneck and module_inputs exclude each other"
+            )
+        if isinstance(model_config, glow_model_config.GlowModulePi0Config) != self.module_inputs:
+            raise ValueError("LeRobotLiberoGlowDataConfig.module_inputs needs, and is needed by, a GlowModulePi0Config")
+        if not (self.plan_as_prompt or self.module_inputs) and (self.plan_delta is None or self.plan_corrupt_p is None):
             raise ValueError("LeRobotLiberoGlowDataConfig.plan_delta and plan_corrupt_p must be set explicitly")
         if bool(getattr(model_config, "plan_bottleneck", False)) != self.plan_bottleneck:
             raise ValueError("LeRobotLiberoGlowDataConfig.plan_bottleneck must match the model's plan_bottleneck")
@@ -432,6 +444,10 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
         if len(at_tokenize) != 1:
             raise ValueError(f"expected one TokenizePrompt in the pi05 model transforms, got {len(at_tokenize)}")
         i = at_tokenize[0]
+        if self.module_inputs:
+            plan = [_module_inputs.GlowModuleInputs(pack, stock[i].tokenizer), stock[i]]
+            model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
+            return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
         if self.plan_as_prompt:
             plan = [_plan_prompt.GlowPlanAsPrompt(pack, nouns=self.plan_nouns, anchors=self.plan_anchors), stock[i]]
             model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
@@ -654,6 +670,38 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _glow_module_train_config(name: str, **module) -> "TrainConfig":
+    """A GLOW module row: GlowModulePi0Config (switches in `module`) reading the LIBERO-10 + Goal
+    pack's active stage, with pi05_libero_plan_prompt's data and recipe. The prompt is empty, so
+    max_token_len is cut to 8 (BOS and the newline answer token are the only language tokens)."""
+    return TrainConfig(
+        name=name,
+        model=glow_model_config.GlowModulePi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, max_token_len=8, **module
+        ),
+        data=LeRobotLiberoGlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
+            module_inputs=True,
+            train_episodes="0:807",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=6.25e-6,
+            decay_steps=5_000,
+            decay_lr=6.25e-7,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=5_000,
+    )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1014,6 +1062,13 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=5_000,
     ),
+    # GLOW module rows: the planning module through learned Spatial / Temporal encoders, the task
+    # string dropped (the encoders are the only goal input). _st is the full model; the others
+    # ablate the Temporal encoder, the grounding (anchors) and the subgoal_operation text.
+    _glow_module_train_config("pi05_libero_glow_st"),
+    _glow_module_train_config("pi05_libero_glow_s_only", module_temporal=False),
+    _glow_module_train_config("pi05_libero_glow_nogrounding", module_grounding=False),
+    _glow_module_train_config("pi05_libero_glow_nosubgoal", module_subgoal_text=False),
     #
     # Fine-tuning Aloha configs.
     #

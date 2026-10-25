@@ -309,6 +309,55 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
+def new_param_prefixes(model: torch.nn.Module) -> tuple[str, ...]:
+    """Name prefixes of the parameters a model adds to pi05 (GLOW's module encoders): the
+    fine-tuning init has none of them, and they train at the config's `encoder_lr_scale`."""
+    model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    return tuple(getattr(model, "NEW_PARAM_PREFIXES", ()))
+
+
+def load_init_weights(model: torch.nn.Module, model_path: str, device) -> None:
+    """Load the fine-tuning init into an unwrapped model: strict, except that the parameters
+    under `new_param_prefixes` may be missing (they keep their fresh initialization)."""
+    prefixes = new_param_prefixes(model)
+    if not prefixes:
+        safetensors.torch.load_model(model, model_path, device=str(device))
+        return
+    missing, unexpected = safetensors.torch.load_model(model, model_path, strict=False, device=str(device))
+    stray = [k for k in missing if not k.startswith(prefixes)]
+    if stray or unexpected:
+        raise RuntimeError(
+            f"init weights {model_path} do not match the model outside {prefixes}: "
+            f"missing {stray[:10]} ({len(stray)}), unexpected {unexpected[:10]} ({len(unexpected)})"
+        )
+    logging.info(f"Init weights: {len(missing)} tensors under {prefixes} start from their initialization")
+
+
+def optimizer_param_groups(model: torch.nn.Module, lr_scale: float) -> list[dict]:
+    """One group for the pretrained parameters and, when the model adds any, one for the new
+    ones; each group's `lr_scale` multiplies the schedule's learning rate."""
+    prefixes = new_param_prefixes(model)
+    groups = {"pretrained": [], "new": []}
+    for name, param in model.named_parameters():
+        name = name.removeprefix("module.")  # noqa: PLW2901
+        groups["new" if prefixes and name.startswith(prefixes) else "pretrained"].append(param)
+    out = [{"params": groups["pretrained"], "lr_scale": 1.0, "name": "pretrained"}]
+    if groups["new"]:
+        out.append({"params": groups["new"], "lr_scale": float(lr_scale), "name": "new"})
+    return out
+
+
+def grad_norm_of(params) -> float:
+    """L2 norm of the gradients of `params` (sharded or not). Collective under FSDP."""
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    norm = torch.nn.utils.get_total_norm(grads)
+    if hasattr(norm, "full_tensor"):
+        norm = norm.full_tensor()
+    return float(norm)
+
+
 def load_model_weights(model_to_load, ckpt_dir, device, ema=None):
     """Load a checkpoint's weights into an unwrapped model: the raw weights when the checkpoint
     has them, seeding `ema` from the averaged ones first."""
@@ -609,7 +658,7 @@ def train_loop(config: _config.TrainConfig):
         elif config.pytorch_weight_path is not None:
             logging.info(f"Loading weights from: {config.pytorch_weight_path}")
             model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-            safetensors.torch.load_model(model, model_path, device=str(device))
+            load_init_weights(model, model_path, device)
         model = _fsdp.shard_model(model, _fsdp.build_mesh(device))
         if is_main and torch.cuda.is_available():
             log_memory_usage(device, 0, "after_sharding")
@@ -627,8 +676,10 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        load_init_weights(
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            model_path,
+            device,
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -639,8 +690,14 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    param_groups = optimizer_param_groups(model, getattr(model_cfg, "encoder_lr_scale", 1.0))
+    new_params = param_groups[1]["params"] if len(param_groups) > 1 else []
+    if is_main:
+        for group in param_groups:
+            count = sum(p.numel() for p in group["params"])
+            logging.info(f"Param group {group['name']}: {count:,} parameters, lr x {group['lr_scale']}")
     optim = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -744,7 +801,7 @@ def train_loop(config: _config.TrainConfig):
             # Update LR once per optimizer step, at the start of an accumulation cycle.
             if micro_step == 0:
                 for pg in optim.param_groups:
-                    pg["lr"] = lr_schedule(global_step)
+                    pg["lr"] = lr_schedule(global_step) * pg.get("lr_scale", 1.0)
 
             # DDP allreduces gradients on every backward; skip that on the micro-batches that
             # are not the last of the cycle once the gradients are allocated, so an optimizer
@@ -803,7 +860,8 @@ def train_loop(config: _config.TrainConfig):
             accum_loss = 0.0
             accum_terms = {}
 
-            # Gradient clipping
+            # Gradient clipping (the new parameters' share measured first, unclipped)
+            new_grad_norm = grad_norm_of(new_params) if new_params else None
             clip = _fsdp.clip_grad_norm_ if use_fsdp else torch.nn.utils.clip_grad_norm_
             grad_norm = clip(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
@@ -826,6 +884,7 @@ def train_loop(config: _config.TrainConfig):
                         "loss": loss_value,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        **({"new_grad_norm": new_grad_norm} if new_grad_norm is not None else {}),
                         **{f"term/{k}": v for k, v in term_values.items()},
                     }
                 )
@@ -862,6 +921,9 @@ def train_loop(config: _config.TrainConfig):
                     log_line += f" grad_norm={avg_grad_norm:.2f}"
                 if ema_distance is not None:
                     log_line += f" ema_dist={ema_distance:.2e}"
+                new_norms = [info["new_grad_norm"] for info in infos if "new_grad_norm" in info]
+                if new_norms:
+                    log_line += f" new_grad_norm={sum(new_norms) / len(new_norms):.2e}"
                 for k, v in avg_terms.items():
                     log_line += f" {k}={v:.4f}"
                 logging.info(f"{log_line} time={elapsed:.1f}s")

@@ -30,6 +30,15 @@ class Stage:
     object_bins: tuple[int, int, int] | None
     target_bins: tuple[int, int, int] | None
     weak_anchor: bool
+    # The anchors as the pack's normalized coordinates (roughly [-1, 1] per axis), for models that
+    # read grounding as numbers rather than as digitized bins in text.
+    object_xyz: tuple[float, float, float] | None = None
+    target_xyz: tuple[float, float, float] | None = None
+
+    @property
+    def predicate(self) -> str:
+        """The atom's predicate, lower-cased: "On(moka_pot, stove)" -> "on"."""
+        return self.atom.split("(", 1)[0].strip().lower()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,6 +66,10 @@ class EpisodePlan:
 
 def _bins(anchor) -> tuple[int, int, int] | None:
     return None if anchor is None else tuple(int(b) for b in anchor["bins"])
+
+
+def _xyz(anchor) -> tuple[float, float, float] | None:
+    return None if anchor is None else tuple(float(v) for v in anchor["normalized"])
 
 
 class PlanPack:
@@ -91,6 +104,8 @@ class PlanPack:
                     object_bins=_bins(s["object_anchor"]),
                     target_bins=_bins(s["target_anchor"]),
                     weak_anchor=bool(s["weak_anchor"]),
+                    object_xyz=_xyz(s["object_anchor"]),
+                    target_xyz=_xyz(s["target_anchor"]),
                 )
                 for s in sorted(entry["stages"], key=lambda s: s["plan_index"])
             )

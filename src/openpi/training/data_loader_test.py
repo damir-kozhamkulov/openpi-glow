@@ -95,8 +95,20 @@ def test_resolve_train_episodes(monkeypatch):
     assert _data_loader.resolve_train_episodes() == list(range(379))
     monkeypatch.setenv("OPENPI_TRAIN_EPISODES", "0,1,2")
     assert _data_loader.resolve_train_episodes() == [0, 1, 2]
-    # The pinned LeRobot needs episodes 0..n-1.
-    for spec in ("379:807", "1,2", "0,2"):
+    # Any subset: ranges and indices mixed, sorted, without duplicates.
+    monkeypatch.setenv("OPENPI_TRAIN_EPISODES", "379:382")
+    assert _data_loader.resolve_train_episodes() == [379, 380, 381]
+    monkeypatch.setenv("OPENPI_TRAIN_EPISODES", "40, 2:4,3")
+    assert _data_loader.resolve_train_episodes() == [2, 3, 40]
+    for spec in ("5:5", "7:3", "-1", " , "):
         monkeypatch.setenv("OPENPI_TRAIN_EPISODES", spec)
         with pytest.raises(ValueError):
             _data_loader.resolve_train_episodes()
+
+
+def test_episode_frame_indices():
+    import torch
+
+    table = {"from": torch.tensor([0, 3, 7, 12]), "to": torch.tensor([3, 7, 12, 14])}
+    assert _data_loader.episode_frame_indices(table, [1, 3]) == [3, 4, 5, 6, 12, 13]
+    assert _data_loader.episode_frame_indices(table, []) == []

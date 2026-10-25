@@ -170,4 +170,8 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        glow_text=getattr(observation, "glow_text", None),
+        glow_text_mask=getattr(observation, "glow_text_mask", None),
+        glow_ints=getattr(observation, "glow_ints", None),
+        glow_floats=getattr(observation, "glow_floats", None),
     )

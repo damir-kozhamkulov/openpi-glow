@@ -130,37 +130,41 @@ class FakeDataset(Dataset):
 def resolve_train_episodes(default: str | None = None) -> list[int] | None:
     """Episode subset to train on, from `OPENPI_TRAIN_EPISODES`, else `default` (the config's).
 
-    Accepts a half-open range `start:stop` or a comma-separated list of indices; unset or empty
-    means the whole dataset. Restricting the episodes does not change the assets path, so
-    `norm_stats` computed over the full dataset stay in use and checkpoints remain compatible
-    with the released ones.
+    Accepts a comma-separated list of indices and half-open ranges `start:stop`, e.g. `379:419`
+    or `0:8,40,52:60`; unset or empty means the whole dataset. The result is sorted, without
+    duplicates. Restricting the episodes does not change the assets path, so `norm_stats`
+    computed over the full dataset stay in use and checkpoints remain compatible with the
+    released ones.
 
-    The subset must be episodes 0..n-1: the pinned LeRobot looks a sample's episode up in its
-    per-episode index table by absolute episode number, so any other subset fails (or reads the
-    wrong rows) once an episode number reaches the subset's size.
-
-    For `physical-intelligence/libero`, LIBERO-10 is `0:379` (task indices 0-9, 101,469 frames)
-    and LIBERO-10 + LIBERO-Goal is `0:807`.
+    For `physical-intelligence/libero`, LIBERO-10 is `0:379` (task indices 0-9, 101,469 frames),
+    LIBERO-Goal is `379:807` and LIBERO-10 + LIBERO-Goal is `0:807`.
     """
     spec = (os.environ.get("OPENPI_TRAIN_EPISODES", "").strip() or (default or "")).strip()
     if not spec:
         return None
-    if ":" in spec:
-        start_str, _, stop_str = spec.partition(":")
-        start, stop = int(start_str), int(stop_str)
-        if start < 0 or stop <= start:
-            raise ValueError(f"OPENPI_TRAIN_EPISODES range must be start:stop with stop > start >= 0, got {spec!r}")
-        episodes = list(range(start, stop))
-    else:
-        episodes = [int(part) for part in spec.split(",") if part.strip()]
-        if not episodes:
-            raise ValueError(f"OPENPI_TRAIN_EPISODES parsed to an empty episode list: {spec!r}")
-    if episodes != list(range(len(episodes))):
-        raise ValueError(
-            f"episode subset {spec!r} is not episodes 0..n-1, which the pinned LeRobot requires "
-            "(it indexes its per-episode table by absolute episode number)"
-        )
-    return episodes
+    episodes = set()
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        if ":" in part:
+            start_str, _, stop_str = part.partition(":")
+            start, stop = int(start_str), int(stop_str)
+            if start < 0 or stop <= start:
+                raise ValueError(f"OPENPI_TRAIN_EPISODES range must be start:stop with stop > start >= 0, got {part!r}")
+            episodes.update(range(start, stop))
+        else:
+            if int(part) < 0:
+                raise ValueError(f"OPENPI_TRAIN_EPISODES has a negative episode: {part!r}")
+            episodes.add(int(part))
+    if not episodes:
+        raise ValueError(f"OPENPI_TRAIN_EPISODES parsed to an empty episode list: {spec!r}")
+    return sorted(episodes)
+
+
+def episode_frame_indices(episode_data_index: dict, episodes: list[int]) -> list[int]:
+    """Dataset rows of `episodes`, from a LeRobot dataset's per-episode `from` / `to` table."""
+    starts, stops = episode_data_index["from"], episode_data_index["to"]
+    return [i for e in episodes for i in range(int(starts[e]), int(stops[e]))]
 
 
 def create_torch_dataset(
@@ -177,14 +181,20 @@ def create_torch_dataset(
     if episodes is not None:
         logging.info(f"Training on an episode subset: {len(episodes)} episodes ({episodes[0]}..{episodes[-1]})")
 
+    # The pinned LeRobot looks a sample's episode up in its per-episode table by absolute episode
+    # number, so it can only load a subset that is episodes 0..n-1. Any other subset loads the
+    # smallest such prefix that holds it, restricted to the subset's rows.
+    prefix = None if episodes is None else list(range(episodes[-1] + 1))
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
-        episodes=episodes,
+        episodes=prefix,
     )
+    if episodes is not None and episodes != prefix:
+        dataset = torch.utils.data.Subset(dataset, episode_frame_indices(dataset.episode_data_index, episodes))
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

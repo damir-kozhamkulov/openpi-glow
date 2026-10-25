@@ -106,6 +106,13 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # GLOW planning module read by learned encoders (openpi.glow.module_inputs): text-piece token
+    # ids and their mask, integer fields, and float fields (the grounding).
+    glow_text: at.Int[ArrayT, "*b gt"] | None = None
+    glow_text_mask: at.Bool[ArrayT, "*b gt"] | None = None
+    glow_ints: at.Int[ArrayT, "*b gi"] | None = None
+    glow_floats: at.Float[ArrayT, "*b gf"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +133,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            glow_text=data.get("glow_text"),
+            glow_text_mask=data.get("glow_text_mask"),
+            glow_ints=data.get("glow_ints"),
+            glow_floats=data.get("glow_floats"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +216,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        glow_text=observation.glow_text,
+        glow_text_mask=observation.glow_text_mask,
+        glow_ints=observation.glow_ints,
+        glow_floats=observation.glow_floats,
     )
 
 

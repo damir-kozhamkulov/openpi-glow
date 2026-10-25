@@ -52,6 +52,11 @@ class PaligemmaTokenizer:
         cleaned_text = text.strip().replace("_", " ").replace("\n", " ")
         return self._tokenizer.encode(cleaned_text, add_bos=False, add_eos=True)
 
+    def encode_text(self, text: str) -> list[int]:
+        """Tokens of a bare text piece, cleaned as prompts are: no BOS, no EOS."""
+        cleaned_text = text.strip().replace("_", " ").replace("\n", " ")
+        return self._tokenizer.encode(cleaned_text, add_bos=False, add_eos=False) if cleaned_text else []
+
 
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
