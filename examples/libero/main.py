@@ -11,6 +11,7 @@ import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.envs import bddl_utils
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
@@ -19,6 +20,11 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+
+# Parsed-problem fields that make up a LIBERO scene: the problem class, what is in it, its regions
+# and how it is laid out. Tasks equal on all of them differ only in goal, language and objects of
+# interest, so one task's goal predicates are meaningful on another's simulator state.
+SCENE_FIELDS = ("problem_name", "fixtures", "objects", "regions", "scene_properties", "initial_state")
 
 
 @dataclasses.dataclass
@@ -63,13 +69,17 @@ class Args:
     plan_hold_min: int = glow_stage_tracker.HOLD_MIN
     # Steering (needs --plan-pack): the plans sent are this pack task's instead of the
     # environment's - the input plan, the oracle / forced plan and the candidates, stage indices
-    # clamped to its stages. Success is still the environment's. Against a plan-bottleneck server
-    # (pi05_libero_glow_bottleneck) the actions read nothing but the plan, so this measures whether
-    # they follow it.
+    # clamped to its stages. Against a plan-bottleneck server (pi05_libero_glow_bottleneck) the
+    # actions read nothing but the plan, so this measures whether they follow it. While steering,
+    # two goals are scored on the same simulator state: the environment task's (`success`, met at
+    # any step) and the steering task's (`steered_success`, which ends the episode). The steering
+    # task must be a task of this suite set in the environment task's scene (SCENE_FIELDS); the
+    # run refuses to start otherwise.
     plan_task: Optional[str] = None
     # Steering by a derangement (needs --plan-pack, excludes --plan-task): environment task i gets
-    # the plans of suite task (i + offset) mod n. A plan-as-prompt server (pi05_libero_plan_prompt)
-    # reads nothing but the plan, so its success should collapse when the plans are another goal's.
+    # the plans of suite task (i + offset) mod n, scored as for --plan-task. A plan-as-prompt server
+    # (pi05_libero_plan_prompt) reads nothing but the plan, so its own-task success should collapse
+    # when the plans are another goal's, and its steered success shows whether it reaches that goal.
     plan_task_offset: Optional[int] = None
     # Instruction sent to the server in place of the environment's task (the planner reads it).
     prompt: Optional[str] = None
@@ -126,13 +136,23 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
-    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
-
     # Every task's language, for --plan-task-offset (the suite order is the task_id order).
     suite_tasks = [str(task_suite.get_task(i).language) for i in range(num_tasks_in_suite)]
 
+    # Steering task's parsed BDDL problem per environment task, all resolved and scene-checked
+    # before the server is contacted.
+    steered_problems = {}
+    if args.plan_task is not None or args.plan_task_offset is not None:
+        for task_id in range(num_tasks_in_suite):
+            steered_problems[task_id] = _steered_problem(
+                task_suite, suite_tasks, task_id, args.plan_task, args.plan_task_offset
+            )
+
+    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    total_steered_successes, total_steered_at_start = 0, 0
     # Episodes cut short because the policy server could not be reached. Their outcome is not a
     # policy result, so a run with any of them is invalid regardless of the rate it computes.
     aborted_episodes = []
@@ -159,9 +179,10 @@ def eval_libero(args: Args) -> None:
                 logging.info(f"steering: {task_description!r} runs with the plans of {plan_task!r}")
             plan_source = str(task_description) if plan_task is None else plan_task
             num_plans = int(plan_pack["tasks"][plan_source]["K"])
+        steered = SteeredGoal(env, steered_problems[task_id]) if task_id in steered_problems else None
 
         # Start episodes
-        task_episodes, task_successes = 0, 0
+        task_episodes, task_successes, task_steered_successes = 0, 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -184,6 +205,9 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            success = steered_success = False
+            # Whether the steering task's goal already held when the policy took over.
+            steered_at_start = None
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -194,6 +218,8 @@ def eval_libero(args: Args) -> None:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
+                    if steered is not None and steered_at_start is None:
+                        steered_at_start = steered.check()
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -250,9 +276,12 @@ def eval_libero(args: Args) -> None:
                     obs, reward, done, info = env.step(action.tolist())
                     if plan is not None:
                         plan.observe(action[6])  # the gripper command just executed
-                    if done:
-                        task_successes += 1
-                        total_successes += 1
+                    success = success or done
+                    if steered is not None:
+                        steered_success = steered.check()
+                        if steered_success:
+                            break
+                    elif done:
                         break
                     t += 1
 
@@ -264,9 +293,20 @@ def eval_libero(args: Args) -> None:
 
             task_episodes += 1
             total_episodes += 1
+            if success:
+                task_successes += 1
+                total_successes += 1
+            if steered_success:
+                task_steered_successes += 1
+                total_steered_successes += 1
+            if steered_at_start:
+                total_steered_at_start += 1
 
             # Save a replay video of the episode
-            suffix = "success" if done else "failure"
+            if steered is None:
+                suffix = "success" if success else "failure"
+            else:
+                suffix = "steered_success" if steered_success else "steered_failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
                 pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
@@ -275,21 +315,37 @@ def eval_libero(args: Args) -> None:
             )
 
             # Log current results
-            logging.info(f"Success: {done}")
+            logging.info(f"Success: {success}")
+            steered_fields = ""
+            if steered is not None:
+                logging.info(
+                    f"Steered success: {steered_success} (goal met at the first policy step: {steered_at_start})"
+                )
+                steered_fields = f"steered_success={steered_success} steered_at_start={steered_at_start} "
             if plan is not None:
                 # One line per episode for the stage-resolved failure analysis.
                 logging.info(
-                    f"plan trace: task={task_id} episode={episode_idx} success={done} "
+                    f"plan trace: task={task_id} episode={episode_idx} success={success} {steered_fields}"
                     f"frames={plan.tracker.frame} {plan.trace()}"
                 )
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            if steered is not None:
+                logging.info(
+                    f"# steered successes: {total_steered_successes} "
+                    f"({total_steered_successes / total_episodes * 100:.1f}%)"
+                )
 
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        if steered is not None:
+            logging.info(f"Current task steered success rate: {float(task_steered_successes) / float(task_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    if steered_problems:
+        logging.info(f"Steered success rate: {float(total_steered_successes) / float(total_episodes)}")
+        logging.info(f"Steered goal met at the first policy step: {total_steered_at_start} episodes")
     logging.info(f"Total episodes: {total_episodes}")
 
     if aborted_episodes:
@@ -310,6 +366,60 @@ def _get_libero_env(task, resolution, seed):
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
+
+
+class SteeredGoal:
+    """A steering task's BDDL goal, scored on the environment's simulator state.
+
+    Each goal atom goes through the environment problem's own `_eval_predicate`, the call its
+    `_check_success` makes for the environment's goal, so the steered goal is the same conjunction
+    of LIBERO predicates over the same object states. `problem` must come from `_steered_problem`,
+    which guarantees the goal names this scene's objects and regions. Like `_check_success`, the
+    TurnOn / TurnOff predicates also set their object's visualization flag from its joint state.
+    """
+
+    def __init__(self, env, problem):
+        self._problem_env = env.env
+        self.goal_state = problem["goal_state"]
+        if not self.goal_state:
+            raise ValueError("the steering task's BDDL has no goal")
+
+    def check(self):
+        return all(self._problem_env._eval_predicate(state) for state in self.goal_state)  # noqa: SLF001
+
+
+def _scene_differences(problem_a, problem_b):
+    return [field for field in SCENE_FIELDS if problem_a.get(field) != problem_b.get(field)]
+
+
+def _steered_problem(task_suite, suite_tasks, task_id, plan_task, plan_task_offset):
+    """The parsed BDDL problem of the task steering suite task `task_id`.
+
+    With an offset it is suite task (task_id + offset) mod n. A --plan-task is matched by language
+    among the suite's tasks; when several share it, the first in `task_id`'s scene is taken. Raises
+    if the task is not in the suite or is set in another scene.
+    """
+    if plan_task_offset is not None:
+        name = glow_stage_tracker.plan_task_for(suite_tasks, task_id, plan_task_offset)
+        candidates = [(task_id + plan_task_offset) % len(suite_tasks)]
+    else:
+        name = plan_task
+        candidates = [i for i, task_name in enumerate(suite_tasks) if task_name == plan_task]
+    if not candidates:
+        raise ValueError(
+            f"steering task {name!r} is not a task of this suite, so its goal cannot be scored on its simulator"
+        )
+    own = bddl_utils.robosuite_parse_problem(task_suite.get_task_bddl_file_path(task_id))
+    differences = []
+    for i in candidates:
+        problem = bddl_utils.robosuite_parse_problem(task_suite.get_task_bddl_file_path(i))
+        differences = _scene_differences(own, problem)
+        if not differences:
+            return problem
+    raise ValueError(
+        f"steering task {name!r} is set in another scene than environment task {suite_tasks[task_id]!r} "
+        f"({', '.join(differences)} differ), so its goal predicates mean nothing on that simulator"
+    )
 
 
 def _quat2axisangle(quat):
