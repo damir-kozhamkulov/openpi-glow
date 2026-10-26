@@ -15,6 +15,9 @@ import pytest
 
 from . import glow_module_diag as gmd
 
+# The dummy Gemma is 64 wide; give it a small SigLIP for the prefix unit tests.
+from openpi.models_pytorch.glow_pi0_pytorch_test import tiny_vision_tower  # noqa: E402, F401
+
 REPO = pathlib.Path(__file__).resolve().parents[2]  # glow_repo (openpi is its submodule)
 GOAL_PACK = REPO / "derived/plan_pack_libero10_goal.json"
 DATASET = pathlib.Path(os.environ.get("HF_LEROBOT_HOME", "")) / "libero_staging"
@@ -150,9 +153,24 @@ def test_main_module_model(monkeypatch, tmp_path):
     o = s["flow"]["overall"]
     assert set(o) == set(gmd.FLOW_VARIANTS) and s["flow"]["samples"] == 8
     assert all(np.isfinite(v["flow"]) for v in o.values())
-    assert o["no_module"]["diff"] != 0.0 and o["task_prompt"]["diff"] != 0.0
+    for name in gmd.FLOW_VARIANTS:
+        if name != "correct":
+            assert o[name]["diff"] != 0.0, name
+    # LIBERO-10 and Goal episodes are both in the sample.
+    for name, by_suite in s["flow_by_suite"].items():
+        assert set(by_suite) == {"all", "libero_10", "libero_goal"}, name
+        assert by_suite["libero_10"]["samples"] + by_suite["libero_goal"]["samples"] == 8
 
-    att = s["attention"]
+    # Every variant's attention is recorded with its own layout.
+    assert set(s["attention"]) == set(gmd.FLOW_VARIANTS)
+    for name, (_, layout) in gmd.FLOW_VARIANTS.items():
+        a = s["attention"][name]
+        assert a["keys_per_sample"]["module"] == (0 if layout == "stock" else 6), name
+        assert sum(a["by_query"]["actions"]["mass_mean"].values()) == pytest.approx(1.0, abs=1e-4), name
+    assert s["attention"]["plan_text"]["keys_per_sample"]["language"] > 2  # the plan text
+    assert s["attention"]["task_prompt"]["keys_per_sample"]["language"] > 2  # the task string
+
+    att = s["attention"]["correct"]
     assert att["keys_per_sample"]["module"] == 6
     assert att["keys_per_sample"]["language"] == 2  # BOS and the newline answer token
     for q in ("actions", "images", "module"):
@@ -162,10 +180,14 @@ def test_main_module_model(monkeypatch, tmp_path):
     layers = get_config("pi05_libero_glow_st").model.create_pytorch().paligemma_with_expert.paligemma.config
     assert len(att["by_query"]["actions"]["mass_per_layer"]["module"]) == layers.text_config.num_hidden_layers
     assert sum(att["actions_value_weighted_share_mean"].values()) == pytest.approx(1.0, abs=1e-4)
-    assert set(s["embedding_rms"]) == {"images", "module", "language"}
+    rms = s["embedding_rms"]
+    assert set(rms["correct"]) == {"images", "module", "language"} and "module" not in rms["no_module"]
     # The encoder tokens are rescaled to the language tokens' RMS (pooled over the tokens; the
-    # diagnostic reports the mean per-token RMS, so the two agree only closely).
-    assert s["embedding_rms"]["module"] == pytest.approx(s["embedding_rms"]["language"], rel=1e-2)
+    # diagnostic reports the mean per-token RMS, so the two agree only closely); post_bos uses the
+    # same scale, word_scale the prompt's word-token scale.
+    assert rms["correct"]["module"] == pytest.approx(rms["correct"]["language"], rel=1e-2)
+    assert rms["post_bos"]["module"] == pytest.approx(rms["correct"]["module"], rel=1e-5)
+    assert rms["word_scale"]["module"] == pytest.approx(rms["post_bos_word_scale"]["module"], rel=1e-5)
 
     payload = json.loads((tmp_path / "diag.json").read_text(encoding="utf-8"))
     assert len(payload["per_sample_flow"]["correct"]) == 8
@@ -201,9 +223,16 @@ def test_main_init_loads_without_encoders(monkeypatch, tmp_path):
     # Without module tokens the init model is the stock one: both prompts' losses do not depend
     # on the encoders' seed.
     c = gmd.main(_args(weights, tmp_path, init=True, init_seed=5))
-    assert c["flow"]["overall"]["no_module"]["flow"] == a["flow"]["overall"]["no_module"]["flow"]
-    assert c["flow"]["overall"]["task_prompt"]["flow"] == a["flow"]["overall"]["task_prompt"]["flow"]
-    assert c["flow"]["overall"]["correct"]["flow"] != a["flow"]["overall"]["correct"]["flow"]
+    # The variants that do not read the encoders do not depend on their seed.
+    for name in ("no_module", "task_prompt", "plan_text", "head_pre_bos", "head_post_bos"):
+        assert c["flow"]["overall"][name]["flow"] == a["flow"]["overall"][name]["flow"], name
+    for name in ("correct", "post_bos", "word_scale", "post_bos_word_scale"):
+        assert c["flow"]["overall"][name]["flow"] != a["flow"]["overall"][name]["flow"], name
+    # --variants runs a subset (always with `correct`, the reference).
+    d = gmd.main(_args(weights, tmp_path, init=True, variants=("no_module", "head_post_bos")))
+    assert set(d["flow"]["overall"]) == {"correct", "no_module", "head_post_bos"}
+    with pytest.raises(ValueError, match="unknown variants"):
+        gmd.main(_args(weights, tmp_path, init=True, variants=("bogus",)))
 
 
 @needs_data
@@ -222,7 +251,7 @@ def test_main_plan_prompt_reference(monkeypatch, tmp_path):
     s = gmd.main(_args(weights, tmp_path, config="pi05_libero_plan_prompt"))
     assert "collapse" not in s
     assert set(s["flow"]["overall"]) == {"correct"}
-    att = s["attention"]
+    att = s["attention"]["correct"]
     assert att["keys_per_sample"]["module"] == 0 and att["keys_per_sample"]["language"] > 2  # the plan text
     assert "module" not in att["by_query"]["actions"]["per_token_vs_prefix_mean"]
     assert sum(att["by_query"]["actions"]["mass_mean"].values()) == pytest.approx(1.0, abs=1e-4)
@@ -261,3 +290,118 @@ def test_main_anchored_init_is_the_text(monkeypatch, tmp_path):
     for slot in gmd.SPATIAL_SLOTS + gmd.TEMPORAL_SLOTS:
         sa, sb = (r["collapse"]["slots"][slot]["all"] for r in runs)
         assert sa["mean_cos"] == pytest.approx(sb["mean_cos"], abs=1e-6), slot
+
+
+def _prefix_case(**model_kw):
+    """A dummy-size module model, an observation and its preprocessed prefix inputs."""
+    from openpi.models_pytorch.glow_module_pi0_pytorch_test import _model_with
+    from openpi.models_pytorch.glow_module_pi0_pytorch_test import _module_arrays
+    from openpi.models_pytorch.glow_module_pi0_pytorch_test import _obs
+
+    m = _model_with(**model_kw)
+    obs = _obs(0, _module_arrays(0))
+    images, img_masks, lang_tokens, lang_masks, _ = m._preprocess_observation(obs, train=False)  # noqa: SLF001
+    return m, obs, (images, img_masks, lang_tokens, lang_masks)
+
+
+def test_make_prefix_reproduces_the_model_prefix():
+    import torch
+
+    m, obs, inputs = _prefix_case()
+    want = m.embed_observation_prefix(obs, *inputs)
+    n_lang, n_mod = inputs[2].shape[1], 6
+    n_img = want[0].shape[1] - n_lang - n_mod
+    for kw in ({"own": n_mod}, {"tokens": m.module_tokens, "where": "pre_bos", "scale": "language"}):
+        rec = gmd.AttentionRecorder(1)
+        prefix = gmd.make_prefix(m, rec, **kw)
+        got = prefix(obs, *inputs)
+        for x, y in zip(got, want, strict=True):
+            torch.testing.assert_close(x, y, rtol=1e-6, atol=1e-6)
+        groups = rec.prefix
+        assert (groups[:, n_img : n_img + n_mod] == gmd.GROUPS.index("module")).all(), kw
+        valid_lang = groups[:, n_img + n_mod :][want[1][:, n_img + n_mod :]]
+        assert (valid_lang == gmd.GROUPS.index("language")).all() and (groups[~want[1]] == -1).all()
+        assert set(prefix.rms) == {"images", "module", "language"}
+    # Without tokens it is the stock prefix.
+    rec = gmd.AttentionRecorder(1)
+    stock = gmd.make_prefix(m, rec)(obs, *inputs)
+    for x, y in zip(stock, m.embed_prefix(*inputs), strict=True):
+        assert torch.equal(x, y)
+    assert not (rec.prefix == gmd.GROUPS.index("module")).any()
+
+
+def test_make_prefix_word_scale_is_the_words_model():
+    """The word_scale variant at the module-text RMS is what a module_token_scale="words" model
+    builds itself."""
+    import torch
+
+    m, obs, inputs = _prefix_case(module_token_scale="words")
+    want = m.embed_observation_prefix(obs, *inputs)
+    target = m.module_text_rms(obs)[:, 0, 0]
+    got = gmd.make_prefix(m, gmd.AttentionRecorder(1), tokens=m.module_tokens, scale="word", target_rms=target)(
+        obs, *inputs
+    )
+    for x, y in zip(got, want, strict=True):
+        torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
+
+
+def test_make_prefix_after_bos_and_scales():
+    import torch
+
+    m, obs, inputs = _prefix_case()
+    n_lang = inputs[2].shape[1]
+    stock = m.embed_prefix(*inputs)
+    n_img = stock[0].shape[1] - n_lang
+    rec = gmd.AttentionRecorder(1)
+    pre = gmd.make_prefix(m, rec, tokens=m.module_tokens, where="pre_bos", scale="language")(obs, *inputs)
+    post = gmd.make_prefix(m, rec, tokens=m.module_tokens, where="post_bos", scale="language")(obs, *inputs)
+    # The first language token stays right after the images; the module tokens follow it.
+    torch.testing.assert_close(post[0][:, : n_img + 1], stock[0][:, : n_img + 1])
+    torch.testing.assert_close(post[0][:, n_img + 7 :], stock[0][:, n_img + 1 :])
+    torch.testing.assert_close(post[0][:, n_img + 1 : n_img + 7], pre[0][:, n_img : n_img + 6])
+    assert post[1][:, n_img + 1 : n_img + 7].all() and not post[2][:, n_img + 1 : n_img + 7].any()
+    assert (rec.prefix[:, n_img + 1 : n_img + 7] == gmd.GROUPS.index("module")).all()
+    assert (rec.prefix[:, n_img] == gmd.GROUPS.index("language")).all()
+
+    target = torch.arange(1, inputs[2].shape[0] + 1, dtype=torch.float32) * 2.0
+    word = gmd.make_prefix(m, rec, tokens=m.module_tokens, scale="word", target_rms=target)(obs, *inputs)
+    module_rms = word[0][:, n_img : n_img + 6].pow(2).mean(-1).sqrt()
+    torch.testing.assert_close(module_rms, target[:, None].expand_as(module_rms), rtol=1e-4, atol=1e-4)
+
+    fixed = torch.randn(inputs[2].shape[0], 3, stock[0].shape[-1])
+    raw = gmd.make_prefix(m, rec, tokens=lambda _obs: fixed, scale="raw")(obs, *inputs)
+    torch.testing.assert_close(raw[0][:, n_img : n_img + 3], fixed)
+    with pytest.raises(ValueError, match="placement"):
+        gmd.make_prefix(m, rec, tokens=m.module_tokens, where="middle")(obs, *inputs)
+    with pytest.raises(ValueError, match="scale"):
+        gmd.make_prefix(m, rec, tokens=m.module_tokens, scale="huge")(obs, *inputs)
+
+
+def test_word_rms_skips_bos_and_newline():
+    import torch
+
+    embed = torch.nn.Embedding(10, 4)
+    tokens = np.array([[2, 5, 6, 7, 0], [2, 4, 7, 0, 0]])
+    mask = np.array([[True, True, True, True, False], [True, True, True, False, False]])
+    got = gmd.word_rms(embed, tokens, mask, 3.0, "cpu")
+    w = embed.weight.detach() * 3.0
+    rms = w.pow(2).mean(-1).sqrt()
+    torch.testing.assert_close(got, torch.stack([(rms[5] + rms[6]) / 2, rms[4]]))
+
+
+@pytest.mark.skipif(not GOAL_PACK.exists(), reason="Goal plan pack not present")
+def test_head_words():
+    from openpi.glow import plan_pack as _plan_pack
+
+    pack = _plan_pack.PlanPack.load(GOAL_PACK)
+    by_index = {t.task_index: t for t in pack.tasks.values()}
+    slots = [*gmd.SPATIAL_SLOTS, *gmd.TEMPORAL_SLOTS]
+    mugs = by_index[0]  # put the white mug on the left plate, then the yellow and white mug on the right
+    assert gmd.head_words(mugs, 0, slots) == ["put", "mug", "plate", "on", "two", "first"]
+    assert gmd.head_words(mugs, 1, slots)[-1] == "second"
+    microwave = by_index[2]  # the mug into "microwave (heating region)", then close it (no target)
+    assert gmd.head_words(microwave, 0, slots)[2] == "microwave"
+    assert gmd.head_words(microwave, 1, slots)[:4] == ["close", "microwave", None, "close"]
+    drawer = by_index[12]  # open the top drawer and put the bowl inside: one stage
+    assert gmd.head_words(drawer, 0, slots) == ["open", "bowl", "drawer", "in", "one", "first"]
+    assert gmd.head_words(drawer, 0, ["OBJ", "T_ACTIVE"]) == ["bowl", "first"]
