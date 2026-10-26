@@ -347,3 +347,34 @@ def test_stock_forward_is_its_velocity_helper():
     prefix = stock.embed_prefix(images, img_masks, lang_tokens, lang_masks)
     v = stock.velocity_from_prefix(*prefix, state, x_t, time)
     torch.testing.assert_close(loss, (noise - actions - v).pow(2))
+
+
+def test_word_token_scale():
+    import math
+
+    arrays = _module_arrays(0)
+    obs = _obs(0, arrays)
+    words = _model_with(module_token_scale="words")
+    language = _model_with()
+    images, img_masks, lang_tokens, lang_masks, _ = words._preprocess_observation(obs, train=False)  # noqa: SLF001
+    n = _enc.SPATIAL_TOKENS + _enc.TEMPORAL_TOKENS
+    embs, _, _ = words.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
+    ref, _, _ = language.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
+    num_img = embs.shape[1] - lang_tokens.shape[1] - n
+    module = embs[:, num_img : num_img + n]
+
+    # Every token at the mean RMS of the sample's module-text tokens as the prefix embeds language.
+    embed = words.paligemma_with_expert.embed_language_tokens
+    ids, mask = torch.as_tensor(arrays["glow_text"]), torch.as_tensor(arrays["glow_text_mask"])
+    rms = (embed(ids).float() * math.sqrt(WIDTH)).pow(2).mean(-1).sqrt()
+    target = (rms * mask).sum(1) / mask.sum(1)
+    module_rms = module.pow(2).mean(-1).sqrt()
+    torch.testing.assert_close(module_rms, target[:, None].expand_as(module_rms), rtol=1e-4, atol=1e-4)
+    # Same encoders, same directions: only the size differs from the language scale.
+    cos = torch.nn.functional.cosine_similarity(module, ref[:, num_img : num_img + n], dim=-1)
+    torch.testing.assert_close(cos, torch.ones_like(cos), rtol=0, atol=1e-5)
+    # The rest of the prefix is untouched.
+    torch.testing.assert_close(embs[:, :num_img], ref[:, :num_img])
+    torch.testing.assert_close(embs[:, num_img + n :], ref[:, num_img + n :])
+    with pytest.raises(ValueError, match="module_token_scale"):
+        _model_with(module_token_scale="huge")

@@ -1074,13 +1074,18 @@ _CONFIGS = [
     _glow_module_train_config("pi05_libero_glow_s_only", module_temporal=False),
     _glow_module_train_config("pi05_libero_glow_nogrounding", module_grounding=False),
     _glow_module_train_config("pi05_libero_glow_nosubgoal", module_subgoal_text=False),
-    # Text-anchored encoders (each token starts as its slot's text embedding). _st_align trains
-    # only them, the backbone frozen, on flow + distillation from the same model reading the task
-    # string; _st_anchor is the joint fine-tune, started from an _st_align checkpoint.
+    # Text-anchored encoders (each token starts as its slot's text embedding) whose tokens enter
+    # the prefix at a word token's size. _st_align trains only them, the backbone frozen, on
+    # flow + distillation from the same model reading the task string; _st_anchor is the joint
+    # fine-tune, started from an _st_align checkpoint.
     _glow_module_train_config(
-        "pi05_libero_glow_st_align", module_text_anchor=True, freeze_pretrained=True, module_distill_weight=1.0
+        "pi05_libero_glow_st_align",
+        module_text_anchor=True,
+        module_token_scale="words",
+        freeze_pretrained=True,
+        module_distill_weight=1.0,
     ),
-    _glow_module_train_config("pi05_libero_glow_st_anchor", module_text_anchor=True),
+    _glow_module_train_config("pi05_libero_glow_st_anchor", module_text_anchor=True, module_token_scale="words"),
     #
     # Fine-tuning Aloha configs.
     #

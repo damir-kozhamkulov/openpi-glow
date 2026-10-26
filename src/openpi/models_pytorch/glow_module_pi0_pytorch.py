@@ -7,8 +7,11 @@ images and the language, all bidirectional as in the stock prefix:
 
 The action expert attends to the whole prefix, as stock; nothing else changes, so training and
 inference are the stock forward and sample_actions with this prefix (`embed_observation_prefix`).
-The encoders' outputs are rescaled to the RMS of the sample's language-token embeddings, so they
-enter the backbone at the scale its input tokens have.
+Each encoder token is rescaled to a target RMS (`config.module_token_scale`): the RMS of the
+sample's language-token embeddings ("language"; with the task string dropped these are BOS and the
+newline answer token), or the mean RMS of the sample's own module-text tokens as the prefix embeds
+language ("words", the size of an ordinary word token). The size matters beyond the first layer:
+a token keeps its input norm in the residual stream.
 
 The encoders are new parameters: the fine-tuning init (pi05_libero) has none of them, so the
 trainer loads it non-strictly for exactly the names under NEW_PARAM_PREFIXES, and trains them at
@@ -21,12 +24,17 @@ of the module model's velocity from the teacher's. The teacher pass runs first, 
 is the last forward before the backward. Evaluation-mode forward is the plain flow loss.
 """
 
+import math
+
 import torch
 import torch.nn.functional as F  # noqa: N812
 
 from openpi.glow import module_encoders as _enc
 from openpi.models import gemma as _gemma
 from openpi.models_pytorch import pi0_pytorch
+
+
+MODULE_TOKEN_SCALES = ("language", "words")
 
 
 class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
@@ -36,6 +44,10 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         super().__init__(config)
         if not (config.module_spatial or config.module_temporal):
             raise ValueError("GlowModulePI0Pytorch needs the spatial or the temporal encoder")
+        if config.module_token_scale not in MODULE_TOKEN_SCALES:
+            raise ValueError(
+                f"module_token_scale must be one of {MODULE_TOKEN_SCALES}, got {config.module_token_scale!r}"
+            )
         width = _gemma.get_config(config.paligemma_variant).width
         self.glow_spatial_encoder = (
             _enc.SpatialEncoder(
@@ -110,6 +122,15 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
             "teacher_flow": F.mse_loss(u_t, v_teacher).detach(),
         }
 
+    def module_text_rms(self, observation) -> torch.Tensor:
+        """Mean RMS [B, 1, 1] of the sample's module-text token embeddings at the prefix's language
+        scale (embedding x sqrt(width), as embed_prefix scales language tokens)."""
+        ids, mask = observation.glow_text, observation.glow_text_mask
+        emb = self.paligemma_with_expert.embed_language_tokens(ids).to(torch.float32)
+        rms = (emb * math.sqrt(emb.shape[-1])).pow(2).mean(-1).sqrt()
+        valid = mask.to(torch.float32)
+        return ((rms * valid).sum(1) / valid.sum(1).clamp(min=1.0))[:, None, None]
+
     def embed_observation_prefix(self, observation, images, img_masks, lang_tokens, lang_masks):
         embs, pad_masks, att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         num_img = embs.shape[1] - lang_tokens.shape[1]
@@ -118,8 +139,9 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         valid = lang_masks.to(torch.float32)[..., None]
         lang_rms = torch.sqrt((lang.pow(2).mean(-1, keepdim=True) * valid).sum(1, keepdim=True)
                               / valid.sum(1, keepdim=True).clamp(min=1.0))
+        target_rms = self.module_text_rms(observation) if self.config.module_token_scale == "words" else lang_rms
         module = self.module_tokens(observation)
-        module = module * torch.rsqrt(module.pow(2).mean(-1, keepdim=True) + 1e-6) * lang_rms.detach()
+        module = module * torch.rsqrt(module.pow(2).mean(-1, keepdim=True) + 1e-6) * target_rms.detach()
         module = module.to(embs.dtype)
 
         bsize, num_module = module.shape[:2]

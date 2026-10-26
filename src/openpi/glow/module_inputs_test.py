@@ -226,6 +226,9 @@ def test_align_configs(monkeypatch):
     assert align.model.module_text_anchor and align.model.freeze_pretrained and align.model.module_distill_weight > 0
     assert anchor.model.module_text_anchor and not anchor.model.freeze_pretrained
     assert anchor.model.module_distill_weight == 0 and not st.model.module_text_anchor
+    # Both enter the prefix at a word token's size; the unanchored row keeps the language scale.
+    assert align.model.module_token_scale == anchor.model.module_token_scale == "words"
+    assert st.model.module_token_scale == "language"
     # Same data and recipe as the unanchored row.
     for cfg in (align, anchor):
         assert dataclasses.replace(cfg.data) == st.data

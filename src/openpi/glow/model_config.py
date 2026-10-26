@@ -48,6 +48,10 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # Each encoder token = its slot's pooled text embedding + a residual whose last layer starts at
     # zero (module_encoders), so a fresh encoder emits language-like tokens, not random ones.
     module_text_anchor: bool = False
+    # The size each encoder token enters the prefix at: "language" = the RMS of the sample's
+    # language tokens (with the task string dropped, only BOS and the newline answer token);
+    # "words" = the mean RMS of the sample's own module-text tokens as the prefix embeds them.
+    module_token_scale: str = "language"
     # The encoders start from scratch while the backbone is fine-tuned: their learning rate is the
     # schedule's times this.
     encoder_lr_scale: float = 16.0
