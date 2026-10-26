@@ -338,6 +338,12 @@ class PI0Pytorch(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_observation_prefix(
             observation, images, img_masks, lang_tokens, lang_masks
         )
+        v_t = self.velocity_from_prefix(prefix_embs, prefix_pad_masks, prefix_att_masks, state, x_t, time)
+        return F.mse_loss(u_t, v_t, reduction="none")
+
+    def velocity_from_prefix(self, prefix_embs, prefix_pad_masks, prefix_att_masks, state, x_t, time) -> Tensor:
+        """The predicted flow velocity for noisy actions `x_t` at `time`, given an embedded prefix:
+        the training forward after the prefix."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -378,9 +384,7 @@ class PI0Pytorch(nn.Module):
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-
-        return F.mse_loss(u_t, v_t, reduction="none")
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

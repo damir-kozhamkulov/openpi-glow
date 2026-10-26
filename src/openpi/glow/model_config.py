@@ -45,9 +45,23 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # Encoder width and transformer depth.
     module_width: int = 512
     module_depth: int = 2
+    # Each encoder token = its slot's pooled text embedding + a residual whose last layer starts at
+    # zero (module_encoders), so a fresh encoder emits language-like tokens, not random ones.
+    module_text_anchor: bool = False
     # The encoders start from scratch while the backbone is fine-tuned: their learning rate is the
     # schedule's times this.
     encoder_lr_scale: float = 16.0
+    # Training loss = module_flow_weight x flow + module_distill_weight x distillation, where the
+    # distillation target is the velocity the same model predicts from the task string instead of
+    # the module tokens (a teacher pass without gradients, on the same images, state, noise and
+    # time). The task string reaches the model only for that pass, tokenized to
+    # module_teacher_prompt_len; inference never sees it.
+    module_flow_weight: float = 1.0
+    module_distill_weight: float = 0.0
+    module_teacher_prompt_len: int = 48
+    # Train only the encoders: every pretrained parameter is frozen, so the teacher pass is the
+    # fine-tuning init itself.
+    freeze_pretrained: bool = False
 
     def create(self, rng):
         raise NotImplementedError("GLOW trains on the PyTorch path only (scripts/train_pytorch.py)")

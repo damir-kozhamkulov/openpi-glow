@@ -13,9 +13,16 @@ enter the backbone at the scale its input tokens have.
 The encoders are new parameters: the fine-tuning init (pi05_libero) has none of them, so the
 trainer loads it non-strictly for exactly the names under NEW_PARAM_PREFIXES, and trains them at
 `config.encoder_lr_scale` times the backbone's learning rate.
+
+Distillation (`config.module_distill_weight` > 0, training mode only): a teacher pass without
+gradients runs the stock prefix with the task string (`observation.glow_teacher_prompt`) on the
+same preprocessed images, state, noisy actions and time, and the loss adds the squared distance
+of the module model's velocity from the teacher's. The teacher pass runs first, so the student's
+is the last forward before the backward. Evaluation-mode forward is the plain flow loss.
 """
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 from openpi.glow import module_encoders as _enc
 from openpi.models import gemma as _gemma
@@ -38,12 +45,15 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
                 config.module_depth,
                 grounding=config.module_grounding,
                 subgoal_text=config.module_subgoal_text,
+                text_anchor=config.module_text_anchor,
             )
             if config.module_spatial
             else None
         )
         self.glow_temporal_encoder = (
-            _enc.TemporalEncoder(width, width, config.module_width, config.module_depth)
+            _enc.TemporalEncoder(
+                width, width, config.module_width, config.module_depth, text_anchor=config.module_text_anchor
+            )
             if config.module_temporal
             else None
         )
@@ -64,6 +74,41 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         if self.glow_temporal_encoder is not None:
             tokens.append(self.glow_temporal_encoder(embed, text, text_mask, ints))
         return torch.cat(tokens, dim=1)
+
+    def forward(self, observation, actions, noise=None, time=None):
+        if not (self.training and self.config.module_distill_weight > 0):
+            return super().forward(observation, actions, noise=noise, time=time)
+        if observation.glow_teacher_prompt is None or observation.glow_teacher_prompt_mask is None:
+            raise ValueError(
+                "GlowModulePI0Pytorch: distillation needs the task string as glow_teacher_prompt; the data "
+                "config passes a teacher tokenizer to GlowModuleInputs when module_distill_weight > 0"
+            )
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        with torch.no_grad():
+            teacher_prefix = self.embed_prefix(
+                images, img_masks, observation.glow_teacher_prompt, observation.glow_teacher_prompt_mask
+            )
+            v_teacher = self.velocity_from_prefix(*teacher_prefix, state, x_t, time)
+        student_prefix = self.embed_observation_prefix(observation, images, img_masks, lang_tokens, lang_masks)
+        v_t = self.velocity_from_prefix(*student_prefix, state, x_t, time)
+
+        flow = F.mse_loss(u_t, v_t)
+        distill = F.mse_loss(v_t, v_teacher)
+        loss = self.config.module_flow_weight * flow + self.config.module_distill_weight * distill
+        return {
+            "loss": loss,
+            "flow": flow.detach(),
+            "distill": distill.detach(),
+            "teacher_flow": F.mse_loss(u_t, v_teacher).detach(),
+        }
 
     def embed_observation_prefix(self, observation, images, img_masks, lang_tokens, lang_masks):
         embs, pad_masks, att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)

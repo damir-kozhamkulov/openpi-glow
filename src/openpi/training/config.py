@@ -445,7 +445,12 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
             raise ValueError(f"expected one TokenizePrompt in the pi05 model transforms, got {len(at_tokenize)}")
         i = at_tokenize[0]
         if self.module_inputs:
-            plan = [_module_inputs.GlowModuleInputs(pack, stock[i].tokenizer), stock[i]]
+            teacher = (
+                _tokenizer.PaligemmaTokenizer(model_config.module_teacher_prompt_len)
+                if model_config.module_distill_weight > 0
+                else None
+            )
+            plan = [_module_inputs.GlowModuleInputs(pack, stock[i].tokenizer, teacher), stock[i]]
             model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
             return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
         if self.plan_as_prompt:
@@ -1069,6 +1074,13 @@ _CONFIGS = [
     _glow_module_train_config("pi05_libero_glow_s_only", module_temporal=False),
     _glow_module_train_config("pi05_libero_glow_nogrounding", module_grounding=False),
     _glow_module_train_config("pi05_libero_glow_nosubgoal", module_subgoal_text=False),
+    # Text-anchored encoders (each token starts as its slot's text embedding). _st_align trains
+    # only them, the backbone frozen, on flow + distillation from the same model reading the task
+    # string; _st_anchor is the joint fine-tune, started from an _st_align checkpoint.
+    _glow_module_train_config(
+        "pi05_libero_glow_st_align", module_text_anchor=True, freeze_pretrained=True, module_distill_weight=1.0
+    ),
+    _glow_module_train_config("pi05_libero_glow_st_anchor", module_text_anchor=True),
     #
     # Fine-tuning Aloha configs.
     #

@@ -199,3 +199,151 @@ def test_stock_prefix_hook_is_the_stock_prefix():
     b = stock.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
     for x, y in zip(a, b, strict=True):
         assert torch.equal(x, y)
+
+
+def _pooled(model, arrays, names):
+    """Mean backbone embedding of the valid tokens of the named segments, per sample [B, D]."""
+    embed = model.paligemma_with_expert.embed_language_tokens
+    ids = np.concatenate([arrays["glow_text"][:, slice(*_mi.TEXT_SEGMENTS[n])] for n in names], axis=1)
+    valid = np.concatenate([arrays["glow_text_mask"][:, slice(*_mi.TEXT_SEGMENTS[n])] for n in names], axis=1)
+    emb = embed(torch.as_tensor(ids)).float() * torch.as_tensor(valid)[..., None]
+    return emb.sum(1) / torch.as_tensor(valid).sum(1, keepdim=True).clamp(min=1)
+
+
+def test_text_anchor_init_emits_the_anchors():
+    m = _model_with(module_text_anchor=True)
+    arrays = _module_arrays(0)
+    tokens = m.module_tokens(_obs(0, arrays))
+    stage = torch.as_tensor(arrays["glow_ints"][:, _mi.INT_STAGE])
+    every_rk = [f"rk{j}" for j in range(_mi.K_MAX)]
+    expected = [
+        _pooled(m, arrays, ["subgoal"]),
+        _pooled(m, arrays, ["object"]),
+        _pooled(m, arrays, ["target"]),
+        _pooled(m, arrays, ["subgoal", "object", "target"]),
+        _pooled(m, arrays, every_rk),
+        torch.stack([_pooled(m, arrays, [f"rk{j}"]) for j in range(_mi.K_MAX)], dim=1)[torch.arange(B), stage],
+    ]
+    torch.testing.assert_close(tokens, torch.stack(expected, dim=1), rtol=1e-5, atol=1e-6)
+    # The prefix carries them, rescaled to the language tokens' RMS as unanchored tokens are.
+    obs = _obs(0, arrays)
+    images, img_masks, lang_tokens, lang_masks, _ = m._preprocess_observation(obs, train=False)  # noqa: SLF001
+    embs, _, _ = m.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
+    num_img = embs.shape[1] - lang_tokens.shape[1] - tokens.shape[1]
+    cos = torch.nn.functional.cosine_similarity(embs[:, num_img : num_img + tokens.shape[1]], tokens, dim=-1)
+    torch.testing.assert_close(cos, torch.ones_like(cos), rtol=0, atol=1e-5)
+
+
+def test_text_anchor_without_subgoal_text():
+    m = _model_with(module_text_anchor=True, module_subgoal_text=False)
+    arrays = _module_arrays(0)
+    tokens = m.module_tokens(_obs(0, arrays))
+    assert torch.equal(tokens[:, 0], torch.zeros_like(tokens[:, 0]))  # OP anchors to zero
+    torch.testing.assert_close(tokens[:, 3], _pooled(m, arrays, ["object", "target"]), rtol=1e-5, atol=1e-6)
+
+
+def test_text_anchor_residual_trains():
+    m = _model_with(module_text_anchor=True)
+    _flow(m, _obs(0, _module_arrays(0))).mean().backward()
+    for enc in (m.glow_spatial_encoder, m.glow_temporal_encoder):
+        # The zero-initialized output layer moves first; everything before it waits for it.
+        assert enc.out[1].weight.grad.abs().sum() > 0 and enc.out[1].bias.grad.abs().sum() > 0
+        assert all(p.grad is None or p.grad.abs().sum() == 0 for p in enc.transformer.parameters())
+    m.zero_grad(set_to_none=True)
+
+
+def _teacher(seed=0, bsize=B):
+    """Task-string tokens for the teacher pass: the stock prompt rows of `_arrays`."""
+    _, _, _, tokens, tmask, _, _ = _arrays(seed + 50, 0, bsize, with_block=False)
+    return {"glow_teacher_prompt": tokens, "glow_teacher_prompt_mask": tmask}
+
+
+def _distill_obs(seed=0):
+    return _obs(seed, {**_module_arrays(seed), **_teacher(seed)})
+
+
+def _flow_inputs(seed=7):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(B, 10, 32, generator=g), torch.randn(B, 10, 32, generator=g), torch.rand(B, generator=g)
+
+
+def _by_hand(m, obs, actions, noise, time):
+    """Teacher and student velocities as the distillation forward computes them (seed 0)."""
+    torch.manual_seed(0)
+    images, img_masks, lang_tokens, lang_masks, state = m._preprocess_observation(obs, train=True)  # noqa: SLF001
+    x_t = time[:, None, None] * noise + (1 - time[:, None, None]) * actions
+    with torch.no_grad():
+        teacher = m.embed_prefix(images, img_masks, obs.glow_teacher_prompt, obs.glow_teacher_prompt_mask)
+        v_teacher = m.velocity_from_prefix(*teacher, state, x_t, time)
+    student = m.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
+    return m.velocity_from_prefix(*student, state, x_t, time), v_teacher
+
+
+def test_distillation_forward():
+    m = _model_with(module_text_anchor=True, module_distill_weight=0.5, module_flow_weight=2.0)
+    obs = _distill_obs()
+    actions, noise, time = _flow_inputs()
+    m.train()
+    torch.manual_seed(0)
+    out = m(obs, actions, noise=noise, time=time)
+    assert set(out) == {"loss", "flow", "distill", "teacher_flow"}
+
+    with torch.no_grad():
+        v, v_teacher = _by_hand(m, obs, actions, noise, time)
+    u_t = noise - actions
+    flow, distill = (u_t - v).pow(2).mean(), (v - v_teacher).pow(2).mean()
+    torch.testing.assert_close(out["flow"], flow)
+    torch.testing.assert_close(out["distill"], distill)
+    torch.testing.assert_close(out["teacher_flow"], (u_t - v_teacher).pow(2).mean())
+    torch.testing.assert_close(out["loss"], 2.0 * flow + 0.5 * distill)
+    assert out["distill"] > 0 and out["loss"].requires_grad and not out["distill"].requires_grad
+
+    # Evaluation mode is the plain per-element flow loss.
+    m.eval()
+    plain = m(obs, actions, noise=noise, time=time)
+    assert isinstance(plain, torch.Tensor) and plain.shape == actions.shape
+
+
+def test_distillation_teacher_carries_no_gradient():
+    """The gradient is that of flow + distillation toward a constant target."""
+    m = _model_with(module_text_anchor=True, module_distill_weight=1.0)
+    obs = _distill_obs()
+    actions, noise, time = _flow_inputs()
+    m.train()
+    torch.manual_seed(0)
+    m(obs, actions, noise=noise, time=time)["loss"].backward()
+    got = {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+    m.zero_grad(set_to_none=True)
+
+    v, v_teacher = _by_hand(m, obs, actions, noise, time)
+    ((noise - actions - v).pow(2).mean() + (v - v_teacher).pow(2).mean()).backward()
+    want = {n: p.grad for n, p in m.named_parameters() if p.grad is not None}
+    assert got.keys() == want.keys()
+    for n in want:
+        torch.testing.assert_close(got[n], want[n], rtol=1e-4, atol=1e-7, msg=n)
+    m.zero_grad(set_to_none=True)
+
+
+def test_distillation_needs_the_teacher_prompt():
+    m = _model_with(module_distill_weight=1.0)
+    m.train()
+    with pytest.raises(ValueError, match="glow_teacher_prompt"):
+        m(_obs(0, _module_arrays(0)), torch.zeros(B, 10, 32))
+
+
+def test_stock_forward_is_its_velocity_helper():
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+
+    torch.manual_seed(1234)
+    stock = PI0Pytorch(_cfg(pi0_config.Pi0Config))
+    obs = _obs(0, _module_arrays(0))
+    actions, noise, time = _flow_inputs()
+    stock.eval()
+    torch.manual_seed(0)
+    loss = stock(obs, actions, noise=noise, time=time)
+    torch.manual_seed(0)
+    images, img_masks, lang_tokens, lang_masks, state = stock._preprocess_observation(obs, train=True)  # noqa: SLF001
+    x_t = time[:, None, None] * noise + (1 - time[:, None, None]) * actions
+    prefix = stock.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    v = stock.velocity_from_prefix(*prefix, state, x_t, time)
+    torch.testing.assert_close(loss, (noise - actions - v).pow(2))

@@ -333,15 +333,34 @@ def load_init_weights(model: torch.nn.Module, model_path: str, device) -> None:
     logging.info(f"Init weights: {len(missing)} tensors under {prefixes} start from their initialization")
 
 
+def freeze_pretrained(model: torch.nn.Module) -> int:
+    """Stop gradients to every parameter outside `new_param_prefixes` (call before wrapping the
+    model); returns how many parameters that freezes."""
+    prefixes = new_param_prefixes(model)
+    if not prefixes:
+        raise ValueError("freeze_pretrained: the model adds no parameters, so nothing would train")
+    frozen = 0
+    for name, param in model.named_parameters():
+        if not name.removeprefix("module.").startswith(prefixes):
+            param.requires_grad_(False)
+            frozen += param.numel()
+    return frozen
+
+
 def optimizer_param_groups(model: torch.nn.Module, lr_scale: float) -> list[dict]:
     """One group for the pretrained parameters and, when the model adds any, one for the new
-    ones; each group's `lr_scale` multiplies the schedule's learning rate."""
+    ones; each group's `lr_scale` multiplies the schedule's learning rate. Frozen parameters are
+    left out, and so is a group they empty."""
     prefixes = new_param_prefixes(model)
     groups = {"pretrained": [], "new": []}
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         name = name.removeprefix("module.")  # noqa: PLW2901
         groups["new" if prefixes and name.startswith(prefixes) else "pretrained"].append(param)
-    out = [{"params": groups["pretrained"], "lr_scale": 1.0, "name": "pretrained"}]
+    out = []
+    if groups["pretrained"]:
+        out.append({"params": groups["pretrained"], "lr_scale": 1.0, "name": "pretrained"})
     if groups["new"]:
         out.append({"params": groups["new"], "lr_scale": float(lr_scale), "name": "new"})
     return out
@@ -626,6 +645,8 @@ def train_loop(config: _config.TrainConfig):
         model_cfg.create_pytorch() if hasattr(model_cfg, "create_pytorch")
         else openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
     ).to(device)
+    if getattr(model_cfg, "freeze_pretrained", False):
+        logging.info(f"Frozen: {freeze_pretrained(model):,} pretrained parameters (only the new ones train)")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -691,7 +712,7 @@ def train_loop(config: _config.TrainConfig):
 
     # Create optimizer with config parameters
     param_groups = optimizer_param_groups(model, getattr(model_cfg, "encoder_lr_scale", 1.0))
-    new_params = param_groups[1]["params"] if len(param_groups) > 1 else []
+    new_params = next((g["params"] for g in param_groups if g["name"] == "new"), [])
     if is_main:
         for group in param_groups:
             count = sum(p.numel() for p in group["params"])
@@ -882,7 +903,8 @@ def train_loop(config: _config.TrainConfig):
                 infos.append(
                     {
                         "loss": loss_value,
-                        "learning_rate": optim.param_groups[0]["lr"],
+                        # The schedule's rate: group 0 is the encoders' when the backbone is frozen.
+                        "learning_rate": optim.param_groups[0]["lr"] / optim.param_groups[0].get("lr_scale", 1.0),
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                         **({"new_grad_norm": new_grad_norm} if new_grad_norm is not None else {}),
                         **{f"term/{k}": v for k, v in term_values.items()},
@@ -954,7 +976,11 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss_value:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {
+                        "loss": f"{loss_value:.4f}",
+                        "lr": f"{optim.param_groups[0]['lr'] / optim.param_groups[0].get('lr_scale', 1.0):.2e}",
+                        "step": global_step,
+                    }
                 )
 
     # Close progress bar

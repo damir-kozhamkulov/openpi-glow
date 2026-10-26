@@ -174,4 +174,6 @@ def preprocess_observation_pytorch(
         glow_text_mask=getattr(observation, "glow_text_mask", None),
         glow_ints=getattr(observation, "glow_ints", None),
         glow_floats=getattr(observation, "glow_floats", None),
+        glow_teacher_prompt=getattr(observation, "glow_teacher_prompt", None),
+        glow_teacher_prompt_mask=getattr(observation, "glow_teacher_prompt_mask", None),
     )

@@ -138,6 +138,27 @@ def test_inference_and_steering(pack, transform):
         transform({"prompt": one.task, "episode_index": ep, "frame_index": 0})
 
 
+def test_teacher_prompt(pack, chain, transform, tokenizer):
+    from openpi.models import tokenizer as _tokenizer
+
+    teacher_tokenizer = _tokenizer.PaligemmaTokenizer(48)
+    with_teacher = _mi.GlowModuleInputs(pack, tokenizer, teacher_tokenizer)
+    ep = next(e for e, rows in sorted(chain.items()) if len(rows) == 2)
+    task = next(t.task for t in pack.tasks.values() if t.task_index == int(chain[ep][0]["task_index"]))
+    sample = {"prompt": task, "episode_index": np.int64(ep), "frame_index": np.int64(0)}
+    out = with_teacher(dict(sample))
+    # The task string as the stock pi05 prompt (BOS, task, newline), the student's prompt emptied.
+    tokens, mask = teacher_tokenizer.tokenize(task)
+    np.testing.assert_array_equal(out["glow_teacher_prompt"], tokens)
+    np.testing.assert_array_equal(out["glow_teacher_prompt_mask"], mask)
+    assert out["prompt"] == "" and 2 < mask.sum() < 48
+    for key, value in transform(dict(sample)).items():
+        np.testing.assert_array_equal(out[key], value)
+    # Inference never carries it, and neither does a transform without a teacher tokenizer.
+    assert "glow_teacher_prompt" not in with_teacher({"prompt": task, "oracle_plan_index": 0})
+    assert "glow_teacher_prompt" not in transform(dict(sample))
+
+
 def test_samples_make_a_valid_observation(pack, transform):
     from openpi.models import model as _model
 
@@ -195,7 +216,34 @@ def test_module_configs(monkeypatch):
         dataclasses.replace(local, plan_as_prompt=True).create(pathlib.Path("."), cfg.model)
 
 
-def test_module_loader_end_to_end(monkeypatch):
+def test_align_configs(monkeypatch):
+    import openpi.training.config as _config
+
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+    st = _config.get_config("pi05_libero_glow_st")
+    align = _config.get_config("pi05_libero_glow_st_align")
+    anchor = _config.get_config("pi05_libero_glow_st_anchor")
+    assert align.model.module_text_anchor and align.model.freeze_pretrained and align.model.module_distill_weight > 0
+    assert anchor.model.module_text_anchor and not anchor.model.freeze_pretrained
+    assert anchor.model.module_distill_weight == 0 and not st.model.module_text_anchor
+    # Same data and recipe as the unanchored row.
+    for cfg in (align, anchor):
+        assert dataclasses.replace(cfg.data) == st.data
+        for field in ("batch_size", "num_train_steps", "lr_schedule", "optimizer", "weight_loader"):
+            assert getattr(cfg, field) == getattr(st, field), field
+
+    def module_transform(cfg):
+        local = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK))
+        inputs = local.create(pathlib.Path("."), cfg.model).model_transforms.inputs
+        return next(t for t in inputs if isinstance(t, _mi.GlowModuleInputs))
+
+    # Only a distilling model gets the teacher prompt.
+    assert module_transform(align).teacher_tokenizer is not None
+    assert module_transform(anchor).teacher_tokenizer is None and module_transform(st).teacher_tokenizer is None
+
+
+@pytest.mark.parametrize("config_name", ["pi05_libero_glow_st", "pi05_libero_glow_st_align"])
+def test_module_loader_end_to_end(monkeypatch, config_name):
     home = os.environ.get("HF_LEROBOT_HOME")
     if not home or not (pathlib.Path(home) / "libero_staging").exists():
         pytest.skip("local LeRobot copy not present")
@@ -205,7 +253,7 @@ def test_module_loader_end_to_end(monkeypatch):
     # A Goal-only subset: not episodes 0..n-1, so the loader restricts the whole dataset's rows.
     monkeypatch.setenv("OPENPI_TRAIN_EPISODES", "379:383")
     monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    cfg = _config.get_config("pi05_libero_glow_st")
+    cfg = _config.get_config(config_name)
     cfg = dataclasses.replace(
         cfg,
         data=dataclasses.replace(cfg.data, repo_id="libero_staging", plan_pack_path=str(GOAL_PACK)),
@@ -222,4 +270,10 @@ def test_module_loader_end_to_end(monkeypatch):
         ints = np.asarray(obs.glow_ints)
         assert (ints[:, _mi.INT_NUM_STAGES] == 1).all() and (ints[:, _mi.INT_STAGE] == 0).all()
         assert np.asarray(obs.glow_text_mask).any(axis=1).all()
+        if cfg.model.module_distill_weight > 0:
+            # The teacher's prompt: BOS, the task string, newline.
+            assert obs.glow_teacher_prompt.shape == (8, cfg.model.module_teacher_prompt_len)
+            assert (np.asarray(obs.glow_teacher_prompt_mask).sum(axis=1) > 2).all()
+        else:
+            assert obs.glow_teacher_prompt is None
     assert goal_tasks  # Goal episodes are single-stage tasks 10-19

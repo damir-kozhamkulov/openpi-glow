@@ -19,6 +19,10 @@ The active stage comes from the labels at training (`episode_index` / `frame_ind
 `plan_task` steers (that task's module, index clamped to its stages). `prev_plan_index`, sent by
 every GLOW client, is accepted and ignored. A field longer than its segment raises rather than
 being cut.
+
+With a `teacher_tokenizer`, training samples also carry the task string as the stock pi05 prompt
+(`glow_teacher_prompt` / `glow_teacher_prompt_mask`), for the distillation teacher pass of
+GlowModulePI0Pytorch. Inference samples never do.
 """
 
 import dataclasses
@@ -67,6 +71,7 @@ def _scalar(x):
 class GlowModuleInputs(DataTransformFn):
     pack: _plan_pack.PlanPack
     tokenizer: _tokenizer.PaligemmaTokenizer
+    teacher_tokenizer: _tokenizer.PaligemmaTokenizer | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.get("prompt")) is None:
@@ -88,6 +93,9 @@ class GlowModuleInputs(DataTransformFn):
                     f"but its prompt {prompt!r} is task {task.task_index}"
                 )
             plan_index = self.pack.plan_index(episode_index, frame_index)
+            if self.teacher_tokenizer is not None:
+                tokens, mask = self.teacher_tokenizer.tokenize(prompt)
+                data["glow_teacher_prompt"], data["glow_teacher_prompt_mask"] = tokens, mask
         elif (oracle := data.pop("oracle_plan_index", None)) is not None:
             plan_index = int(_scalar(oracle))
             if plan_prompt != prompt:
