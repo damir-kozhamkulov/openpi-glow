@@ -13,13 +13,89 @@ next query's previous plan. Modes:
   self    the server scores every stage and returns its choice (`plan_choice`)
   oracle  the tracker's stage is sent as `oracle_plan_index` and used as the plan
   forced  a fixed stage is sent as `oracle_plan_index` (counterfactual: do actions follow it?)
+  atoms   the first stage of a given order whose goal atom has not held yet on the simulator
+          (`StageAtoms`) is sent as `oracle_plan_index`: order 0,1 is a simulator oracle, 1,0
+          asks for the stages the other way round (do actions follow the stage when the scene
+          does not settle it?)
 The tracker runs in every mode, so the model's plan can be compared against it. When the plans
 come from another task than the environment's (steering), `tracker_plans` is the environment
 task's stage count and `num_plans` the plan task's.
+
+`StageAtoms`: when each stage's goal atom (its runtime_key, e.g. "on(moka_pot_1,
+flat_stove_1_cook_region)", one atom of the task's BDDL goal) first held. Evaluating the atoms
+reads the simulator state, so it is for scoring and for the atoms mode, never for a policy input
+an evaluation could not have.
 """
 
 HOLD_MIN = 30
-PLAN_MODES = ("self", "oracle", "forced")
+PLAN_MODES = ("self", "oracle", "forced", "atoms")
+
+
+def parse_atom(runtime_key):
+    """A runtime key as a LIBERO goal atom: "on(a_1, b_1)" -> ("on", "a_1", "b_1")."""
+    key = runtime_key.strip()
+    if not key.endswith(")") or "(" not in key:
+        raise ValueError("runtime key {!r} is not predicate(args)".format(runtime_key))
+    name, args = key[:-1].split("(", 1)
+    args = tuple(a.strip() for a in args.split(","))
+    if not name.strip() or not all(args):
+        raise ValueError("runtime key {!r} is not predicate(args)".format(runtime_key))
+    return (name.strip().lower(),) + args
+
+
+def parse_order(text):
+    """--plan-order "1,0" -> [1, 0] (0-based stage indices, each once)."""
+    try:
+        order = [int(s) for s in text.split(",")]
+    except ValueError:
+        raise ValueError("plan order {!r} is not comma-separated stage indices".format(text)) from None
+    if not order or min(order) < 0 or len(set(order)) != len(order):
+        raise ValueError("plan order {!r} must name each stage index >= 0 at most once".format(text))
+    return order
+
+
+def stage_order_for(order, num_plans):
+    """`order` restricted to a task's stages; it must then name every one of them."""
+    own = [k for k in order if k < num_plans]
+    if sorted(own) != list(range(num_plans)):
+        raise ValueError("plan order {} does not order all {} stages of the task".format(order, num_plans))
+    return own
+
+
+class StageAtoms:
+    def __init__(self, atoms, holds):
+        """atoms: one goal atom per stage, in stage order; holds(atom) -> bool on the simulator."""
+        if not atoms:
+            raise ValueError("a task has at least one stage atom")
+        self.atoms = list(atoms)
+        self._holds = holds
+        self.first_met = [None] * len(self.atoms)  # frame each atom first held
+
+    def observe(self, frame):
+        """Check every atom not met yet; call once per executed frame (and before the first)."""
+        for k, atom in enumerate(self.atoms):
+            if self.first_met[k] is None and self._holds(atom):
+                self.first_met[k] = frame
+
+    def stage(self, order):
+        """The first stage in `order` whose atom has not held yet (the last one once all have)."""
+        for k in order:
+            if self.first_met[k] is None:
+                return k
+        return order[-1]
+
+    def first(self):
+        """Which atom held first: the stage index as a string, "together" if several first held
+        on the same frame, "none" if none has."""
+        met = [(f, k) for k, f in enumerate(self.first_met) if f is not None]
+        if not met:
+            return "none"
+        earliest = min(f for f, _ in met)
+        firsts = [k for f, k in met if f == earliest]
+        return str(firsts[0]) if len(firsts) == 1 else "together"
+
+    def trace(self):
+        return "atoms_first_met={} first_stage={}".format(self.first_met, self.first())
 
 
 def plan_task_for(task_names, task_id, offset):
@@ -74,7 +150,9 @@ class StageTracker:
 
 
 class PlanEcho:
-    def __init__(self, mode, num_plans, forced_index=None, hold_min=HOLD_MIN, tracker_plans=None):
+    def __init__(
+        self, mode, num_plans, forced_index=None, hold_min=HOLD_MIN, tracker_plans=None, atoms=None, order=None
+    ):
         if mode not in PLAN_MODES:
             raise ValueError("mode must be one of {}, got {!r}".format(PLAN_MODES, mode))
         if mode == "forced":
@@ -82,9 +160,17 @@ class PlanEcho:
                 raise ValueError("forced mode needs a stage index >= 0")
             # One index serves every task: a stage past a task's last one means its last stage.
             forced_index = min(forced_index, num_plans - 1)
+        if mode == "atoms":
+            if atoms is None or order is None:
+                raise ValueError("atoms mode needs the stage atoms and a stage order")
+            if len(atoms.atoms) != num_plans:
+                raise ValueError("atoms mode plans the environment task's own {} stages".format(len(atoms.atoms)))
+            order = stage_order_for(order, num_plans)
         self.mode = mode
         self.num_plans = num_plans
         self.forced_index = forced_index
+        self.atoms = atoms
+        self.order = order
         self.tracker = StageTracker(num_plans if tracker_plans is None else tracker_plans, hold_min=hold_min)
         self.prev = 0
         self.queries = 0
@@ -100,6 +186,8 @@ class PlanEcho:
             req["oracle_plan_index"] = self.tracker.plan_index
         elif self.mode == "forced":
             req["oracle_plan_index"] = self.forced_index
+        elif self.mode == "atoms":
+            req["oracle_plan_index"] = self.atoms.stage(self.order)
         self._sent = req
         return req
 
@@ -128,7 +216,8 @@ class PlanEcho:
 
     def trace(self):
         """One-line episode summary for the stage-resolved analysis."""
-        return (
+        order = "" if self.order is None else "order={} ".format(",".join(str(k) for k in self.order))
+        return order + (
             "mode={} plan={} tracker={} of {} queries={} agreement={}/{} switches={} "
             "regressions={} tracker_releases={}".format(
                 self.mode,

@@ -188,3 +188,46 @@ def test_steered_goal_scores_the_simulator_state():
         assert own.check() is bool(env.check_success()) is False
     finally:
         env.close()
+
+
+def _pack_task(*keys):
+    return {
+        "K": len(keys),
+        "stages": [{"plan_index": k, "runtime_key": key} for k, key in reversed(list(enumerate(keys)))],
+    }
+
+
+def test_stage_atoms_are_goal_atoms_in_stage_order():
+    problem = _problem([["on", "bowl_1", "plate_1"], ["open", "drawer_1"]], objects=("bowl_1", "plate_1"))
+    task = _pack_task("on(bowl_1, plate_1)", "open(drawer_1)")
+    assert main.stage_atoms(task, problem) == [("on", "bowl_1", "plate_1"), ("open", "drawer_1")]
+    with pytest.raises(ValueError, match="not in the task's BDDL goal"):
+        main.stage_atoms(_pack_task("on(bowl_1, stove_region)"), problem)
+
+
+def test_first_counts_order():
+    import collections
+
+    c = collections.Counter({"none": 1, "1": 3, "together": 2, "0": 4})
+    assert main._first_counts(c) == "stage 0: 4, stage 1: 3, together: 2, none: 1"
+
+
+@needs_libero
+@pytest.mark.parametrize("suite_name", ["libero_10", "libero_goal"])
+def test_every_pack_stage_atom_is_in_its_bddl_goal(suite_name):
+    import json
+    import os
+
+    pack_path = os.environ.get("OPENPI_PLAN_PACK", "/app/glow/plan_pack_libero10_goal.json")
+    if not pathlib.Path(pack_path).exists():
+        pytest.skip(f"no plan pack at {pack_path}")
+    with open(pack_path, encoding="utf-8") as f:
+        pack = json.load(f)
+    task_suite, names = _libero_suite(suite_name)
+    for task_id, name in enumerate(names):
+        problem = main.bddl_utils.robosuite_parse_problem(task_suite.get_task_bddl_file_path(task_id))
+        atoms = main.stage_atoms(pack["tasks"][name], problem)
+        assert len(atoms) == pack["tasks"][name]["K"]
+        extra = {tuple(a) for a in problem["goal_state"]} - set(atoms)
+        # The stages cover the whole goal, except that both moka pots must also sit on a lit stove.
+        assert extra == ({("turnon", "flat_stove_1")} if name == "put both moka pots on the stove" else set()), name

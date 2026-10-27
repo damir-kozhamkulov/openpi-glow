@@ -93,3 +93,71 @@ def test_plan_task_for_is_a_derangement():
         gst.plan_task_for(names, 0, -1)
     with pytest.raises(ValueError):
         gst.plan_task_for([], 0, 1)
+
+
+def test_parse_atom():
+    assert gst.parse_atom("on(moka_pot_1, flat_stove_1_cook_region)") == (
+        "on",
+        "moka_pot_1",
+        "flat_stove_1_cook_region",
+    )
+    assert gst.parse_atom(" Close(microwave_1) ") == ("close", "microwave_1")
+    for bad in ("on moka_pot_1", "on(a, )", "(a)", "on(a"):
+        with pytest.raises(ValueError):
+            gst.parse_atom(bad)
+
+
+def test_parse_order_and_stage_order_for():
+    assert gst.parse_order("1,0") == [1, 0]
+    for bad in ("", "1,1", "-1,0", "a,b"):
+        with pytest.raises(ValueError):
+            gst.parse_order(bad)
+    assert gst.stage_order_for([1, 0], 2) == [1, 0]
+    assert gst.stage_order_for([1, 0], 1) == [0]  # a one-stage task keeps its stage
+    assert gst.stage_order_for([2, 0, 1], 2) == [0, 1]
+    with pytest.raises(ValueError):
+        gst.stage_order_for([1], 2)  # stage 0 left out
+
+
+def _atoms(holds):
+    return gst.StageAtoms([("on", "a_1", "b_1"), ("on", "c_1", "b_1")], lambda atom: holds[atom[1]])
+
+
+def test_stage_atoms_record_when_each_atom_first_held():
+    holds = {"a_1": False, "c_1": False}
+    atoms = _atoms(holds)
+    atoms.observe(0)
+    assert atoms.first_met == [None, None] and atoms.first() == "none"
+    assert atoms.stage([1, 0]) == 1 and atoms.stage([0, 1]) == 0
+    holds["c_1"] = True
+    atoms.observe(7)
+    assert atoms.first_met == [None, 7] and atoms.first() == "1"
+    assert atoms.stage([1, 0]) == 0 and atoms.stage([0, 1]) == 0
+    holds["c_1"] = False  # undone later: first_met keeps the first time
+    holds["a_1"] = True
+    atoms.observe(9)
+    assert atoms.first_met == [9, 7] and atoms.first() == "1"
+    assert atoms.stage([1, 0]) == 0  # all met: the order's last stage
+    assert atoms.trace() == "atoms_first_met=[9, 7] first_stage=1"
+    together = _atoms({"a_1": True, "c_1": True})
+    together.observe(3)
+    assert together.first() == "together"
+    with pytest.raises(ValueError):
+        gst.StageAtoms([], lambda atom: True)
+
+
+def test_atoms_mode_sends_the_ordered_stage():
+    holds = {"a_1": False, "c_1": False}
+    atoms = _atoms(holds)
+    with pytest.raises(ValueError):
+        gst.PlanEcho("atoms", 2, atoms=atoms)  # no order
+    with pytest.raises(ValueError):
+        gst.PlanEcho("atoms", 1, atoms=atoms, order=[0])  # not the environment task's stages
+    echo = gst.PlanEcho("atoms", 2, atoms=atoms, order=[1, 0])
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1}
+    assert echo.update({}) == 1
+    holds["c_1"] = True
+    atoms.observe(5)
+    assert echo.request()["oracle_plan_index"] == 0
+    assert echo.update({}) == 0 and echo.regressions == 1
+    assert echo.trace().startswith("order=1,0 mode=atoms plan=0 ")

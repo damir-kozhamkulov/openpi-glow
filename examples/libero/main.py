@@ -62,9 +62,15 @@ class Args:
     # silently sending nothing.
     plan_pack: Optional[str] = None
     # self: the model chooses each plan and reads its own choice back; oracle: the tracker's stage
-    # is the plan; forced: --plan-forced-index is the plan throughout (clamped to a task's last stage).
-    plan_mode: Literal["self", "oracle", "forced"] = "self"
+    # is the plan; forced: --plan-forced-index is the plan throughout (clamped to a task's last stage);
+    # atoms: the plan is the first stage in --plan-order whose goal atom has not held yet on the
+    # simulator. Every mode logs when each stage's goal atom first held and which held first.
+    plan_mode: Literal["self", "oracle", "forced", "atoms"] = "self"
     plan_forced_index: Optional[int] = None
+    # Stage order for --plan-mode atoms: 0-based stage indices, comma-separated, restricted per task
+    # to its own stages ("1,0": every two-stage task gets its second stage first, a one-stage task
+    # its stage). The episode still ends on the environment's success (every atom held).
+    plan_order: Optional[str] = None
     # Frames a grasp must be held before its release advances the tracker.
     plan_hold_min: int = glow_stage_tracker.HOLD_MIN
     # Steering (needs --plan-pack): the plans sent are this pack task's instead of the
@@ -99,6 +105,15 @@ def eval_libero(args: Args) -> None:
             raise ValueError("--plan-task and --plan-task-offset exclude each other")
         if args.plan_task_offset < 0:
             raise ValueError("--plan-task-offset must be >= 0")
+    plan_order = None
+    if (args.plan_mode == "atoms") != (args.plan_order is not None):
+        raise ValueError("--plan-mode atoms and --plan-order go together")
+    if args.plan_order is not None:
+        if args.plan_pack is None:
+            raise ValueError("--plan-mode atoms needs --plan-pack")
+        if args.plan_task is not None or args.plan_task_offset is not None:
+            raise ValueError("--plan-mode atoms orders the environment task's own stages; it excludes steering")
+        plan_order = glow_stage_tracker.parse_order(args.plan_order)
     if args.plan_pack is not None:
         if args.plan_mode == "forced" and args.plan_forced_index is None:
             raise ValueError("--plan-mode forced needs --plan-forced-index")
@@ -109,6 +124,7 @@ def eval_libero(args: Args) -> None:
         logging.info(
             f"GLOW plan pack: {args.plan_pack} ({len(plan_pack['tasks'])} tasks); plan_mode={args.plan_mode}"
             + (f" forced_index={args.plan_forced_index}" if args.plan_mode == "forced" else "")
+            + (f" order={plan_order}" if plan_order is not None else "")
             + (f" plan_task={args.plan_task!r}" if args.plan_task is not None else "")
             + (f" plan_task_offset={args.plan_task_offset}" if args.plan_task_offset is not None else "")
         )
@@ -153,6 +169,8 @@ def eval_libero(args: Args) -> None:
     # Start evaluation
     total_episodes, total_successes = 0, 0
     total_steered_successes, total_steered_at_start = 0, 0
+    # Multi-stage episodes by which stage's goal atom held first (StageAtoms.first).
+    total_first = collections.Counter()
     # Episodes cut short because the policy server could not be reached. Their outcome is not a
     # policy result, so a run with any of them is invalid regardless of the rate it computes.
     aborted_episodes = []
@@ -166,11 +184,15 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        num_plans = tracker_plans = None
+        num_plans = tracker_plans = atom_list = None
         if plan_pack is not None:
             if str(task_description) not in plan_pack["tasks"]:
                 raise KeyError(f"task {task_description!r} is not in the plan pack {args.plan_pack}")
             tracker_plans = int(plan_pack["tasks"][str(task_description)]["K"])
+            atom_list = stage_atoms(
+                plan_pack["tasks"][str(task_description)],
+                bddl_utils.robosuite_parse_problem(task_suite.get_task_bddl_file_path(task_id)),
+            )
             plan_task = args.plan_task
             if args.plan_task_offset is not None:
                 plan_task = glow_stage_tracker.plan_task_for(suite_tasks, task_id, args.plan_task_offset)
@@ -183,20 +205,27 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes, task_steered_successes = 0, 0, 0
+        task_first = collections.Counter()
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
             env.reset()
             action_plan = collections.deque()
-            plan = None
+            plan = atoms = None
             if num_plans is not None:
+                problem_env = env.env
+                atoms = glow_stage_tracker.StageAtoms(
+                    atom_list, lambda atom, problem_env=problem_env: problem_env._eval_predicate(list(atom))  # noqa: SLF001
+                )
                 plan = glow_stage_tracker.PlanEcho(
                     args.plan_mode,
                     num_plans,
                     forced_index=args.plan_forced_index,
                     hold_min=args.plan_hold_min,
                     tracker_plans=tracker_plans,
+                    atoms=atoms if plan_order is not None else None,
+                    order=plan_order,
                 )
 
             # Set initial states
@@ -220,6 +249,8 @@ def eval_libero(args: Args) -> None:
                         continue
                     if steered is not None and steered_at_start is None:
                         steered_at_start = steered.check()
+                    if atoms is not None and plan.tracker.frame == 0:
+                        atoms.observe(0)  # an atom already true when the policy takes over
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -276,6 +307,7 @@ def eval_libero(args: Args) -> None:
                     obs, reward, done, info = env.step(action.tolist())
                     if plan is not None:
                         plan.observe(action[6])  # the gripper command just executed
+                        atoms.observe(plan.tracker.frame)
                     success = success or done
                     if steered is not None:
                         steered_success = steered.check()
@@ -326,8 +358,11 @@ def eval_libero(args: Args) -> None:
                 # One line per episode for the stage-resolved failure analysis.
                 logging.info(
                     f"plan trace: task={task_id} episode={episode_idx} success={success} {steered_fields}"
-                    f"frames={plan.tracker.frame} {plan.trace()}"
+                    f"frames={plan.tracker.frame} {plan.trace()} {atoms.trace()}"
                 )
+                if len(atom_list) > 1:
+                    task_first[atoms.first()] += 1
+                    total_first[atoms.first()] += 1
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
             if steered is not None:
@@ -341,11 +376,17 @@ def eval_libero(args: Args) -> None:
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
         if steered is not None:
             logging.info(f"Current task steered success rate: {float(task_steered_successes) / float(task_episodes)}")
+        if task_first:
+            logging.info(f"Current task first stage atom met: {_first_counts(task_first)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     if steered_problems:
         logging.info(f"Steered success rate: {float(total_steered_successes) / float(total_episodes)}")
         logging.info(f"Steered goal met at the first policy step: {total_steered_at_start} episodes")
+    if total_first:
+        logging.info(
+            f"First stage atom met, over {sum(total_first.values())} multi-stage episodes: {_first_counts(total_first)}"
+        )
     logging.info(f"Total episodes: {total_episodes}")
 
     if aborted_episodes:
@@ -366,6 +407,27 @@ def _get_libero_env(task, resolution, seed):
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
+
+
+def stage_atoms(pack_task, problem):
+    """The goal atom of every stage of a plan-pack task (its runtime_key), in stage order.
+
+    Each must be an atom of the task's parsed BDDL goal, so `_eval_predicate` scores it exactly as
+    `_check_success` scores that part of the goal; raises otherwise.
+    """
+    stages = sorted(pack_task["stages"], key=lambda s: int(s["plan_index"]))
+    atoms = [glow_stage_tracker.parse_atom(s["runtime_key"]) for s in stages]
+    goal = {tuple(atom) for atom in problem["goal_state"]}
+    missing = [atom for atom in atoms if atom not in goal]
+    if missing:
+        raise ValueError(f"stage atoms {missing} are not in the task's BDDL goal {sorted(goal)}")
+    return atoms
+
+
+def _first_counts(counter):
+    """Stage indices in order, then "together" and "none"."""
+    keys = sorted((k for k in counter if k.isdigit()), key=int) + [k for k in ("together", "none") if k in counter]
+    return ", ".join(f"stage {k}: {counter[k]}" if k.isdigit() else f"{k}: {counter[k]}" for k in keys)
 
 
 class SteeredGoal:
