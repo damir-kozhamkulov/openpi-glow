@@ -82,9 +82,9 @@ class LiberoInputs(transforms.DataTransformFn):
 
         # GLOW plan-state keys, consumed by the GlowPlanState model transform: the dataset's
         # episode/frame at training; at inference the model's previous plan as echoed by the
-        # client, plus an optional oracle plan and an optional steering task whose plans are used.
-        # Absent otherwise.
-        for key in ("episode_index", "frame_index", "prev_plan_index", "oracle_plan_index", "plan_task"):
+        # client, plus an optional oracle plan, an optional steering task whose plans are used and
+        # an optional chain of tasks whose stages run as one plan. Absent otherwise.
+        for key in ("episode_index", "frame_index", "prev_plan_index", "oracle_plan_index", "plan_task", "plan_chain"):
             if key in data:
                 inputs[key] = data[key]
 

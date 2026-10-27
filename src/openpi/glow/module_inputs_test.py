@@ -216,6 +216,47 @@ def test_plan_chain_at_inference(pack, transform):
         transform.encode_stages(tuple(a.stages) * (_mi.K_MAX + 1), 0)
 
 
+def test_plan_chain_through_policy_inputs(monkeypatch, pack):
+    """A chain request as examples/libero sends it, over msgpack, through the served config's
+    input transforms (LiberoInputs first): every index of the chain reaches the module arrays."""
+    import openpi.training.config as _config
+    from openpi import transforms as _transforms
+    from openpi.policies import libero_policy
+    from openpi_client import msgpack_numpy
+
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+    cfg = _config.get_config("pi05_libero_glow_chain")
+    dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
+    assert isinstance(dc.data_transforms.inputs[0], libero_policy.LiberoInputs)
+    served = _transforms.compose(
+        [
+            *dc.data_transforms.inputs,
+            _transforms.Normalize(None, use_quantiles=dc.use_quantile_norm),
+            *dc.model_transforms.inputs,
+        ]
+    )
+    module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
+    a, b = _by_index(pack, 17), _by_index(pack, 16)  # bowl on the stove; turn on the stove
+    for chain, k, stages in (
+        ([a.task, b.task], 0, (a.stages[0], b.stages[0])),
+        ([a.task, b.task], 1, (a.stages[0], b.stages[0])),
+        ([b.task, a.task], 1, (b.stages[0], a.stages[0])),
+    ):
+        element = {
+            "observation/image": np.zeros((224, 224, 3), np.uint8),
+            "observation/wrist_image": np.zeros((224, 224, 3), np.uint8),
+            "observation/state": np.zeros(8),
+            "prompt": a.task,
+            "oracle_plan_index": k,
+            "plan_chain": list(chain),
+        }
+        out = served(msgpack_numpy.unpackb(msgpack_numpy.packb(element)))
+        assert out["glow_ints"][:2].tolist() == [k, 2]
+        for key, value in module.encode_stages(stages, k).items():
+            np.testing.assert_array_equal(out[key], value)
+        assert "plan_chain" not in out and out["tokenized_prompt_mask"].sum() == 2
+
+
 def test_chain_partners(pack):
     partners = _mi.chain_partners(pack, GOAL_TASKS)
     assert set(partners) == set(GOAL_TASKS)
