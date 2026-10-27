@@ -161,3 +161,50 @@ def test_atoms_mode_sends_the_ordered_stage():
     assert echo.request()["oracle_plan_index"] == 0
     assert echo.update({}) == 0 and echo.regressions == 1
     assert echo.trace().startswith("order=1,0 mode=atoms plan=0 ")
+
+
+def test_moved_object():
+    assert gst.moved_object("in(butter_1, basket_1_contain_region)") == "butter_1"
+    assert gst.moved_object("on(akita_black_bowl_1, plate_1)") == "akita_black_bowl_1"
+    assert gst.moved_object("open(wooden_cabinet_1_middle_region)") is None
+    assert gst.moved_object("turnon(flat_stove_1)") is None
+
+
+def test_chain_partner_for():
+    names = ["bowl on plate", "wine on rack", "bowl in drawer", "turn on the stove", "bowl on stove"]
+    moved = {0: "bowl_1", 1: "wine_1", 2: "bowl_1", 3: None, 4: "bowl_1"}
+    same = lambda i: True  # noqa: E731
+    # Offset 1 from task 0 skips task 2 (the bowl again) only when it is next: here 1 is the wine.
+    assert gst.chain_partner_for(names, 0, 1, moved.get, same) == 1
+    # From the drawer task, offset 1 is the stove (no moved object), fine.
+    assert gst.chain_partner_for(names, 2, 1, moved.get, same) == 3
+    # From the stove-bowl task, offset 1 wraps to 0 (bowl: conflict) then 1 (wine).
+    assert gst.chain_partner_for(names, 4, 1, moved.get, same) == 1
+    # A task moving nothing pairs with anything, never itself.
+    assert gst.chain_partner_for(names, 3, 1, moved.get, same) == 4
+    assert gst.chain_partner_for(names, 3, 5, moved.get, same) == 4  # offset n = itself, skipped
+    # Scene filter.
+    assert gst.chain_partner_for(names, 0, 1, moved.get, lambda i: i != 1) == 3
+    with pytest.raises(ValueError, match="none in its scene"):
+        gst.chain_partner_for(names, 0, 1, moved.get, lambda i: i in (0, 2, 4))
+    with pytest.raises(ValueError, match="offset"):
+        gst.chain_partner_for(names, 0, 0, moved.get, same)
+    with pytest.raises(ValueError, match="at least two"):
+        gst.chain_partner_for(["only"], 0, 1, moved.get, same)
+
+
+def test_atoms_mode_over_a_chain():
+    """A two-stage chain of one-stage tasks: the pointer follows the first unmet atom of the order."""
+    held = {("on", "bowl_1", "plate_1"): False, ("open", "drawer_1"): False}
+    atoms = gst.StageAtoms([("on", "bowl_1", "plate_1"), ("open", "drawer_1")], lambda a: held[a])
+    echo = gst.PlanEcho("atoms", 2, atoms=atoms, order=[0, 1], tracker_plans=1)
+    atoms.observe(0)
+    assert echo.request()["oracle_plan_index"] == 0
+    echo.update({})
+    held[("on", "bowl_1", "plate_1")] = True
+    echo.observe(-1.0)
+    atoms.observe(1)
+    assert echo.request()["oracle_plan_index"] == 1
+    echo.update({})
+    assert atoms.first() == "0" and echo.tracker.num_plans == 1
+    assert "order=0,1 mode=atoms plan=1" in echo.trace()

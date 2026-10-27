@@ -98,6 +98,41 @@ class StageAtoms:
         return "atoms_first_met={} first_stage={}".format(self.first_met, self.first())
 
 
+def moved_object(runtime_key):
+    """The object instance a stage's goal atom moves: the first argument of an on / in atom
+    ("in(butter_1, basket_1_contain_region)" -> "butter_1"), None for any other predicate."""
+    atom = parse_atom(runtime_key)
+    return atom[1] if atom[0] in ("on", "in") else None
+
+
+def chain_partner_for(task_names, task_id, offset, moved, same_scene):
+    """The suite task chained with environment task `task_id`: the first task at or after
+    (task_id + offset) mod n, cyclically and never the task itself, that is set in the same scene
+    (`same_scene(i)`) and moves a different object than it (`moved(i)`: moved_object of a task's
+    one stage; None moves none, which conflicts with nothing). Raises when none qualifies.
+
+    The same rule, over the pack's one-stage tasks, pairs the training chains
+    (openpi.glow.module_inputs.chain_partners); the offset picks one partner per task.
+    """
+    n = len(task_names)
+    if n < 2:
+        raise ValueError("a chain needs at least two tasks in the suite")
+    if offset < 1:
+        raise ValueError("offset must be >= 1, got {}".format(offset))
+    mine = moved(task_id)
+    for d in range(n):
+        i = (task_id + offset + d) % n
+        if i == task_id or not same_scene(i):
+            continue
+        if mine is None or moved(i) != mine:
+            return i
+    raise ValueError(
+        "no task of the suite can chain with {!r}: none in its scene moves a different object".format(
+            task_names[task_id]
+        )
+    )
+
+
 def plan_task_for(task_names, task_id, offset):
     """The task whose plans steer environment task `task_id`: suite task (task_id + offset) mod n.
 

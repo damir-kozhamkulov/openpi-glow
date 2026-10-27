@@ -87,6 +87,17 @@ class Args:
     # (pi05_libero_plan_prompt) reads nothing but the plan, so its own-task success should collapse
     # when the plans are another goal's, and its steered success shows whether it reaches that goal.
     plan_task_offset: Optional[int] = None
+    # Chains (needs --plan-pack and --plan-mode atoms or forced; excludes steering): environment
+    # task i runs a two-stage plan of its own goal and a partner's, the partner being the first
+    # suite task at or after (i + offset) mod n, in its scene, that moves a different object
+    # (glow_stage_tracker.chain_partner_for; every task must have one stage). --plan-order 0,1
+    # puts the environment's stage first, 1,0 the partner's; the plan sent is the chain in that
+    # order (`plan_chain`), and the atoms mode points at the first stage of the chain whose goal
+    # atom has not held yet. Three goals are scored on the same simulator: the environment's
+    # (`success`), the partner's (`partner_success`) and both (`chain_success`, which ends the
+    # episode); the step budget doubles. Which atom held first says whether the actions followed
+    # the chain's order.
+    plan_chain_offset: Optional[int] = None
     # Instruction sent to the server in place of the environment's task (the planner reads it).
     prompt: Optional[str] = None
 
@@ -114,6 +125,17 @@ def eval_libero(args: Args) -> None:
         if args.plan_task is not None or args.plan_task_offset is not None:
             raise ValueError("--plan-mode atoms orders the environment task's own stages; it excludes steering")
         plan_order = glow_stage_tracker.parse_order(args.plan_order)
+    if args.plan_chain_offset is not None:
+        if args.plan_pack is None:
+            raise ValueError("--plan-chain-offset needs --plan-pack")
+        if args.plan_mode not in ("atoms", "forced"):
+            raise ValueError("--plan-chain-offset needs --plan-mode atoms (the chain's order) or forced")
+        if args.plan_task is not None or args.plan_task_offset is not None:
+            raise ValueError("--plan-chain-offset and steering exclude each other")
+        if args.plan_chain_offset < 1:
+            raise ValueError("--plan-chain-offset must be >= 1")
+        if plan_order is not None and sorted(plan_order) != [0, 1]:
+            raise ValueError("--plan-order for a chain is 0,1 (the environment's stage first) or 1,0")
     if args.plan_pack is not None:
         if args.plan_mode == "forced" and args.plan_forced_index is None:
             raise ValueError("--plan-mode forced needs --plan-forced-index")
@@ -151,6 +173,8 @@ def eval_libero(args: Args) -> None:
         max_steps = 400  # longest training demo has 373 steps
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+    if args.plan_chain_offset is not None:
+        max_steps *= 2  # two goals per episode
 
     # Every task's language, for --plan-task-offset (the suite order is the task_id order).
     suite_tasks = [str(task_suite.get_task(i).language) for i in range(num_tasks_in_suite)]
@@ -163,12 +187,19 @@ def eval_libero(args: Args) -> None:
             steered_problems[task_id] = _steered_problem(
                 task_suite, suite_tasks, task_id, args.plan_task, args.plan_task_offset
             )
+    # Chain partner (task id, parsed problem) per environment task, likewise resolved up front.
+    chain_partners = {}
+    if args.plan_chain_offset is not None:
+        for task_id in range(num_tasks_in_suite):
+            chain_partners[task_id] = _chain_partner(task_suite, suite_tasks, task_id, args.plan_chain_offset, plan_pack)
+            logging.info(f"chain: {suite_tasks[task_id]!r} with {suite_tasks[chain_partners[task_id][0]]!r}")
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
     total_steered_successes, total_steered_at_start = 0, 0
+    total_partner_successes, total_chain_successes = 0, 0
     # Multi-stage episodes by which stage's goal atom held first (StageAtoms.first).
     total_first = collections.Counter()
     # Episodes cut short because the policy server could not be reached. Their outcome is not a
@@ -202,9 +233,25 @@ def eval_libero(args: Args) -> None:
             plan_source = str(task_description) if plan_task is None else plan_task
             num_plans = int(plan_pack["tasks"][plan_source]["K"])
         steered = SteeredGoal(env, steered_problems[task_id]) if task_id in steered_problems else None
+        # Chains: the plan is the environment's stage and the partner's, in --plan-order; the
+        # atoms are the chain's, so the atoms mode points into the chain.
+        chain_names = chain_order = partner_goal = None
+        if task_id in chain_partners:
+            partner_id, partner_problem = chain_partners[task_id]
+            partner_name = suite_tasks[partner_id]
+            partner_atoms = stage_atoms(plan_pack["tasks"][partner_name], partner_problem)
+            pair = [(str(task_description), atom_list[0]), (partner_name, partner_atoms[0])]
+            chain_order = plan_order if plan_order is not None else [0, 1]
+            chain = [pair[k] for k in chain_order]
+            chain_names, atom_list = [name for name, _ in chain], [atom for _, atom in chain]
+            num_plans, plan_order_used = len(chain), [0, 1]
+            partner_goal = SteeredGoal(env, partner_problem)
+        else:
+            plan_order_used = plan_order
 
         # Start episodes
         task_episodes, task_successes, task_steered_successes = 0, 0, 0
+        task_partner_successes, task_chain_successes = 0, 0
         task_first = collections.Counter()
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
@@ -224,8 +271,8 @@ def eval_libero(args: Args) -> None:
                     forced_index=args.plan_forced_index,
                     hold_min=args.plan_hold_min,
                     tracker_plans=tracker_plans,
-                    atoms=atoms if plan_order is not None else None,
-                    order=plan_order,
+                    atoms=atoms if plan_order_used is not None else None,
+                    order=plan_order_used,
                 )
 
             # Set initial states
@@ -234,7 +281,7 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
-            success = steered_success = False
+            success = steered_success = partner_success = False
             # Whether the steering task's goal already held when the policy took over.
             steered_at_start = None
 
@@ -285,6 +332,8 @@ def eval_libero(args: Args) -> None:
                             element.update(plan.request())
                             if plan_task is not None:
                                 element["plan_task"] = plan_task
+                            if chain_names is not None:
+                                element["plan_chain"] = list(chain_names)
 
                         # Query model to get action
                         response = client.infer(element)
@@ -313,6 +362,10 @@ def eval_libero(args: Args) -> None:
                         steered_success = steered.check()
                         if steered_success:
                             break
+                    elif partner_goal is not None:
+                        partner_success = partner_success or partner_goal.check()
+                        if success and partner_success:
+                            break
                     elif done:
                         break
                     t += 1
@@ -333,9 +386,18 @@ def eval_libero(args: Args) -> None:
                 total_steered_successes += 1
             if steered_at_start:
                 total_steered_at_start += 1
+            chain_success = success and partner_success
+            if partner_success:
+                task_partner_successes += 1
+                total_partner_successes += 1
+            if chain_success:
+                task_chain_successes += 1
+                total_chain_successes += 1
 
             # Save a replay video of the episode
-            if steered is None:
+            if partner_goal is not None:
+                suffix = "chain_success" if chain_success else "chain_failure"
+            elif steered is None:
                 suffix = "success" if success else "failure"
             else:
                 suffix = "steered_success" if steered_success else "steered_failure"
@@ -354,6 +416,11 @@ def eval_libero(args: Args) -> None:
                     f"Steered success: {steered_success} (goal met at the first policy step: {steered_at_start})"
                 )
                 steered_fields = f"steered_success={steered_success} steered_at_start={steered_at_start} "
+            if partner_goal is not None:
+                logging.info(f"Partner success: {partner_success}; chain success: {chain_success}")
+                steered_fields = (
+                    f"chain={chain_order} partner_success={partner_success} chain_success={chain_success} "
+                )
             if plan is not None:
                 # One line per episode for the stage-resolved failure analysis.
                 logging.info(
@@ -376,6 +443,11 @@ def eval_libero(args: Args) -> None:
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
         if steered is not None:
             logging.info(f"Current task steered success rate: {float(task_steered_successes) / float(task_episodes)}")
+        if partner_goal is not None:
+            logging.info(
+                f"Current task partner success rate: {float(task_partner_successes) / float(task_episodes)}; "
+                f"chain success rate: {float(task_chain_successes) / float(task_episodes)}"
+            )
         if task_first:
             logging.info(f"Current task first stage atom met: {_first_counts(task_first)}")
 
@@ -383,6 +455,9 @@ def eval_libero(args: Args) -> None:
     if steered_problems:
         logging.info(f"Steered success rate: {float(total_steered_successes) / float(total_episodes)}")
         logging.info(f"Steered goal met at the first policy step: {total_steered_at_start} episodes")
+    if chain_partners:
+        logging.info(f"Partner success rate: {float(total_partner_successes) / float(total_episodes)}")
+        logging.info(f"Chain success rate: {float(total_chain_successes) / float(total_episodes)}")
     if total_first:
         logging.info(
             f"First stage atom met, over {sum(total_first.values())} multi-stage episodes: {_first_counts(total_first)}"
@@ -482,6 +557,37 @@ def _steered_problem(task_suite, suite_tasks, task_id, plan_task, plan_task_offs
         f"steering task {name!r} is set in another scene than environment task {suite_tasks[task_id]!r} "
         f"({', '.join(differences)} differ), so its goal predicates mean nothing on that simulator"
     )
+
+
+def _chain_partner(task_suite, suite_tasks, task_id, offset, plan_pack):
+    """(partner task id, its parsed BDDL problem) for environment task `task_id`: the first suite
+    task at or after (task_id + offset) mod n, in the same scene (SCENE_FIELDS), whose one stage
+    moves a different object (glow_stage_tracker.chain_partner_for). Every task of the suite must
+    be in the plan pack with one stage. Raises when no task qualifies."""
+    problems = {}
+
+    def problem(i):
+        if i not in problems:
+            problems[i] = bddl_utils.robosuite_parse_problem(task_suite.get_task_bddl_file_path(i))
+        return problems[i]
+
+    def one_stage(i):
+        task = plan_pack["tasks"].get(suite_tasks[i])
+        if task is None:
+            raise KeyError(f"task {suite_tasks[i]!r} is not in the plan pack")
+        if int(task["K"]) != 1:
+            raise ValueError(f"chains take one-stage tasks; {suite_tasks[i]!r} has {task['K']} stages")
+        return task["stages"][0]["runtime_key"]
+
+    own = problem(task_id)
+    partner = glow_stage_tracker.chain_partner_for(
+        suite_tasks,
+        task_id,
+        offset,
+        moved=lambda i: glow_stage_tracker.moved_object(one_stage(i)),
+        same_scene=lambda i: not _scene_differences(own, problem(i)),
+    )
+    return partner, problem(partner)
 
 
 def _quat2axisangle(quat):

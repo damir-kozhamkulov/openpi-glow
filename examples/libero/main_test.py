@@ -231,3 +231,48 @@ def test_every_pack_stage_atom_is_in_its_bddl_goal(suite_name):
         extra = {tuple(a) for a in problem["goal_state"]} - set(atoms)
         # The stages cover the whole goal, except that both moka pots must also sit on a lit stove.
         assert extra == ({("turnon", "flat_stove_1")} if name == "put both moka pots on the stove" else set()), name
+
+
+def _chain_pack(names, keys):
+    return {"tasks": {n: _pack_task(k) for n, k in zip(names, keys)}}
+
+
+def test_chain_partner_skips_the_same_object_and_other_scenes(suite):
+    names = ["a", "b", "c", "b"]
+    pack = _chain_pack(names, ["on(bowl_1, stove_region)", "open(drawer_1)", "on(bowl_1, plate_1)", "turnon(stove_1)"])
+    # Task 0 (the bowl) with offset 1: task 1 (the drawer) is in the scene and moves nothing.
+    partner, problem = main._chain_partner(suite, names, 0, 1, pack)
+    assert partner == 1 and problem is suite.problems[1]
+    # Offset 2 from task 0: task 2 is in another scene (objects differ), task 3 moves nothing.
+    assert main._chain_partner(suite, names, 0, 2, pack)[0] == 3
+    # From task 3 with offset 1: wraps to 0.
+    assert main._chain_partner(suite, names, 3, 1, pack)[0] == 0
+    # A two-stage task cannot chain.
+    pack["tasks"]["b"] = _pack_task("open(drawer_1)", "turnon(stove_1)")
+    with pytest.raises(ValueError, match="one-stage"):
+        main._chain_partner(suite, names, 0, 1, pack)
+    with pytest.raises(KeyError, match="not in the plan pack"):
+        main._chain_partner(suite, names, 0, 1, {"tasks": {"a": _pack_task("on(bowl_1, stove_region)")}})
+
+
+@needs_libero
+def test_libero_goal_chain_partners():
+    """Every Goal task has a partner at offset 1; none moves the partner's object; the two-way
+    chains cover the suite in one scene."""
+    import json
+    import os
+
+    pack_path = os.environ.get("OPENPI_PLAN_PACK", "/app/glow/plan_pack_libero10_goal.json")
+    if not pathlib.Path(pack_path).exists():
+        pytest.skip(f"no plan pack at {pack_path}")
+    with open(pack_path, encoding="utf-8") as f:
+        pack = json.load(f)
+    task_suite, names = _libero_suite("libero_goal")
+    for task_id, name in enumerate(names):
+        partner, problem = main._chain_partner(task_suite, names, task_id, 1, pack)
+        assert partner != task_id
+        mine = main.glow_stage_tracker.moved_object(pack["tasks"][name]["stages"][0]["runtime_key"])
+        theirs = main.glow_stage_tracker.moved_object(pack["tasks"][names[partner]]["stages"][0]["runtime_key"])
+        assert mine is None or theirs != mine
+        # The partner's stage atom is in its BDDL goal, so it can be scored on this scene.
+        assert main.stage_atoms(pack["tasks"][names[partner]], problem)
