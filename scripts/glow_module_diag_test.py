@@ -169,6 +169,9 @@ def test_main_module_model(monkeypatch, tmp_path):
         assert sum(a["by_query"]["actions"]["mass_mean"].values()) == pytest.approx(1.0, abs=1e-4), name
     assert s["attention"]["plan_text"]["keys_per_sample"]["language"] > 2  # the plan text
     assert s["attention"]["task_prompt"]["keys_per_sample"]["language"] > 2  # the task string
+    assert set(s["stage"]) == {"other_subgoal_vs_subgoal", "task_other_subgoal_vs_task_subgoal"}
+    for pair in s["stage"].values():
+        assert 2 <= pair["overall"]["samples"] < 8 and np.isfinite(pair["overall"]["diff"])
 
     att = s["attention"]["correct"]
     assert att["keys_per_sample"]["module"] == 6
@@ -405,3 +408,46 @@ def test_head_words():
     drawer = by_index[12]  # open the top drawer and put the bowl inside: one stage
     assert gmd.head_words(drawer, 0, slots) == ["open", "bowl", "drawer", "in", "one", "first"]
     assert gmd.head_words(drawer, 0, ["OBJ", "T_ACTIVE"]) == ["bowl", "first"]
+
+
+@pytest.mark.skipif(not GOAL_PACK.exists(), reason="Goal plan pack not present")
+def test_stage_prompts():
+    from openpi.glow import plan_pack as _plan_pack
+
+    pack = _plan_pack.PlanPack.load(GOAL_PACK)
+    by_index = {t.task_index: t for t in pack.tasks.values()}
+    mugs = by_index[0]
+    p = gmd.stage_prompts(mugs, 1)
+    assert set(p) == set(gmd.STAGE_PROMPTS)
+    assert p["subgoal"] == "put the yellow and white mug on the right plate"
+    assert p["other_subgoal"] == "put the white mug on the left plate"
+    assert p["task_subgoal"] == f"{mugs.task}. {p['subgoal']}"
+    assert p["task_other_subgoal"] == f"{mugs.task}. {p['other_subgoal']}"
+    one = by_index[12]
+    q = gmd.stage_prompts(one, 0)
+    assert q["subgoal"] == q["other_subgoal"] and q["task_subgoal"] == q["task_other_subgoal"]
+    # Every task string + subgoal fits the stage prompt without truncation.
+    from openpi.models import tokenizer as _tokenizer
+
+    tok = _tokenizer.PaligemmaTokenizer(gmd.STAGE_PROMPT_LEN)
+    for t in pack.tasks.values():
+        for k in range(t.num_plans):
+            for text in gmd.stage_prompts(t, k).values():
+                assert not tok.tokenize(text)[1][-1], text
+
+
+def test_stage_summary():
+    tasks = np.array([0, 0, 1, 1, 12])
+    stages = np.array([0, 1, 0, 1, 0])
+    multistage = np.array([True, True, True, True, False])
+    flows = {
+        "subgoal": np.array([1.0, 1.0, 2.0, 2.0, 9.0]),
+        "other_subgoal": np.array([1.5, 1.5, 2.0, 3.0, 0.0]),
+    }
+    s = gmd.stage_summary(flows, tasks, stages, multistage)
+    assert list(s) == ["other_subgoal_vs_subgoal"]  # the task_* pair is absent
+    o = s["other_subgoal_vs_subgoal"]
+    assert o["overall"]["samples"] == 4 and o["overall"]["diff"] == pytest.approx(0.5)
+    assert o["per_task"][0]["diff"] == pytest.approx(0.5) and o["per_task"][1]["diff"] == pytest.approx(0.5)
+    assert set(o["per_task"]) == {0, 1}  # the one-stage task is left out
+    assert o["by_stage"][0]["diff"] == pytest.approx(0.25) and o["by_stage"][1]["diff"] == pytest.approx(0.75)

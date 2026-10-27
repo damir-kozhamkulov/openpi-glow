@@ -63,6 +63,44 @@ def test_module_variants(module):
     assert correct["glow_ints"][_mi.INT_PREDICATE] != 0 and correct["glow_text_mask"].sum() > 0
 
 
+def _segments(arrays, names):
+    from openpi.glow import module_inputs as _mi
+
+    return np.concatenate([arrays["glow_text"][slice(*_mi.TEXT_SEGMENTS[n])] for n in names])
+
+
+def test_splits_take_one_encoders_inputs(module):
+    from openpi.glow import module_inputs as _mi
+
+    spatial = ("subgoal", "object", "target")
+    temporal = tuple(f"rk{j}" for j in range(_mi.K_MAX))
+    # Task 0 (two stages) against task 1: different subgoals, anchors and runtime keys.
+    two = next(t for t in module.pack.tasks.values() if t.task_index == 0)
+    correct = module.encode(two.task, 0)
+    v = gmp.module_variants(module.encode, module.pack, two.task, 0, correct)
+    for split, donor in (("other_task", v["other_task"]), ("wrong_stage", v["wrong_stage"])):
+        s = v[f"{split}_spatial"]
+        np.testing.assert_array_equal(_segments(s, spatial), _segments(donor, spatial))
+        np.testing.assert_array_equal(_segments(s, temporal), _segments(correct, temporal))
+        np.testing.assert_array_equal(s["glow_floats"], donor["glow_floats"])
+        assert s["glow_ints"][_mi.INT_PREDICATE] == donor["glow_ints"][_mi.INT_PREDICATE]
+        assert s["glow_ints"][_mi.INT_STAGE] == 0
+    t = v["other_task_temporal"]
+    np.testing.assert_array_equal(_segments(t, spatial), _segments(correct, spatial))
+    np.testing.assert_array_equal(_segments(t, temporal), _segments(v["other_task"], temporal))
+    np.testing.assert_array_equal(t["glow_floats"], correct["glow_floats"])
+    np.testing.assert_array_equal(t["glow_ints"][1:], v["other_task"]["glow_ints"][1:])
+    assert not np.array_equal(_segments(t, temporal), _segments(correct, temporal))
+    # The pointer split moves the stage index and nothing else.
+    p = v["wrong_stage_pointer"]
+    assert p["glow_ints"][_mi.INT_STAGE] == 1 and correct["glow_ints"][_mi.INT_STAGE] == 0
+    for key in ("glow_text", "glow_text_mask", "glow_floats"):
+        np.testing.assert_array_equal(p[key], correct[key])
+    # Variants never write into `correct`.
+    np.testing.assert_array_equal(correct["glow_text"], module.encode(two.task, 0)["glow_text"])
+    np.testing.assert_array_equal(correct["glow_ints"], module.encode(two.task, 0)["glow_ints"])
+
+
 @pytest.mark.skipif(
     not ((DATASET / "meta/info.json").exists() and NORM_STATS.exists()),
     reason="local LeRobot copy or norm_stats not present",
@@ -138,5 +176,7 @@ def test_main_end_to_end(monkeypatch, tmp_path):
     for name in ("other_task", "grounding_other", "spatial_blank", "temporal_blank"):
         assert o[name]["diff"] != 0.0, name
     assert s["vs_correct_multistage"]["overall"]["wrong_stage"]["diff"] != 0.0
+    by_stage = [b for b in s["vs_correct_multistage_by_stage"].values() if b is not None]
+    assert by_stage and sum(b["samples"] for b in by_stage) <= s["vs_correct_multistage"]["samples"]
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert len(payload["per_sample"]["correct"]) == 16

@@ -4,18 +4,25 @@ Forward only, no gradients. Every variant sees the same frames, images, state, a
 noise, flow time and image augmentation; only the planning-module arrays differ, so the paired
 per-sample differences from `correct` measure what the actions read from each encoder input:
 
-  correct           the labeled stage of the sample's own task
-  correct_again     correct repeated: the run-to-run floor (nondeterministic kernels)
-  other_task        every module input from another task of the same suite (the next one in
-                    task-index order; same stage, or that task's last) - the goal is wrong
-  wrong_stage       the other stage of the same task (a one-stage task keeps its stage) - the
-                    Temporal pointer and the Spatial stage are wrong
-  grounding_other   only the anchors (glow_floats) from other_task - the grounding is wrong
-  spatial_blank     subgoal, nouns, predicate and anchors removed
-  temporal_blank    the runtime keys removed (stage pointer kept)
+  correct              the labeled stage of the sample's own task
+  correct_again        correct repeated: the run-to-run floor (nondeterministic kernels)
+  other_task           every module input from another task of the same suite (the next one in
+                       task-index order; same stage, or that task's last) - the goal is wrong
+  other_task_spatial   only the Spatial inputs (subgoal, nouns, predicate, anchors) from other_task
+  other_task_temporal  only the Temporal inputs (runtime keys, stage pointer, stage count) from
+                       other_task
+  wrong_stage          the other stage of the same task (a one-stage task keeps its stage) - the
+                       Temporal pointer and the Spatial stage are wrong
+  wrong_stage_spatial  only the Spatial inputs from wrong_stage (the pointer stays right)
+  wrong_stage_pointer  only the stage pointer from wrong_stage (the Spatial stage stays right)
+  grounding_other      only the anchors (glow_floats) from other_task - the grounding is wrong
+  spatial_blank        subgoal, nouns, predicate and anchors removed
+  temporal_blank       the runtime keys removed (stage pointer kept)
 
 A model whose actions read an input has a clearly positive difference when it is wrong; one that
-ignores it has ~0. `wrong_stage` is also summarized on multi-stage samples only.
+ignores it has ~0. The `_spatial` / `_temporal` / `_pointer` splits say which encoder carries a
+task's or a stage's effect. Everything is also summarized on multi-stage samples only, and on
+those by the sample's labeled stage (a wrong stage ahead of the scene vs behind it).
 
   python scripts/glow_module_probe.py --weights-dir <dir with model.safetensors> \
       --norm-stats-dir <assets dir holding physical-intelligence/libero/norm_stats.json> \
@@ -38,7 +45,11 @@ VARIANTS = (
     "correct",
     "correct_again",
     "other_task",
+    "other_task_spatial",
+    "other_task_temporal",
     "wrong_stage",
+    "wrong_stage_spatial",
+    "wrong_stage_pointer",
     "grounding_other",
     "spatial_blank",
     "temporal_blank",
@@ -74,6 +85,32 @@ def other_task(pack, task_string: str):
     return same[(same.index(task) + 1) % len(same)]
 
 
+def splice(base: dict, donor: dict, part: str) -> dict:
+    """`base`'s module arrays with one encoder's inputs taken from `donor`: "spatial" (subgoal,
+    object and target text, predicate, anchors) or "temporal" (runtime keys, stage pointer, stage
+    count)."""
+    from openpi.glow import module_inputs as _mi
+
+    if part == "spatial":
+        segments = ("subgoal", "object", "target")
+        ints = (_mi.INT_PREDICATE,)
+    elif part == "temporal":
+        segments = tuple(f"rk{j}" for j in range(_mi.K_MAX))
+        ints = (_mi.INT_STAGE, _mi.INT_NUM_STAGES)
+    else:
+        raise ValueError(f"unknown part {part!r}")
+    out = {k: v.copy() for k, v in base.items()}
+    for name in segments:
+        start, stop = _mi.TEXT_SEGMENTS[name]
+        out["glow_text"][start:stop] = donor["glow_text"][start:stop]
+        out["glow_text_mask"][start:stop] = donor["glow_text_mask"][start:stop]
+    for i in ints:
+        out["glow_ints"][i] = donor["glow_ints"][i]
+    if part == "spatial":
+        out["glow_floats"][:] = donor["glow_floats"]
+    return out
+
+
 def module_variants(encode, pack, task_string: str, plan_index: int, correct: dict) -> dict[str, dict]:
     """The module arrays of every variant for one sample (`correct` = its own arrays)."""
     from openpi.glow import module_inputs as _mi
@@ -82,6 +119,9 @@ def module_variants(encode, pack, task_string: str, plan_index: int, correct: di
     other = other_task(pack, task_string)
     cross = encode(other.task, min(plan_index, other.num_plans - 1))
     swapped = encode(task_string, (plan_index + 1) % task.num_plans)
+
+    pointer = {k: v.copy() for k, v in correct.items()}
+    pointer["glow_ints"][_mi.INT_STAGE] = swapped["glow_ints"][_mi.INT_STAGE]
 
     spatial_blank = {k: v.copy() for k, v in correct.items()}
     for name in ("subgoal", "object", "target"):
@@ -101,7 +141,11 @@ def module_variants(encode, pack, task_string: str, plan_index: int, correct: di
         "correct": correct,
         "correct_again": correct,
         "other_task": cross,
+        "other_task_spatial": splice(correct, cross, "spatial"),
+        "other_task_temporal": splice(correct, cross, "temporal"),
         "wrong_stage": swapped,
+        "wrong_stage_spatial": splice(correct, swapped, "spatial"),
+        "wrong_stage_pointer": pointer,
         "grounding_other": {**correct, "glow_floats": cross["glow_floats"]},
         "spatial_blank": spatial_blank,
         "temporal_blank": temporal_blank,
@@ -174,7 +218,7 @@ def main(args: Args) -> dict:
     model.eval()
 
     flows = {v: [] for v in VARIANTS}
-    tasks, multistage = [], []
+    tasks, multistage, stages = [], [], []
     t0 = time.monotonic()
     for b in range(n // args.batch_size):
         idx = indices[b * args.batch_size : (b + 1) * args.batch_size]
@@ -189,6 +233,7 @@ def main(args: Args) -> dict:
             samples.append((sample, module_variants(module.encode, module.pack, task_string, k, correct)))
             tasks.append(int(np.asarray(f["task_index"])))
             multistage.append(module.pack.task(task_string).num_plans > 1)
+            stages.append(k)
 
         torch.manual_seed(args.seed * 100_003 + b)
         base = _flow_probe._collate([s for s, _ in samples])  # noqa: SLF001
@@ -210,28 +255,43 @@ def main(args: Args) -> dict:
     flows = {k: np.concatenate(v) for k, v in flows.items()}
     tasks = np.asarray(tasks)
     multistage = np.asarray(multistage, dtype=bool)
+    stages = np.asarray(stages)
+
+    def subset(sel):
+        return (
+            _flow_probe.paired_summary({k: v[sel] for k, v in flows.items()}, tasks[sel], "correct")
+            if sel.sum() > 1
+            else None
+        )
+
     summary = {
         "vs_correct": _flow_probe.paired_summary(flows, tasks, "correct"),
-        "vs_correct_multistage": _flow_probe.paired_summary(
-            {k: v[multistage] for k, v in flows.items()}, tasks[multistage], "correct"
-        )
-        if multistage.sum() > 1
-        else None,
+        "vs_correct_multistage": subset(multistage),
+        "vs_correct_multistage_by_stage": {int(k): subset(multistage & (stages == k)) for k in np.unique(stages)},
         "args": dataclasses.asdict(args),
     }
     overall = summary["vs_correct"]["overall"]
-    logging.info(f"{len(tasks)} samples, {int(multistage.sum())} from multi-stage tasks")
+    by_stage = {k: s for k, s in summary["vs_correct_multistage_by_stage"].items() if s is not None}
+    counts = ", ".join(f"{k}: {s['samples']}" for k, s in by_stage.items())
+    logging.info(f"{len(tasks)} samples, {int(multistage.sum())} from multi-stage tasks (by labeled stage: {counts})")
     for name in flows:
         o = overall[name]
-        line = f"FLOW {name:16s} {o['flow']:.5f}  x{o['ratio']:.3f}  diff {o['diff']:+.5f} +- {o['diff_se']:.5f}"
+        line = f"FLOW {name:19s} {o['flow']:.5f}  x{o['ratio']:.3f}  diff {o['diff']:+.5f} +- {o['diff_se']:.5f}"
         if summary["vs_correct_multistage"] is not None:
             m = summary["vs_correct_multistage"]["overall"][name]
-            line += f" | multi-stage diff {m['diff']:+.5f} +- {m['diff_se']:.5f}"
+            line += f" | multi-stage x{m['ratio']:.3f} diff {m['diff']:+.5f} +- {m['diff_se']:.5f}"
+        for k, s in by_stage.items():
+            line += f" | stage {k} x{s['overall'][name]['ratio']:.3f}"
         logging.info(line)
     if args.out:
         out = pathlib.Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {**summary, "per_sample": {k: v.tolist() for k, v in flows.items()}, "indices": indices.tolist()}
+        payload = {
+            **summary,
+            "per_sample": {k: v.tolist() for k, v in flows.items()},
+            "indices": indices.tolist(),
+            "stages": stages.tolist(),
+        }
         out.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         logging.info(f"wrote {out}")
     return summary

@@ -29,10 +29,20 @@ Three measurements on one checkpoint:
                 post_bos_word_scale  both
                 head_pre_bos         instead of the encoders, one real word embedding per slot
                 head_post_bos        (head_words), at a language token's scale, before / after BOS
+                subgoal              no module tokens, the active stage's subgoal_operation as the
+                                     whole prompt
+                other_subgoal        the same with the task's other stage (a one-stage task keeps
+                                     its own)
+                task_subgoal         no module tokens, "{task string}. {active subgoal}"
+                task_other_subgoal   the same with the other stage's subgoal
               At the fine-tuning init (`--init`) correct - no_module is the cost of fresh encoder
               tokens and no_module - task_prompt that of dropping the task string; a variant that
               lands near no_module is harmless at init, one below it on LIBERO-Goal carries the
               goal.
+  stage       On multi-stage samples, the paired difference of each wrong-stage prompt from its
+              right-stage pair (STAGE_PAIRS), overall and by labeled stage: clearly positive means
+              the backbone reads which stage a subgoal names (a teacher given it would carry the
+              stage), ~0 that it reads the scene instead.
 
 `--init` loads the weights non-strictly for the model's NEW_PARAM_PREFIXES (as the trainer's
 fine-tuning init does), seeding the fresh encoders with `--init-seed`.
@@ -60,8 +70,9 @@ import glow_flow_probe as _flow_probe  # noqa: E402
 
 GROUPS = ("images", "module", "language", "actions")
 # name -> (prompt, prefix): prompt "empty" (the module config's BOS + newline), "task" (the task
-# string) or "plan" (the plan text, as pi05_libero_plan_prompt renders it); prefix "own" (the
-# model's), "stock" (no module tokens) or (tokens, placement, scale) for make_prefix.
+# string), "plan" (the plan text, as pi05_libero_plan_prompt renders it) or one of STAGE_PROMPTS;
+# prefix "own" (the model's), "stock" (no module tokens) or (tokens, placement, scale) for
+# make_prefix.
 FLOW_VARIANTS = {
     "correct": ("empty", "own"),
     "no_module": ("empty", "stock"),
@@ -72,7 +83,16 @@ FLOW_VARIANTS = {
     "post_bos_word_scale": ("empty", ("module", "post_bos", "word")),
     "head_pre_bos": ("empty", ("head", "pre_bos", "raw")),
     "head_post_bos": ("empty", ("head", "post_bos", "raw")),
+    "subgoal": ("subgoal", "stock"),
+    "other_subgoal": ("other_subgoal", "stock"),
+    "task_subgoal": ("task_subgoal", "stock"),
+    "task_other_subgoal": ("task_other_subgoal", "stock"),
 }
+STAGE_PROMPTS = ("subgoal", "other_subgoal", "task_subgoal", "task_other_subgoal")
+# (right stage, wrong stage) variant pairs compared on multi-stage samples.
+STAGE_PAIRS = (("subgoal", "other_subgoal"), ("task_subgoal", "task_other_subgoal"))
+# A task string and a subgoal: at most ~30 + 24 tokens, BOS and newline.
+STAGE_PROMPT_LEN = 80
 PREDICATE_WORDS = {"on": "on", "in": "in", "open": "open", "close": "close", "turnon": "on", "turnoff": "off"}
 COUNT_WORDS = ("one", "two", "three", "four")
 ORDINAL_WORDS = ("first", "second", "third", "fourth")
@@ -276,6 +296,50 @@ def head_words(task, stage_index: int, slots: list[str]) -> list[str | None]:
     return [words[slot] for slot in slots]
 
 
+def stage_prompts(task, stage_index: int) -> dict[str, str]:
+    """The STAGE_PROMPTS texts of one sample: its stage's subgoal and the task's other stage's
+    (the next one, wrapping; a one-stage task's own), alone and after the task string."""
+    right = task.stages[stage_index].subgoal_operation
+    wrong = task.stages[(stage_index + 1) % task.num_plans].subgoal_operation
+    return {
+        "subgoal": right,
+        "other_subgoal": wrong,
+        "task_subgoal": f"{task.task}. {right}",
+        "task_other_subgoal": f"{task.task}. {wrong}",
+    }
+
+
+def stage_summary(flows: dict[str, np.ndarray], tasks: np.ndarray, stages: np.ndarray, multistage: np.ndarray) -> dict:
+    """Per STAGE_PAIRS pair present in `flows`: wrong - right on multi-stage samples, overall,
+    per task and by labeled stage."""
+
+    def paired(right, wrong, sel):
+        d = flows[wrong][sel] - flows[right][sel]
+        return {
+            "samples": int(sel.sum()),
+            "right": float(flows[right][sel].mean()),
+            "wrong": float(flows[wrong][sel].mean()),
+            "ratio": float(flows[wrong][sel].mean() / flows[right][sel].mean()),
+            "diff": float(d.mean()),
+            "diff_se": float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else float("nan"),
+        }
+
+    out = {}
+    for right, wrong in STAGE_PAIRS:
+        if right not in flows or wrong not in flows or multistage.sum() < 2:
+            continue
+        out[f"{wrong}_vs_{right}"] = {
+            "overall": paired(right, wrong, multistage),
+            "per_task": {int(t): paired(right, wrong, multistage & (tasks == t)) for t in np.unique(tasks[multistage])},
+            "by_stage": {
+                int(k): paired(right, wrong, multistage & (stages == k))
+                for k in np.unique(stages[multistage])
+                if (multistage & (stages == k)).sum() > 1
+            },
+        }
+    return out
+
+
 def word_rms(embed, tokens, mask, scale: float, device):
     """Mean RMS [B] of a prompt's word-token embeddings as the prefix carries them (x `scale`):
     the valid tokens without the leading BOS and the closing newline."""
@@ -475,6 +539,8 @@ def main(args: Args) -> dict:
     if needs_plan:
         plan_cfg = _config.get_config(PLAN_TEXT_CONFIG)
         plan_tokenizer = _tokenizer.PaligemmaTokenizer(plan_cfg.model.max_token_len)
+    stage_kinds = sorted({FLOW_VARIANTS[v][0] for v in variants} & set(STAGE_PROMPTS))
+    stage_tokenizer = _tokenizer.PaligemmaTokenizer(STAGE_PROMPT_LEN)
     slots = slot_names(model) if module is not None else []
     embed = model.paligemma_with_expert.embed_language_tokens
     embed_scale = math.sqrt(model.paligemma_with_expert.paligemma.config.text_config.hidden_size)
@@ -491,7 +557,7 @@ def main(args: Args) -> dict:
     recorders = {v: AttentionRecorder(num_layers) for v in variants}
     flows = {v: [] for v in variants}
     rms = {v: [] for v in variants}
-    tasks = []
+    tasks, stage_index, multistage = [], [], []
     t0 = time.monotonic()
     for b in range(n // args.batch_size):
         idx = indices[b * args.batch_size : (b + 1) * args.batch_size]
@@ -516,6 +582,15 @@ def main(args: Args) -> dict:
                 )
                 for f in frames
             ]
+            stage_index += [k for _, k in stages]
+            multistage += [task.num_plans > 1 for task, _ in stages]
+            for kind in stage_kinds:
+                prompts_k = [stage_tokenizer.tokenize(stage_prompts(task, k)[kind]) for task, k in stages]
+                batches[kind] = {
+                    **batch,
+                    "tokenized_prompt": np.stack([p[0] for p in prompts_k]),
+                    "tokenized_prompt_mask": np.stack([p[1] for p in prompts_k]),
+                }
             if needs_plan:
                 plans = [
                     plan_tokenizer.tokenize(
@@ -587,6 +662,8 @@ def main(args: Args) -> dict:
     tasks = np.asarray(tasks)
     result["flow"] = _flow_probe.paired_summary(flows, tasks, "correct")
     result["flow_by_suite"] = suite_summary(flows, tasks)
+    if module is not None:
+        result["stage"] = stage_summary(flows, tasks, np.asarray(stage_index), np.asarray(multistage, dtype=bool))
     result["attention"] = {v: r.summary() for v, r in recorders.items()}
     result["embedding_rms"] = {
         v: {
@@ -604,6 +681,14 @@ def main(args: Args) -> dict:
         line += " | " + " ".join(f"{suite} {v['flow']:.5f}" for suite, v in by_suite.items())
         if "no_module" in flows:
             line += f" | vs no_module x{o['flow'] / result['flow']['overall']['no_module']['flow']:.2f}"
+        logging.info(line)
+    for name, s in result.get("stage", {}).items():
+        o = s["overall"]
+        line = (
+            f"STAGE {name:38s} {o['wrong']:.5f} vs {o['right']:.5f}  x{o['ratio']:.3f}  "
+            f"diff {o['diff']:+.5f} +- {o['diff_se']:.5f} ({o['samples']} multi-stage samples)"
+        )
+        line += "".join(f" | stage {k} x{b['ratio']:.3f}" for k, b in s["by_stage"].items())
         logging.info(line)
     for name, att in result["attention"].items():
         key = "module" if att["keys_per_sample"]["module"] > 0 else "language"
