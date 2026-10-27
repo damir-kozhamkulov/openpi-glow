@@ -3,11 +3,13 @@
 The planning module (openpi.glow.module_inputs) enters the prefix as encoder tokens, between the
 images and the language, all bidirectional as in the stock prefix:
 
-    [images][spatial x4][temporal x2][language: BOS "\n" - the task string is dropped][actions]
+    [images][spatial: 4 per stage + 1][temporal x2][language: BOS "\n" - the task string is dropped][actions]
 
 The action expert attends to the whole prefix, as stock; nothing else changes, so training and
 inference are the stock forward and sample_actions with this prefix (`embed_observation_prefix`).
-Each encoder token is rescaled to a target RMS (`config.module_token_scale`): the RMS of the
+The Spatial groups of stages past the plan's K are padding: masked out like padded language
+tokens (`module_token_mask`), so they take no attention and no position. Each encoder token is
+rescaled to a target RMS (`config.module_token_scale`): the RMS of the
 sample's language-token embeddings ("language"; with the task string dropped these are BOS and the
 newline answer token), or the mean RMS of the sample's own module-text tokens as the prefix embeds
 language ("words", the size of an ordinary word token). The size matters beyond the first layer:
@@ -87,6 +89,19 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
             tokens.append(self.glow_temporal_encoder(embed, text, text_mask, ints))
         return torch.cat(tokens, dim=1)
 
+    def module_token_mask(self, observation) -> torch.Tensor:
+        """[B, N] which of `module_tokens` are real: the Spatial groups of stages past the plan's K
+        are padding; the Spatial summary and the Temporal tokens always count."""
+        ints = observation.glow_ints
+        if ints is None:
+            raise ValueError("GlowModulePI0Pytorch: the observation has no planning-module arrays")
+        masks = []
+        if self.glow_spatial_encoder is not None:
+            masks.append(_enc.spatial_token_mask(ints))
+        if self.glow_temporal_encoder is not None:
+            masks.append(torch.ones(ints.shape[0], _enc.TEMPORAL_TOKENS, dtype=torch.bool, device=ints.device))
+        return torch.cat(masks, dim=1)
+
     def forward(self, observation, actions, noise=None, time=None):
         if not (self.training and self.config.module_distill_weight > 0):
             return super().forward(observation, actions, noise=noise, time=time)
@@ -143,12 +158,11 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         module = self.module_tokens(observation)
         module = module * torch.rsqrt(module.pow(2).mean(-1, keepdim=True) + 1e-6) * target_rms.detach()
         module = module.to(embs.dtype)
+        module_mask = self.module_token_mask(observation).to(pad_masks.dtype)
 
         bsize, num_module = module.shape[:2]
         embs = torch.cat([embs[:, :num_img], module, embs[:, num_img:]], dim=1)
-        pad_masks = torch.cat(
-            [pad_masks[:, :num_img], pad_masks.new_ones(bsize, num_module), pad_masks[:, num_img:]], dim=1
-        )
+        pad_masks = torch.cat([pad_masks[:, :num_img], module_mask, pad_masks[:, num_img:]], dim=1)
         att_masks = torch.cat(
             [att_masks[:, :num_img], att_masks.new_zeros(bsize, num_module), att_masks[:, num_img:]], dim=1
         )

@@ -17,6 +17,7 @@ from . import glow_module_diag as gmd
 
 # The dummy Gemma is 64 wide; give it a small SigLIP for the prefix unit tests.
 from openpi.models_pytorch.glow_pi0_pytorch_test import tiny_vision_tower  # noqa: E402, F401
+from openpi.glow import module_encoders as _enc  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]  # glow_repo (openpi is its submodule)
 GOAL_PACK = REPO / "derived/plan_pack_libero10_goal.json"
@@ -142,13 +143,16 @@ def test_main_module_model(monkeypatch, tmp_path):
     s = gmd.main(_args(weights, tmp_path))
 
     slots = s["collapse"]["slots"]
-    assert list(slots) == [*gmd.SPATIAL_SLOTS, *gmd.TEMPORAL_SLOTS]
+    model = get_config("pi05_libero_glow_st").model.create_pytorch()
+    assert list(slots) == gmd.slot_names(model)
     pack_modules = len(s["collapse"]["modules"])
-    assert slots["OP"]["all"]["modules"] == pack_modules > 20
-    assert slots["OP"]["libero_goal"]["modules"] == 10  # every Goal task has one stage
+    assert slots["S0_OP"]["all"]["modules"] == pack_modules > 20
+    assert slots["S0_OP"]["libero_goal"]["modules"] == 10  # every Goal task has one stage
+    # The second group is padding for one-stage modules: only the two-stage ones count there.
+    assert slots["S1_OP"]["libero_goal"]["modules"] == 0 and 0 < slots["S1_OP"]["all"]["modules"] < pack_modules
     # A random encoder separates modules; its CTX slot is a learned constant query, but the
     # transformer mixes the other slots into it.
-    assert slots["OBJ"]["all"]["spread"] > 0 and slots["OBJ"]["all"]["mean_cos"] < 1.0
+    assert slots["S0_OBJ"]["all"]["spread"] > 0 and slots["S0_OBJ"]["all"]["mean_cos"] < 1.0
 
     o = s["flow"]["overall"]
     assert set(o) == set(gmd.FLOW_VARIANTS) and s["flow"]["samples"] == 8
@@ -163,9 +167,19 @@ def test_main_module_model(monkeypatch, tmp_path):
 
     # Every variant's attention is recorded with its own layout.
     assert set(s["attention"]) == set(gmd.FLOW_VARIANTS)
+    # Module keys per sample: none for the stock prefix; the model's own and the module-token
+    # layouts mask the padding groups (7 tokens for a one-stage plan, 11 for a two-stage one);
+    # the head-word layouts insert every token.
+    n_all = _enc.SPATIAL_TOKENS + _enc.TEMPORAL_TOKENS
     for name, (_, layout) in gmd.FLOW_VARIANTS.items():
         a = s["attention"][name]
-        assert a["keys_per_sample"]["module"] == (0 if layout == "stock" else 6), name
+        keys = a["keys_per_sample"]["module"]
+        if layout == "stock":
+            assert keys == 0, name
+        elif layout == "own" or layout[0] == "module":
+            assert 7 <= keys <= 11, name
+        else:
+            assert keys == n_all, name
         assert sum(a["by_query"]["actions"]["mass_mean"].values()) == pytest.approx(1.0, abs=1e-4), name
     assert s["attention"]["plan_text"]["keys_per_sample"]["language"] > 2  # the plan text
     assert s["attention"]["task_prompt"]["keys_per_sample"]["language"] > 2  # the task string
@@ -174,7 +188,7 @@ def test_main_module_model(monkeypatch, tmp_path):
         assert 2 <= pair["overall"]["samples"] < 8 and np.isfinite(pair["overall"]["diff"])
 
     att = s["attention"]["correct"]
-    assert att["keys_per_sample"]["module"] == 6
+    assert 7 <= att["keys_per_sample"]["module"] <= 11
     assert att["keys_per_sample"]["language"] == 2  # BOS and the newline answer token
     for q in ("actions", "images", "module"):
         assert sum(att["by_query"][q]["mass_mean"].values()) == pytest.approx(1.0, abs=1e-4)
@@ -290,8 +304,10 @@ def test_main_anchored_init_is_the_text(monkeypatch, tmp_path):
     ]
     a, b = (r["flow"]["overall"]["correct"]["flow"] for r in runs)
     assert a == pytest.approx(b, rel=1e-6)
-    for slot in gmd.SPATIAL_SLOTS + gmd.TEMPORAL_SLOTS:
+    for slot in runs[0]["collapse"]["slots"]:
         sa, sb = (r["collapse"]["slots"][slot]["all"] for r in runs)
+        if sa["modules"] < 2:
+            continue  # a padding group for every module
         assert sa["mean_cos"] == pytest.approx(sb["mean_cos"], abs=1e-6), slot
 
 
@@ -312,16 +328,22 @@ def test_make_prefix_reproduces_the_model_prefix():
 
     m, obs, inputs = _prefix_case()
     want = m.embed_observation_prefix(obs, *inputs)
-    n_lang, n_mod = inputs[2].shape[1], 6
+    n_lang, n_mod = inputs[2].shape[1], len(gmd.slot_names(m))
     n_img = want[0].shape[1] - n_lang - n_mod
-    for kw in ({"own": n_mod}, {"tokens": m.module_tokens, "where": "pre_bos", "scale": "language"}):
+    valid_module = m.module_token_mask(obs)
+    assert not valid_module.all() and valid_module.any()  # two-stage plans: two groups are padding
+    for kw in (
+        {"own": n_mod},
+        {"tokens": m.module_tokens, "token_mask": m.module_token_mask, "where": "pre_bos", "scale": "language"},
+    ):
         rec = gmd.AttentionRecorder(1)
         prefix = gmd.make_prefix(m, rec, **kw)
         got = prefix(obs, *inputs)
         for x, y in zip(got, want, strict=True):
             torch.testing.assert_close(x, y, rtol=1e-6, atol=1e-6)
         groups = rec.prefix
-        assert (groups[:, n_img : n_img + n_mod] == gmd.GROUPS.index("module")).all(), kw
+        module = groups[:, n_img : n_img + n_mod]
+        assert (module[valid_module] == gmd.GROUPS.index("module")).all() and (module[~valid_module] == -1).all(), kw
         valid_lang = groups[:, n_img + n_mod :][want[1][:, n_img + n_mod :]]
         assert (valid_lang == gmd.GROUPS.index("language")).all() and (groups[~want[1]] == -1).all()
         assert set(prefix.rms) == {"images", "module", "language"}
@@ -341,9 +363,14 @@ def test_make_prefix_word_scale_is_the_words_model():
     m, obs, inputs = _prefix_case(module_token_scale="words")
     want = m.embed_observation_prefix(obs, *inputs)
     target = m.module_text_rms(obs)[:, 0, 0]
-    got = gmd.make_prefix(m, gmd.AttentionRecorder(1), tokens=m.module_tokens, scale="word", target_rms=target)(
-        obs, *inputs
-    )
+    got = gmd.make_prefix(
+        m,
+        gmd.AttentionRecorder(1),
+        tokens=m.module_tokens,
+        token_mask=m.module_token_mask,
+        scale="word",
+        target_rms=target,
+    )(obs, *inputs)
     for x, y in zip(got, want, strict=True):
         torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
 
@@ -352,24 +379,27 @@ def test_make_prefix_after_bos_and_scales():
     import torch
 
     m, obs, inputs = _prefix_case()
-    n_lang = inputs[2].shape[1]
+    n_lang, n_mod = inputs[2].shape[1], len(gmd.slot_names(m))
     stock = m.embed_prefix(*inputs)
     n_img = stock[0].shape[1] - n_lang
     rec = gmd.AttentionRecorder(1)
     pre = gmd.make_prefix(m, rec, tokens=m.module_tokens, where="pre_bos", scale="language")(obs, *inputs)
     post = gmd.make_prefix(m, rec, tokens=m.module_tokens, where="post_bos", scale="language")(obs, *inputs)
-    # The first language token stays right after the images; the module tokens follow it.
+    # The first language token stays right after the images; the module tokens follow it. Without
+    # a token mask every inserted token is valid.
     torch.testing.assert_close(post[0][:, : n_img + 1], stock[0][:, : n_img + 1])
-    torch.testing.assert_close(post[0][:, n_img + 7 :], stock[0][:, n_img + 1 :])
-    torch.testing.assert_close(post[0][:, n_img + 1 : n_img + 7], pre[0][:, n_img : n_img + 6])
-    assert post[1][:, n_img + 1 : n_img + 7].all() and not post[2][:, n_img + 1 : n_img + 7].any()
-    assert (rec.prefix[:, n_img + 1 : n_img + 7] == gmd.GROUPS.index("module")).all()
+    torch.testing.assert_close(post[0][:, n_img + 1 + n_mod :], stock[0][:, n_img + 1 :])
+    torch.testing.assert_close(post[0][:, n_img + 1 : n_img + 1 + n_mod], pre[0][:, n_img : n_img + n_mod])
+    assert post[1][:, n_img + 1 : n_img + 1 + n_mod].all() and not post[2][:, n_img + 1 : n_img + 1 + n_mod].any()
+    assert (rec.prefix[:, n_img + 1 : n_img + 1 + n_mod] == gmd.GROUPS.index("module")).all()
     assert (rec.prefix[:, n_img] == gmd.GROUPS.index("language")).all()
 
     target = torch.arange(1, inputs[2].shape[0] + 1, dtype=torch.float32) * 2.0
     word = gmd.make_prefix(m, rec, tokens=m.module_tokens, scale="word", target_rms=target)(obs, *inputs)
-    module_rms = word[0][:, n_img : n_img + 6].pow(2).mean(-1).sqrt()
-    torch.testing.assert_close(module_rms, target[:, None].expand_as(module_rms), rtol=1e-4, atol=1e-4)
+    valid = m.module_token_mask(obs)
+    module_rms = word[0][:, n_img : n_img + n_mod][valid].pow(2).mean(-1).sqrt()
+    expected = target[:, None].expand(-1, n_mod)[valid]
+    torch.testing.assert_close(module_rms, expected, rtol=1e-4, atol=1e-4)
 
     fixed = torch.randn(inputs[2].shape[0], 3, stock[0].shape[-1])
     raw = gmd.make_prefix(m, rec, tokens=lambda _obs: fixed, scale="raw")(obs, *inputs)
@@ -398,16 +428,24 @@ def test_head_words():
 
     pack = _plan_pack.PlanPack.load(GOAL_PACK)
     by_index = {t.task_index: t for t in pack.tasks.values()}
-    slots = [*gmd.SPATIAL_SLOTS, *gmd.TEMPORAL_SLOTS]
+    group = ["ATOM", "OP", "OBJ", "TGT"]
+    slots = [f"S{g}_{s}" for g in range(4) for s in group] + ["CTX", *gmd.TEMPORAL_SLOTS]
     mugs = by_index[0]  # put the white mug on the left plate, then the yellow and white mug on the right
-    assert gmd.head_words(mugs, 0, slots) == ["put", "mug", "plate", "on", "two", "first"]
+    words = gmd.head_words(mugs, 0, slots)
+    assert words[:8] == ["on", "put", "mug", "plate", "on", "put", "mug", "plate"]
+    assert words[8:16] == [None] * 8 and words[16:] == ["on", "two", "first"]
     assert gmd.head_words(mugs, 1, slots)[-1] == "second"
+    # The slot order places stages: order [1, 0] shows stage 1 in group 0.
     microwave = by_index[2]  # the mug into "microwave (heating region)", then close it (no target)
-    assert gmd.head_words(microwave, 0, slots)[2] == "microwave"
-    assert gmd.head_words(microwave, 1, slots)[:4] == ["close", "microwave", None, "close"]
+    assert gmd.head_words(microwave, 0, slots)[2] == "mug" and gmd.head_words(microwave, 0, slots)[3] == "microwave"
+    assert gmd.head_words(microwave, 1, slots)[4:8] == ["close", "close", "microwave", None]
+    assert gmd.head_words(microwave, 1, slots, order=[1, 0, 2, 3])[:4] == ["close", "close", "microwave", None]
+    assert gmd.head_words(microwave, 1, slots, order=[1, 0, 2, 3])[16] == "close"
     drawer = by_index[12]  # open the top drawer and put the bowl inside: one stage
-    assert gmd.head_words(drawer, 0, slots) == ["open", "bowl", "drawer", "in", "one", "first"]
-    assert gmd.head_words(drawer, 0, ["OBJ", "T_ACTIVE"]) == ["bowl", "first"]
+    assert gmd.head_words(drawer, 0, slots)[:4] == ["in", "open", "bowl", "drawer"]
+    assert gmd.head_words(drawer, 0, slots)[4:16] == [None] * 12
+    assert gmd.head_words(drawer, 0, slots)[16:] == ["in", "one", "first"]
+    assert gmd.head_words(drawer, 0, ["S0_OBJ", "T_ACTIVE"]) == ["bowl", "first"]
 
 
 @pytest.mark.skipif(not GOAL_PACK.exists(), reason="Goal plan pack not present")

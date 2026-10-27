@@ -39,28 +39,42 @@ def test_other_task_stays_in_the_suite(module):
         assert other.task_index // gmp.SUITE_SIZE == t.task_index // gmp.SUITE_SIZE
 
 
+def _spans(names):
+    from openpi.glow import module_inputs as _mi
+
+    return [_mi.TEXT_SEGMENTS[n] for n in names]
+
+
 def test_module_variants(module):
     from openpi.glow import module_inputs as _mi
 
     two = next(t for t in module.pack.tasks.values() if t.num_plans == 2)
     correct = module.encode(two.task, 0)
-    v = gmp.module_variants(module.encode, module.pack, two.task, 0, correct)
+    v = gmp.module_variants(module, two.task, 0, correct)
     assert set(v) == set(gmp.VARIANTS)
     other = gmp.other_task(module.pack, two.task)
     np.testing.assert_array_equal(v["other_task"]["glow_text"], module.encode(other.task, 0)["glow_text"])
     np.testing.assert_array_equal(v["wrong_stage"]["glow_text"], module.encode(two.task, 1)["glow_text"])
     np.testing.assert_array_equal(v["grounding_other"]["glow_text"], correct["glow_text"])
     np.testing.assert_array_equal(v["grounding_other"]["glow_floats"], v["other_task"]["glow_floats"])
+    # The Spatial arrays hold the whole plan: a wrong stage is a wrong pointer and nothing else.
+    for key, value in v["wrong_stage"].items():
+        np.testing.assert_array_equal(value, v["wrong_stage_pointer"][key])
     # Blanks remove exactly their encoder's text, and leave `correct` untouched.
-    spatial = [_mi.TEXT_SEGMENTS[n] for n in ("subgoal", "object", "target")]
-    temporal = [_mi.TEXT_SEGMENTS[f"rk{j}"] for j in range(_mi.K_MAX)]
+    spatial = _spans(gmp._segments(_mi.SPATIAL_FIELDS))  # noqa: SLF001
+    temporal = _spans(gmp._segments(_mi.TEMPORAL_FIELDS))  # noqa: SLF001
     for blank, removed, kept in (("spatial_blank", spatial, temporal), ("temporal_blank", temporal, spatial)):
         for start, stop in removed:
             assert not v[blank]["glow_text_mask"][start:stop].any()
         for start, stop in kept:
             np.testing.assert_array_equal(v[blank]["glow_text_mask"][start:stop], correct["glow_text_mask"][start:stop])
-    assert v["spatial_blank"]["glow_ints"][_mi.INT_PREDICATE] == 0 and not v["spatial_blank"]["glow_floats"].any()
-    assert correct["glow_ints"][_mi.INT_PREDICATE] != 0 and correct["glow_text_mask"].sum() > 0
+    sb = v["spatial_blank"]
+    assert not sb["glow_ints"][_mi.INT_PREDICATE].any() and not sb["glow_floats"].any()
+    np.testing.assert_array_equal(sb["glow_ints"][_mi.INT_SPATIAL_SLOT], correct["glow_ints"][_mi.INT_SPATIAL_SLOT])
+    assert correct["glow_ints"][_mi.INT_PREDICATE][0] != 0 and correct["glow_text_mask"].sum() > 0
+    # A two-stage task has no chain variants of its own: they repeat `correct`.
+    for name in gmp.CHAIN_VARIANTS:
+        assert v[name] is correct
 
 
 def _segments(arrays, names):
@@ -72,24 +86,26 @@ def _segments(arrays, names):
 def test_splits_take_one_encoders_inputs(module):
     from openpi.glow import module_inputs as _mi
 
-    spatial = ("subgoal", "object", "target")
-    temporal = tuple(f"rk{j}" for j in range(_mi.K_MAX))
+    spatial = gmp._segments(_mi.SPATIAL_FIELDS)  # noqa: SLF001
+    temporal = gmp._segments(_mi.TEMPORAL_FIELDS)  # noqa: SLF001
     # Task 0 (two stages) against task 1: different subgoals, anchors and runtime keys.
     two = next(t for t in module.pack.tasks.values() if t.task_index == 0)
     correct = module.encode(two.task, 0)
-    v = gmp.module_variants(module.encode, module.pack, two.task, 0, correct)
-    for split, donor in (("other_task", v["other_task"]), ("wrong_stage", v["wrong_stage"])):
-        s = v[f"{split}_spatial"]
-        np.testing.assert_array_equal(_segments(s, spatial), _segments(donor, spatial))
-        np.testing.assert_array_equal(_segments(s, temporal), _segments(correct, temporal))
-        np.testing.assert_array_equal(s["glow_floats"], donor["glow_floats"])
-        assert s["glow_ints"][_mi.INT_PREDICATE] == donor["glow_ints"][_mi.INT_PREDICATE]
-        assert s["glow_ints"][_mi.INT_STAGE] == 0
+    v = gmp.module_variants(module, two.task, 0, correct)
+    donor = v["other_task"]
+    s = v["other_task_spatial"]
+    np.testing.assert_array_equal(_segments(s, spatial), _segments(donor, spatial))
+    np.testing.assert_array_equal(_segments(s, temporal), _segments(correct, temporal))
+    np.testing.assert_array_equal(s["glow_floats"], donor["glow_floats"])
+    np.testing.assert_array_equal(s["glow_ints"][_mi.INT_PREDICATE], donor["glow_ints"][_mi.INT_PREDICATE])
+    np.testing.assert_array_equal(s["glow_ints"][_mi.INT_SPATIAL_SLOT], donor["glow_ints"][_mi.INT_SPATIAL_SLOT])
+    assert s["glow_ints"][_mi.INT_STAGE] == 0 and s["glow_ints"][_mi.INT_NUM_STAGES] == 2
     t = v["other_task_temporal"]
     np.testing.assert_array_equal(_segments(t, spatial), _segments(correct, spatial))
-    np.testing.assert_array_equal(_segments(t, temporal), _segments(v["other_task"], temporal))
+    np.testing.assert_array_equal(_segments(t, temporal), _segments(donor, temporal))
     np.testing.assert_array_equal(t["glow_floats"], correct["glow_floats"])
-    np.testing.assert_array_equal(t["glow_ints"][1:], v["other_task"]["glow_ints"][1:])
+    np.testing.assert_array_equal(t["glow_ints"][:2], donor["glow_ints"][:2])
+    np.testing.assert_array_equal(t["glow_ints"][2:], correct["glow_ints"][2:])
     assert not np.array_equal(_segments(t, temporal), _segments(correct, temporal))
     # The pointer split moves the stage index and nothing else.
     p = v["wrong_stage_pointer"]
@@ -99,6 +115,54 @@ def test_splits_take_one_encoders_inputs(module):
     # Variants never write into `correct`.
     np.testing.assert_array_equal(correct["glow_text"], module.encode(two.task, 0)["glow_text"])
     np.testing.assert_array_equal(correct["glow_ints"], module.encode(two.task, 0)["glow_ints"])
+
+
+def test_chain_variants(module):
+    from openpi.glow import module_inputs as _mi
+
+    # Every one-stage Goal task has a partner; LIBERO-10's one one-stage task (9) has none.
+    for task in module.pack.tasks.values():
+        partner = gmp.chain_partner(module.pack, task.task)
+        if task.num_plans != 1 or task.task_index == 9:
+            assert partner is None or task.num_plans == 1
+            continue
+        assert partner is not None and partner.num_plans == 1 and partner.task_index != task.task_index
+        assert partner.task_index // gmp.SUITE_SIZE == task.task_index // gmp.SUITE_SIZE
+    assert gmp.chain_partner(module.pack, next(t.task for t in module.pack.tasks.values() if t.task_index == 9)) is None
+    # The bowl-on-the-stove task (17): its partner is the next non-bowl task, 19 (open the drawer).
+    own = next(t for t in module.pack.tasks.values() if t.task_index == 17)
+    partner = gmp.chain_partner(module.pack, own.task)
+    assert partner.task_index == 19
+    correct = module.encode(own.task, 0)
+    v = gmp.module_variants(module, own.task, 0, correct)
+    first = module.encode_stages((own.stages[0], partner.stages[0]), 0)
+    for key, value in first.items():
+        np.testing.assert_array_equal(v["chain_correct"][key], value)
+    second = v["chain_second"]
+    assert second["glow_ints"][:2].tolist() == [1, 2]
+    np.testing.assert_array_equal(_segments(second, ["rk1"]), _segments(first, ["rk0"]))
+    np.testing.assert_array_equal(_segments(second, ["rk0"]), _segments(first, ["rk1"]))
+    wrong = v["chain_wrong_pointer"]
+    assert wrong["glow_ints"][_mi.INT_STAGE] == 1
+    for key in ("glow_text", "glow_text_mask", "glow_floats"):
+        np.testing.assert_array_equal(wrong[key], first[key])
+    tb = v["chain_temporal_blank"]
+    assert not tb["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS["rk0"])].any()
+    np.testing.assert_array_equal(tb["glow_ints"], first["glow_ints"])
+    pb = v["chain_partner_blank"]
+    for field in _mi.SPATIAL_FIELDS:
+        assert not pb["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS[f"{field}1"])].any()
+        np.testing.assert_array_equal(
+            pb["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS[f"{field}0"])],
+            first["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS[f"{field}0"])],
+        )
+    assert pb["glow_ints"][_mi.INT_PREDICATE][1] == 0 and pb["glow_ints"][_mi.INT_PREDICATE][0] != 0
+    assert not pb["glow_floats"][_mi.STAGE_FLOATS : 2 * _mi.STAGE_FLOATS].any()
+    np.testing.assert_array_equal(pb["glow_floats"][: _mi.STAGE_FLOATS], first["glow_floats"][: _mi.STAGE_FLOATS])
+    np.testing.assert_array_equal(
+        pb["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS["rk1"])],
+        first["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS["rk1"])],
+    )
 
 
 @pytest.mark.skipif(
@@ -152,7 +216,9 @@ def test_main_end_to_end(monkeypatch, tmp_path):
     weights = tmp_path / "weights"
     weights.mkdir()
     torch.manual_seed(0)
-    safetensors.torch.save_model(get_config("pi05_libero_glow_st").model.create_pytorch(), str(weights / "model.safetensors"))
+    safetensors.torch.save_model(
+        get_config("pi05_libero_glow_st").model.create_pytorch(), str(weights / "model.safetensors")
+    )
 
     out = tmp_path / "probe.json"
     # LIBERO-10 episodes (two-stage tasks) and Goal episodes, not a 0..n-1 prefix.

@@ -5,6 +5,7 @@ label chains (plan_chain.csv, goal_plan_chain.csv) - skipped otherwise. The end-
 check additionally needs the local LeRobot copy (HF_LEROBOT_HOME with repo `libero_staging`).
 """
 
+import collections
 import csv
 import dataclasses
 import json
@@ -20,7 +21,15 @@ from openpi.glow import plan_pack as _plan_pack
 REPO = pathlib.Path(__file__).resolve().parents[4]  # glow_repo (openpi is its submodule)
 GOAL_PACK = REPO / "derived/plan_pack_libero10_goal.json"
 CHAINS = (REPO / "derived/plan_chain.csv", REPO / "derived/goal_plan_chain.csv")
-CONFIGS = ("pi05_libero_glow_st", "pi05_libero_glow_s_only", "pi05_libero_glow_nogrounding", "pi05_libero_glow_nosubgoal")
+CONFIGS = (
+    "pi05_libero_glow_st",
+    "pi05_libero_glow_s_only",
+    "pi05_libero_glow_nogrounding",
+    "pi05_libero_glow_nosubgoal",
+    "pi05_libero_glow_chain",
+    "pi05_libero_glow_chain_exec",
+)
+GOAL_TASKS = tuple(range(10, 20))
 
 pytestmark = pytest.mark.skipif(
     not (GOAL_PACK.exists() and all(c.exists() for c in CHAINS)), reason="Goal plan pack / label chains not present"
@@ -66,49 +75,91 @@ def _segment(arrays, name):
     return arrays["glow_text"][start:stop][arrays["glow_text_mask"][start:stop]].tolist()
 
 
+def _by_index(pack, task_index):
+    return next(t for t in pack.tasks.values() if t.task_index == task_index)
+
+
 def test_layout():
     spans = sorted(_mi.TEXT_SEGMENTS.values())
     assert spans[0][0] == 0 and spans[-1][1] == _mi.TEXT_LEN
     assert all(a[1] == b[0] for a, b in zip(spans, spans[1:], strict=False))
+    assert len(_mi.TEXT_SEGMENTS) == _mi.K_MAX * len(_mi.STAGE_FIELDS)
+    assert set(_mi.SPATIAL_FIELDS) | set(_mi.TEMPORAL_FIELDS) == set(_mi.STAGE_FIELDS)
+    assert _mi.INTS_LEN == 2 + 2 * _mi.K_MAX and _mi.FLOATS_LEN == _mi.K_MAX * _mi.STAGE_FLOATS
+    for j in range(_mi.K_MAX):
+        obj, obj_valid, tgt, tgt_valid = _mi.float_slices(j)
+        assert (obj.start, obj.stop, obj_valid, tgt.start, tgt.stop, tgt_valid) == tuple(
+            j * _mi.STAGE_FLOATS + o for o in (0, 3, 3, 4, 7, 7)
+        )
 
 
 def test_encode_every_stage(pack, raw, transform, tokenizer):
-    """Every stage of every task, against the pack JSON read independently."""
+    """Every stage of every task, against the pack JSON read independently: every stage's text,
+    predicate and anchors at its execution position, the pointer, and the sorted slot order."""
     for task_string, entry in raw["tasks"].items():
         stages = sorted(entry["stages"], key=lambda s: s["plan_index"])
-        for k, st in enumerate(stages):
+        order = sorted(range(len(stages)), key=lambda j: stages[j]["runtime_key"])
+        for k in range(len(stages)):
             a = transform.encode(task_string, k)
             assert a["glow_text"].shape == a["glow_text_mask"].shape == (_mi.TEXT_LEN,)
             assert a["glow_ints"].shape == (_mi.INTS_LEN,) and a["glow_floats"].shape == (_mi.FLOATS_LEN,)
-            assert _segment(a, "subgoal") == tokenizer.encode_text(st["subgoal_operation"])
-            assert _segment(a, "object") == tokenizer.encode_text(st["object_noun"])
-            assert _segment(a, "target") == tokenizer.encode_text(st["target_noun"])
             for j in range(_mi.K_MAX):
-                expected = tokenizer.encode_text(stages[j]["runtime_key"]) if j < len(stages) else []
-                assert _segment(a, f"rk{j}") == expected
+                st = stages[j] if j < len(stages) else None
+                expect = (
+                    {
+                        "atom": st["atom"],
+                        "subgoal": st["subgoal_operation"],
+                        "object": st["object_noun"],
+                        "target": st["target_noun"],
+                        "rk": st["runtime_key"],
+                    }
+                    if st
+                    else dict.fromkeys(_mi.STAGE_FIELDS, "")
+                )
+                for field, piece in expect.items():
+                    assert _segment(a, f"{field}{j}") == (tokenizer.encode_text(piece) if piece else [])
             # Valid tokens fill each segment from its start.
             for start, stop in _mi.TEXT_SEGMENTS.values():
                 m = a["glow_text_mask"][start:stop]
                 assert m.tolist() == sorted(m.tolist(), reverse=True)
                 assert not a["glow_text"][start:stop][~m].any()
-            predicate = st["atom"].split("(")[0].lower()
-            assert a["glow_ints"].tolist() == [_mi.PREDICATES.index(predicate) + 1, k, entry["K"]]
-            for role, xyz, valid in (
-                ("object", _mi.FLOAT_OBJECT, _mi.FLOAT_OBJECT_VALID),
-                ("target", _mi.FLOAT_TARGET, _mi.FLOAT_TARGET_VALID),
-            ):
-                anchor = st[f"{role}_anchor"]
-                if anchor is None:
-                    assert a["glow_floats"][valid] == 0 and not a["glow_floats"][xyz].any()
-                else:
-                    assert a["glow_floats"][valid] == 1
-                    np.testing.assert_allclose(a["glow_floats"][xyz], anchor["normalized"], rtol=1e-6)
+            predicates = [_mi.PREDICATES.index(s["atom"].split("(")[0].lower()) + 1 for s in stages]
+            ints = a["glow_ints"].tolist()
+            assert ints[:2] == [k, entry["K"]]
+            assert ints[_mi.INT_PREDICATE] == predicates + [0] * (_mi.K_MAX - len(stages))
+            assert ints[_mi.INT_SPATIAL_SLOT] == order + list(range(len(stages), _mi.K_MAX))
+            for j in range(_mi.K_MAX):
+                obj, obj_valid, tgt, tgt_valid = _mi.float_slices(j)
+                for xyz, valid, anchor in (
+                    (obj, obj_valid, stages[j]["object_anchor"] if j < len(stages) else None),
+                    (tgt, tgt_valid, stages[j]["target_anchor"] if j < len(stages) else None),
+                ):
+                    if anchor is None:
+                        assert a["glow_floats"][valid] == 0 and not a["glow_floats"][xyz].any()
+                    else:
+                        assert a["glow_floats"][valid] == 1
+                        np.testing.assert_allclose(a["glow_floats"][xyz], anchor["normalized"], rtol=1e-6)
+
+
+def test_sorted_order_differs_from_execution_order(pack, tokenizer):
+    """The moka-pot task runs moka_pot_2 before moka_pot_1: sorted by key, its groups swap."""
+    moka = _by_index(pack, 6)
+    assert [s.runtime_key.split("(")[1].split(",")[0] for s in moka.stages] == ["moka_pot_2", "moka_pot_1"]
+    execution = _mi.GlowModuleInputs(pack, tokenizer, stage_order="execution")
+    sorted_ = _mi.GlowModuleInputs(pack, tokenizer)
+    assert sorted_.encode(moka.task, 0)["glow_ints"][_mi.INT_SPATIAL_SLOT].tolist() == [1, 0, 2, 3]
+    assert execution.encode(moka.task, 0)["glow_ints"][_mi.INT_SPATIAL_SLOT].tolist() == [0, 1, 2, 3]
+    # Only the slot order differs: the text arrays stay in execution order either way.
+    for key in ("glow_text", "glow_text_mask", "glow_floats"):
+        np.testing.assert_array_equal(sorted_.encode(moka.task, 0)[key], execution.encode(moka.task, 0)[key])
+    with pytest.raises(ValueError, match="stage_order"):
+        _mi.GlowModuleInputs(pack, tokenizer, stage_order="random")
 
 
 def test_training_stage_at_boundaries(pack, chain, transform):
     ep = next(e for e, rows in sorted(chain.items()) if len(rows) == 2)
     rows = chain[ep]
-    task = next(t.task for t in pack.tasks.values() if t.task_index == int(rows[0]["task_index"]))
+    task = _by_index(pack, int(rows[0]["task_index"])).task
     boundary = int(rows[1]["start_frame"])
     for frame, k in ((0, 0), (boundary - 1, 0), (boundary, 1)):
         out = transform({"prompt": task, "episode_index": np.int64(ep), "frame_index": np.int64(frame), "state": 1})
@@ -125,7 +176,7 @@ def test_inference_and_steering(pack, transform):
     out = transform({"prompt": two.task, "oracle_plan_index": np.int64(1), "prev_plan_index": np.int64(0)})
     assert out["prompt"] == "" and "prev_plan_index" not in out and "oracle_plan_index" not in out
     np.testing.assert_array_equal(out["glow_text"], transform.encode(two.task, 1)["glow_text"])
-    # Steering: the steering task's module, the stage clamped to its stages.
+    # Steering: the steering task's plan, the stage clamped to its stages.
     out = transform({"prompt": two.task, "oracle_plan_index": 1, "plan_task": one.task})
     for key, value in transform.encode(one.task, 0).items():
         np.testing.assert_array_equal(out[key], value)
@@ -138,13 +189,112 @@ def test_inference_and_steering(pack, transform):
         transform({"prompt": one.task, "episode_index": ep, "frame_index": 0})
 
 
+def test_plan_chain_at_inference(pack, transform):
+    """plan_chain runs several tasks' stages as one plan, the index counting over the chain."""
+    a, b = _by_index(pack, 17), _by_index(pack, 16)  # bowl on the stove; turn on the stove
+    out = transform({"prompt": a.task, "oracle_plan_index": 1, "plan_chain": [a.task, b.task]})
+    expected = transform.encode_stages((a.stages[0], b.stages[0]), 1)
+    for key, value in expected.items():
+        np.testing.assert_array_equal(out[key], value)
+    assert out["glow_ints"][:2].tolist() == [1, 2]
+    assert _segment(out, "rk0") != _segment(out, "rk1")
+    # Sorted groups: "on(akita_black_bowl_1, ...)" sorts before "turnon(...)".
+    assert out["glow_ints"][_mi.INT_SPATIAL_SLOT].tolist() == [0, 1, 2, 3]
+    out = transform({"prompt": a.task, "oracle_plan_index": 0, "plan_chain": [b.task, a.task]})
+    assert out["glow_ints"][_mi.INT_SPATIAL_SLOT].tolist() == [1, 0, 2, 3]
+    # An empty chain is no chain; a chain excludes plan_task; a training sample takes none.
+    np.testing.assert_array_equal(
+        transform({"prompt": a.task, "oracle_plan_index": 0, "plan_chain": []})["glow_text"],
+        transform.encode(a.task, 0)["glow_text"],
+    )
+    with pytest.raises(ValueError, match="exclude"):
+        transform({"prompt": a.task, "oracle_plan_index": 0, "plan_chain": [b.task], "plan_task": b.task})
+    ep = next(e for e, p in pack.episodes.items() if p.task_index == a.task_index)
+    with pytest.raises(ValueError, match="steering"):
+        transform({"prompt": a.task, "episode_index": ep, "frame_index": 0, "plan_chain": [a.task, b.task]})
+    with pytest.raises(ValueError, match=f"{_mi.K_MAX}"):
+        transform.encode_stages(tuple(a.stages) * (_mi.K_MAX + 1), 0)
+
+
+def test_chain_partners(pack):
+    partners = _mi.chain_partners(pack, GOAL_TASKS)
+    assert set(partners) == set(GOAL_TASKS)
+    moved = {i: _mi.moved_object(_by_index(pack, i).stages[0]) for i in GOAL_TASKS}
+    assert moved[17] == "akita_black_bowl_1" and moved[16] is None and moved[19] is None
+    for own, mates in partners.items():
+        assert own not in {m.task_index for m in mates}
+        for m in mates:
+            assert moved[own] is None or _mi.moved_object(m.stages[0]) != moved[own]
+        assert [m.task_index for m in mates] == sorted(m.task_index for m in mates)
+    # The four bowl tasks never pair with each other; the stove tasks pair with everything.
+    bowl = {i for i in GOAL_TASKS if moved[i] == "akita_black_bowl_1"}
+    assert len(bowl) == 4
+    for i in bowl:
+        assert not bowl & {m.task_index for m in partners[i]}
+    assert len(partners[16]) == len(GOAL_TASKS) - 1
+    assert sum(len(v) for v in partners.values()) == 76
+    with pytest.raises(ValueError, match="stages"):
+        _mi.chain_partners(pack, (0, 10))
+    with pytest.raises(KeyError):
+        _mi.chain_partners(pack, (99,))
+
+
+def test_chain_augmentation(pack, tokenizer):
+    own = _by_index(pack, 17)
+    ep = next(e for e, p in pack.episodes.items() if p.task_index == own.task_index)
+    sample = {"prompt": own.task, "episode_index": np.int64(ep), "frame_index": np.int64(0)}
+    always = _mi.GlowModuleInputs(pack, tokenizer, chain_p=1.0, chain_tasks=GOAL_TASKS, rng=np.random.default_rng(0))
+    partners = {m.task_index for m in always.partners[own.task_index]}
+    seen = collections.Counter()
+    for _ in range(120):
+        out = always(dict(sample))
+        k, num = out["glow_ints"][:2].tolist()
+        assert num == 2 and out["prompt"] == ""
+        other = 1 - k
+        # The own stage sits at the pointer, a partner's at the other position.
+        assert _segment(out, f"rk{k}") == tokenizer.encode_text(own.stages[0].runtime_key)
+        matches = [
+            m
+            for m in always.partners[own.task_index]
+            if _segment(out, f"rk{other}") == tokenizer.encode_text(m.stages[0].runtime_key)
+        ]
+        assert len(matches) == 1
+        pair = (own.stages[0], matches[0].stages[0]) if k == 0 else (matches[0].stages[0], own.stages[0])
+        expected = always.encode_stages(pair, k)
+        for key, value in expected.items():
+            np.testing.assert_array_equal(out[key], value)
+        seen[(k, matches[0].task_index)] += 1
+    assert {i for _, i in seen} == partners and {k for k, _ in seen} == {0, 1}
+    # chain_p = 0 (the default) never chains; a task outside chain_tasks never chains.
+    never = _mi.GlowModuleInputs(pack, tokenizer, chain_tasks=GOAL_TASKS)
+    for key, value in never.encode(own.task, 0).items():
+        np.testing.assert_array_equal(never(dict(sample))[key], value)
+    l10 = _by_index(pack, 9)
+    l10_ep = next(e for e, p in pack.episodes.items() if p.task_index == l10.task_index)
+    out = always({"prompt": l10.task, "episode_index": np.int64(l10_ep), "frame_index": np.int64(0)})
+    for key, value in always.encode(l10.task, 0).items():
+        np.testing.assert_array_equal(out[key], value)
+    # Half the time at chain_p 0.5, with the global generator too.
+    half = _mi.GlowModuleInputs(pack, tokenizer, chain_p=0.5, chain_tasks=GOAL_TASKS)
+    np.random.seed(0)
+    chained = sum(half(dict(sample))["glow_ints"][_mi.INT_NUM_STAGES] == 2 for _ in range(400))
+    assert 150 < chained < 250
+    # Inference samples are never chained.
+    for key, value in always.encode(own.task, 0).items():
+        np.testing.assert_array_equal(always({"prompt": own.task, "oracle_plan_index": 0})[key], value)
+    with pytest.raises(ValueError, match="chain_tasks"):
+        _mi.GlowModuleInputs(pack, tokenizer, chain_p=0.5)
+    with pytest.raises(ValueError, match="chain_p"):
+        _mi.GlowModuleInputs(pack, tokenizer, chain_p=1.5, chain_tasks=GOAL_TASKS)
+
+
 def test_teacher_prompt(pack, chain, transform, tokenizer):
     from openpi.models import tokenizer as _tokenizer
 
     teacher_tokenizer = _tokenizer.PaligemmaTokenizer(48)
     with_teacher = _mi.GlowModuleInputs(pack, tokenizer, teacher_tokenizer)
     ep = next(e for e, rows in sorted(chain.items()) if len(rows) == 2)
-    task = next(t.task for t in pack.tasks.values() if t.task_index == int(chain[ep][0]["task_index"]))
+    task = _by_index(pack, int(chain[ep][0]["task_index"])).task
     sample = {"prompt": task, "episode_index": np.int64(ep), "frame_index": np.int64(0)}
     out = with_teacher(dict(sample))
     # The task string as the stock pi05 prompt (BOS, task, newline), the student's prompt emptied.
@@ -157,6 +307,13 @@ def test_teacher_prompt(pack, chain, transform, tokenizer):
     # Inference never carries it, and neither does a transform without a teacher tokenizer.
     assert "glow_teacher_prompt" not in with_teacher({"prompt": task, "oracle_plan_index": 0})
     assert "glow_teacher_prompt" not in transform(dict(sample))
+    # A chained sample's teacher prompt is still its own task string.
+    own = _by_index(pack, 17)
+    own_ep = next(e for e, p in pack.episodes.items() if p.task_index == own.task_index)
+    chained = _mi.GlowModuleInputs(pack, tokenizer, teacher_tokenizer, chain_p=1.0, chain_tasks=GOAL_TASKS)
+    out = chained({"prompt": own.task, "episode_index": np.int64(own_ep), "frame_index": np.int64(0)})
+    np.testing.assert_array_equal(out["glow_teacher_prompt"], teacher_tokenizer.tokenize(own.task)[0])
+    assert out["glow_ints"][_mi.INT_NUM_STAGES] == 2
 
 
 def test_samples_make_a_valid_observation(pack, transform):
@@ -179,6 +336,7 @@ def test_samples_make_a_valid_observation(pack, transform):
     batch = jax.tree.map(lambda *xs: np.stack(xs), *samples)
     obs = _model.Observation.from_dict(batch)
     assert obs.glow_text.shape == (3, _mi.TEXT_LEN) and obs.glow_floats.shape == (3, _mi.FLOATS_LEN)
+    assert obs.glow_ints.shape == (3, _mi.INTS_LEN)
 
 
 def test_module_configs(monkeypatch):
@@ -191,20 +349,55 @@ def test_module_configs(monkeypatch):
         "pi05_libero_glow_s_only": {"module_temporal": False},
         "pi05_libero_glow_nogrounding": {"module_grounding": False},
         "pi05_libero_glow_nosubgoal": {"module_subgoal_text": False},
+        "pi05_libero_glow_chain": {"module_text_anchor": True, "module_token_scale": "words"},
+        "pi05_libero_glow_chain_exec": {"module_text_anchor": True, "module_token_scale": "words"},
+    }
+    data = {
+        "pi05_libero_glow_chain": {
+            "module_chain_p": 0.5,
+            "module_chain_tasks": GOAL_TASKS,
+            "module_stage_order": "sorted",
+        },
+        "pi05_libero_glow_chain_exec": {
+            "module_chain_p": 0.5,
+            "module_chain_tasks": GOAL_TASKS,
+            "module_stage_order": "execution",
+        },
     }
     monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
     for name in CONFIGS:
         cfg = _config.get_config(name)
         assert isinstance(cfg.model, GlowModulePi0Config) and cfg.model.max_token_len == 8
         expected = dataclasses.replace(GlowModulePi0Config(), **switches[name])
-        for field in ("module_spatial", "module_temporal", "module_grounding", "module_subgoal_text"):
+        for field in (
+            "module_spatial",
+            "module_temporal",
+            "module_grounding",
+            "module_subgoal_text",
+            "module_text_anchor",
+        ):
             assert getattr(cfg.model, field) == getattr(expected, field), (name, field)
+        assert cfg.data.module_inputs and cfg.data.plan_pack_path == plan_prompt.data.plan_pack_path
+        assert cfg.data.train_episodes == plan_prompt.data.train_episodes == "0:807"
+        for field, value in data.get(
+            name, {"module_chain_p": 0.0, "module_chain_tasks": (), "module_stage_order": "sorted"}
+        ).items():
+            assert getattr(cfg.data, field) == value, (name, field)
+        assert cfg.lr_schedule == plan_prompt.lr_schedule and cfg.batch_size == plan_prompt.batch_size
+        # The transform the config builds carries the data fields.
+        monkeypatch.setenv(_plan_pack.ENV_VAR, str(GOAL_PACK))
+        dc = dataclasses.replace(cfg.data, plan_pack_path=None).create(cfg.assets_dirs, cfg.model)
+        module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
+        assert (module.chain_p, module.chain_tasks, module.stage_order) == (
+            cfg.data.module_chain_p,
+            cfg.data.module_chain_tasks,
+            cfg.data.module_stage_order,
+        )
+        assert set(module.partners) == set(module.chain_tasks)
         # The text control's data and recipe.
         for field in ("batch_size", "num_train_steps", "lr_schedule", "optimizer", "ema_decay", "weight_loader"):
             assert getattr(cfg, field) == getattr(plan_prompt, field), (name, field)
-        assert cfg.data.module_inputs and not cfg.data.plan_as_prompt
-        assert cfg.data.plan_pack_path == plan_prompt.data.plan_pack_path
-        assert cfg.data.train_episodes == plan_prompt.data.train_episodes
+        assert not cfg.data.plan_as_prompt
     cfg = _config.get_config("pi05_libero_glow_st")
     local = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK))
     kinds = [type(t).__name__ for t in local.create(pathlib.Path("."), cfg.model).model_transforms.inputs]
@@ -214,6 +407,8 @@ def test_module_configs(monkeypatch):
         local.create(pathlib.Path("."), plan_prompt.model)
     with pytest.raises(ValueError, match="exclude"):
         dataclasses.replace(local, plan_as_prompt=True).create(pathlib.Path("."), cfg.model)
+    with pytest.raises(ValueError, match="stage_order"):
+        dataclasses.replace(local, module_stage_order="random").create(pathlib.Path("."), cfg.model)
 
 
 def test_align_configs(monkeypatch):
@@ -223,17 +418,20 @@ def test_align_configs(monkeypatch):
     st = _config.get_config("pi05_libero_glow_st")
     align = _config.get_config("pi05_libero_glow_st_align")
     anchor = _config.get_config("pi05_libero_glow_st_anchor")
+    chain = _config.get_config("pi05_libero_glow_chain")
     assert align.model.module_text_anchor and align.model.freeze_pretrained and align.model.module_distill_weight > 0
     assert anchor.model.module_text_anchor and not anchor.model.freeze_pretrained
     assert anchor.model.module_distill_weight == 0 and not st.model.module_text_anchor
     # Both enter the prefix at a word token's size; the unanchored row keeps the language scale.
     assert align.model.module_token_scale == anchor.model.module_token_scale == "words"
     assert st.model.module_token_scale == "language"
-    # Same data and recipe as the unanchored row.
+    # Same data and recipe as the unanchored row; the chain row is _st_anchor's model with chains.
     for cfg in (align, anchor):
         assert dataclasses.replace(cfg.data) == st.data
         for field in ("batch_size", "num_train_steps", "lr_schedule", "optimizer", "weight_loader"):
             assert getattr(cfg, field) == getattr(st, field), field
+    assert chain.model == anchor.model
+    assert dataclasses.replace(chain.data, module_chain_p=0.0, module_chain_tasks=()) == anchor.data
 
     def module_transform(cfg):
         local = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK))
@@ -245,7 +443,7 @@ def test_align_configs(monkeypatch):
     assert module_transform(anchor).teacher_tokenizer is None and module_transform(st).teacher_tokenizer is None
 
 
-@pytest.mark.parametrize("config_name", ["pi05_libero_glow_st", "pi05_libero_glow_st_align"])
+@pytest.mark.parametrize("config_name", ["pi05_libero_glow_st", "pi05_libero_glow_st_align", "pi05_libero_glow_chain"])
 def test_module_loader_end_to_end(monkeypatch, config_name):
     home = os.environ.get("HF_LEROBOT_HOME")
     if not home or not (pathlib.Path(home) / "libero_staging").exists():
@@ -263,15 +461,24 @@ def test_module_loader_end_to_end(monkeypatch, config_name):
         batch_size=8,
         num_workers=0,
     )
-    pack = _plan_pack.PlanPack.load(GOAL_PACK)
-    goal_tasks = {t.task_index for t in pack.tasks.values() if t.task_index >= 10}
+    chained = 0
     loader = _data.create_data_loader(cfg, framework="pytorch", shuffle=True, num_batches=3, skip_norm_stats=True)
     for obs, _ in loader:
         # The prompt is BOS + "\n" only; the goal is in the module arrays.
         assert obs.tokenized_prompt.shape == (8, 8)
         assert (np.asarray(obs.tokenized_prompt_mask).sum(axis=1) == 2).all()
         ints = np.asarray(obs.glow_ints)
-        assert (ints[:, _mi.INT_NUM_STAGES] == 1).all() and (ints[:, _mi.INT_STAGE] == 0).all()
+        assert ints.shape == (8, _mi.INTS_LEN) and np.asarray(obs.glow_text).shape == (8, _mi.TEXT_LEN)
+        assert np.asarray(obs.glow_floats).shape == (8, _mi.FLOATS_LEN)
+        two = ints[:, _mi.INT_NUM_STAGES] == 2
+        chained += int(two.sum())
+        if cfg.data.module_chain_p == 0:
+            assert (ints[:, _mi.INT_NUM_STAGES] == 1).all() and (ints[:, _mi.INT_STAGE] == 0).all()
+        else:
+            assert (ints[~two, _mi.INT_STAGE] == 0).all() and (ints[two, _mi.INT_STAGE] <= 1).all()
+            # A chained sample has two runtime keys; an unchained one has one.
+            rk1 = slice(*_mi.TEXT_SEGMENTS["rk1"])
+            assert (np.asarray(obs.glow_text_mask)[:, rk1].any(axis=1) == two).all()
         assert np.asarray(obs.glow_text_mask).any(axis=1).all()
         if cfg.model.module_distill_weight > 0:
             # The teacher's prompt: BOS, the task string, newline.
@@ -279,4 +486,5 @@ def test_module_loader_end_to_end(monkeypatch, config_name):
             assert (np.asarray(obs.glow_teacher_prompt_mask).sum(axis=1) > 2).all()
         else:
             assert obs.glow_teacher_prompt is None
-    assert goal_tasks  # Goal episodes are single-stage tasks 10-19
+    if cfg.data.module_chain_p > 0:
+        assert 0 < chained < 24

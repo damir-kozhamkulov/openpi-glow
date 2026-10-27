@@ -2,8 +2,9 @@
 
 Prefix layout and scale; the module inputs reach the actions (training flow and inference
 actions move when they change, and stay put when they do not); every encoder input is read
-(subgoal, nouns, anchors, predicate, runtime keys, stage); the ablation switches remove what
-they name; the encoders get gradients; the stock model is unchanged by the prefix hook.
+(atoms, subgoals, nouns, anchors, predicates, runtime keys, the stage pointer, the Spatial slot
+order); padded stage groups are masked; the ablation switches remove what they name; the
+encoders get gradients; the stock model is unchanged by the prefix hook.
 
 Runs in-container with `uv pip install --python /venv-server/bin/python pytest pynvml`.
 """
@@ -26,22 +27,40 @@ B = 4
 WIDTH = 64  # dummy Gemma width
 
 
-def _module_arrays(seed, bsize=B):
-    """Random but well-formed module arrays: every text segment partly filled, two-stage tasks."""
+K = 2  # stages of the test plans
+
+
+def _module_arrays(seed, bsize=B, num_stages=K):
+    """Random but well-formed module arrays: every text segment of the first `num_stages` stages
+    partly filled (the rest zero), anchors on every stage, the Spatial groups in reverse order."""
     g = np.random.default_rng(seed)
     text = np.zeros((bsize, _mi.TEXT_LEN), dtype=np.int64)
     mask = np.zeros((bsize, _mi.TEXT_LEN), dtype=bool)
     for name, (start, stop) in _mi.TEXT_SEGMENTS.items():
-        n = 0 if name in ("rk2", "rk3") else int(g.integers(1, stop - start))
+        if int(name[-1]) >= num_stages:
+            continue
+        n = int(g.integers(1, stop - start))
         text[:, start : start + n] = g.integers(3, 1000, (bsize, n))
         mask[:, start : start + n] = True
-    ints = np.stack(
-        [g.integers(1, len(_mi.PREDICATES) + 1, bsize), g.integers(0, 2, bsize), np.full(bsize, 2)], axis=1
+    ints = np.zeros((bsize, _mi.INTS_LEN), dtype=np.int64)
+    ints[:, _mi.INT_STAGE] = g.integers(0, num_stages, bsize)
+    ints[:, _mi.INT_NUM_STAGES] = num_stages
+    ints[:, _mi.INT_PREDICATE] = np.where(
+        np.arange(_mi.K_MAX) < num_stages, g.integers(1, len(_mi.PREDICATES) + 1, (bsize, _mi.K_MAX)), 0
     )
-    floats = np.concatenate(
-        [g.uniform(-1, 1, (bsize, 3)), np.ones((bsize, 1)), g.uniform(-1, 1, (bsize, 3)), np.ones((bsize, 1))], axis=1
-    )
-    return {"glow_text": text, "glow_text_mask": mask, "glow_ints": ints, "glow_floats": floats.astype(np.float32)}
+    ints[:, _mi.INT_SPATIAL_SLOT] = [*range(num_stages - 1, -1, -1), *range(num_stages, _mi.K_MAX)]
+    floats = np.zeros((bsize, _mi.FLOATS_LEN), dtype=np.float32)
+    for j in range(num_stages):
+        obj, obj_valid, tgt, tgt_valid = _mi.float_slices(j)
+        floats[:, obj], floats[:, obj_valid] = g.uniform(-1, 1, (bsize, 3)), 1.0
+        floats[:, tgt], floats[:, tgt_valid] = g.uniform(-1, 1, (bsize, 3)), 1.0
+    return {"glow_text": text, "glow_text_mask": mask, "glow_ints": ints, "glow_floats": floats}
+
+
+def _valid_tokens(num_stages=K):
+    """Which of the model's module tokens are real for plans of `num_stages` stages."""
+    spatial = [j < num_stages for j in range(_mi.K_MAX) for _ in _enc.SPATIAL_SLOTS] + [True]
+    return torch.tensor(spatial + [True] * _enc.TEMPORAL_TOKENS)
 
 
 def _obs(seed, module, bsize=B):
@@ -85,16 +104,26 @@ def test_prefix_layout_and_scale(model):
     n = _enc.SPATIAL_TOKENS + _enc.TEMPORAL_TOKENS
     num_img = stock[0].shape[1] - lang_tokens.shape[1]
     assert embs.shape == (B, stock[0].shape[1] + n, WIDTH)
-    # Images and language are the stock ones; the module tokens sit between them, valid and bidirectional.
+    # Images and language are the stock ones; the module tokens sit between them, bidirectional,
+    # the padded Spatial groups (stages past K) masked out like padded language.
     assert torch.equal(embs[:, :num_img], stock[0][:, :num_img])
     assert torch.equal(embs[:, num_img + n :], stock[0][:, num_img:])
-    assert pad[:, num_img : num_img + n].all() and not att[:, num_img : num_img + n].any()
+    valid = _valid_tokens()
+    assert torch.equal(pad[:, num_img : num_img + n], valid[None].expand(B, -1))
+    assert not att[:, num_img : num_img + n].any()
     assert torch.equal(pad[:, num_img + n :], stock[1][:, num_img:])
-    # Module tokens have the RMS of the sample's language tokens.
-    module_rms = embs[:, num_img : num_img + n].pow(2).mean(-1).sqrt()
+    assert torch.equal(model.module_token_mask(obs), valid[None].expand(B, -1))
+    # Real module tokens have the RMS of the sample's language tokens; padded ones are zero.
+    module = embs[:, num_img : num_img + n]
+    module_rms = module[:, valid].pow(2).mean(-1).sqrt()
     lang = stock[0][:, num_img:]
     lang_rms = (lang.pow(2).mean(-1) * lang_masks).sum(1) / lang_masks.sum(1)
     torch.testing.assert_close(module_rms, lang_rms.sqrt()[:, None].expand_as(module_rms), rtol=1e-4, atol=1e-4)
+    assert not module[:, ~valid].any()
+    # A one-stage plan masks three groups; a four-stage plan none.
+    for k in (1, _mi.K_MAX):
+        mask_k = model.module_token_mask(_obs(0, _module_arrays(0, num_stages=k)))
+        assert torch.equal(mask_k, _valid_tokens(k)[None].expand(B, -1))
 
 
 def test_module_inputs_reach_the_actions(model):
@@ -125,15 +154,22 @@ def _segment_edit(name):
     return edit
 
 
+def _swap_slots(a):
+    a["glow_ints"][:, _mi.INT_SPATIAL_SLOT] = a["glow_ints"][:, _mi.INT_SPATIAL_SLOT][:, [1, 0, 2, 3]]
+
+
 EDITS = {
-    "subgoal": _segment_edit("subgoal"),
-    "object noun": _segment_edit("object"),
-    "target noun": _segment_edit("target"),
+    "atom": _segment_edit("atom0"),
+    "subgoal": _segment_edit("subgoal0"),
+    "object noun": _segment_edit("object0"),
+    "target noun": _segment_edit("target0"),
+    "second stage subgoal": _segment_edit("subgoal1"),
     "runtime key": _segment_edit("rk1"),
-    "predicate": lambda a: a["glow_ints"].__setitem__((slice(None), _mi.INT_PREDICATE), 0),
+    "predicate": lambda a: a["glow_ints"].__setitem__((slice(None), _mi.INT_PREDICATE.start), 0),
     "stage": lambda a: a["glow_ints"].__setitem__((slice(None), _mi.INT_STAGE), 1 - a["glow_ints"][:, _mi.INT_STAGE]),
-    "object anchor": lambda a: a["glow_floats"].__setitem__((slice(None), _mi.FLOAT_OBJECT), 0.5),
-    "target anchor": lambda a: a["glow_floats"].__setitem__((slice(None), _mi.FLOAT_TARGET), -0.5),
+    "slot order": _swap_slots,
+    "object anchor": lambda a: a["glow_floats"].__setitem__((slice(None), _mi.float_slices(0)[0]), 0.5),
+    "target anchor": lambda a: a["glow_floats"].__setitem__((slice(None), _mi.float_slices(1)[2]), -0.5),
 }
 
 
@@ -151,9 +187,17 @@ def test_every_input_is_read(model, field):
     ("switch", "ignored", "tokens"),
     [
         ({"module_temporal": False}, ("runtime key",), _enc.SPATIAL_TOKENS),
-        ({"module_spatial": False}, ("subgoal", "object noun", "target noun", "predicate", "object anchor"), 2),
-        ({"module_grounding": False}, ("object anchor", "target anchor"), 6),
-        ({"module_subgoal_text": False}, ("subgoal",), 6),
+        (
+            {"module_spatial": False},
+            ("atom", "subgoal", "object noun", "target noun", "predicate", "object anchor", "slot order"),
+            _enc.TEMPORAL_TOKENS,
+        ),
+        ({"module_grounding": False}, ("object anchor", "target anchor"), _enc.SPATIAL_TOKENS + _enc.TEMPORAL_TOKENS),
+        (
+            {"module_subgoal_text": False},
+            ("subgoal", "second stage subgoal"),
+            _enc.SPATIAL_TOKENS + _enc.TEMPORAL_TOKENS,
+        ),
     ],
 )
 def test_ablation_switches(switch, ignored, tokens):
@@ -215,31 +259,38 @@ def test_text_anchor_init_emits_the_anchors():
     arrays = _module_arrays(0)
     tokens = m.module_tokens(_obs(0, arrays))
     stage = torch.as_tensor(arrays["glow_ints"][:, _mi.INT_STAGE])
+    order = arrays["glow_ints"][0, _mi.INT_SPATIAL_SLOT].tolist()  # the same for every row
+    assert order[:K] == [1, 0]
     every_rk = [f"rk{j}" for j in range(_mi.K_MAX)]
-    expected = [
-        _pooled(m, arrays, ["subgoal"]),
-        _pooled(m, arrays, ["object"]),
-        _pooled(m, arrays, ["target"]),
-        _pooled(m, arrays, ["subgoal", "object", "target"]),
+    fields = ("subgoal", "object", "target", "atom")  # _enc.SPATIAL_SLOTS: OP, OBJ, TGT, ATOM
+    expected = [_pooled(m, arrays, [f"{field}{j}"]) for j in order for field in fields]
+    expected += [
+        _pooled(m, arrays, [f"{f}{j}" for j in range(_mi.K_MAX) for f in fields]),
         _pooled(m, arrays, every_rk),
         torch.stack([_pooled(m, arrays, [f"rk{j}"]) for j in range(_mi.K_MAX)], dim=1)[torch.arange(B), stage],
     ]
     torch.testing.assert_close(tokens, torch.stack(expected, dim=1), rtol=1e-5, atol=1e-6)
+    # Groups past the plan's stages are zero tokens.
+    assert not tokens[:, ~_valid_tokens()].any()
     # The prefix carries them, rescaled to the language tokens' RMS as unanchored tokens are.
     obs = _obs(0, arrays)
     images, img_masks, lang_tokens, lang_masks, _ = m._preprocess_observation(obs, train=False)  # noqa: SLF001
     embs, _, _ = m.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
     num_img = embs.shape[1] - lang_tokens.shape[1] - tokens.shape[1]
+    valid = _valid_tokens()
     cos = torch.nn.functional.cosine_similarity(embs[:, num_img : num_img + tokens.shape[1]], tokens, dim=-1)
-    torch.testing.assert_close(cos, torch.ones_like(cos), rtol=0, atol=1e-5)
+    torch.testing.assert_close(cos[:, valid], torch.ones_like(cos[:, valid]), rtol=0, atol=1e-5)
 
 
 def test_text_anchor_without_subgoal_text():
     m = _model_with(module_text_anchor=True, module_subgoal_text=False)
     arrays = _module_arrays(0)
     tokens = m.module_tokens(_obs(0, arrays))
-    assert torch.equal(tokens[:, 0], torch.zeros_like(tokens[:, 0]))  # OP anchors to zero
-    torch.testing.assert_close(tokens[:, 3], _pooled(m, arrays, ["object", "target"]), rtol=1e-5, atol=1e-6)
+    op = [g * len(_enc.SPATIAL_SLOTS) + _enc.SPATIAL_SLOTS.index("OP") for g in range(K)]
+    assert torch.equal(tokens[:, op], torch.zeros_like(tokens[:, op]))  # OP anchors to zero
+    ctx = _mi.K_MAX * len(_enc.SPATIAL_SLOTS)
+    names = [f"{f}{j}" for j in range(_mi.K_MAX) for f in ("atom", "object", "target")]
+    torch.testing.assert_close(tokens[:, ctx], _pooled(m, arrays, names), rtol=1e-5, atol=1e-6)
 
 
 def test_text_anchor_residual_trains():
@@ -368,11 +419,12 @@ def test_word_token_scale():
     ids, mask = torch.as_tensor(arrays["glow_text"]), torch.as_tensor(arrays["glow_text_mask"])
     rms = (embed(ids).float() * math.sqrt(WIDTH)).pow(2).mean(-1).sqrt()
     target = (rms * mask).sum(1) / mask.sum(1)
-    module_rms = module.pow(2).mean(-1).sqrt()
+    valid = _valid_tokens()
+    module_rms = module[:, valid].pow(2).mean(-1).sqrt()
     torch.testing.assert_close(module_rms, target[:, None].expand_as(module_rms), rtol=1e-4, atol=1e-4)
     # Same encoders, same directions: only the size differs from the language scale.
     cos = torch.nn.functional.cosine_similarity(module, ref[:, num_img : num_img + n], dim=-1)
-    torch.testing.assert_close(cos, torch.ones_like(cos), rtol=0, atol=1e-5)
+    torch.testing.assert_close(cos[:, valid], torch.ones_like(cos[:, valid]), rtol=0, atol=1e-5)
     # The rest of the prefix is untouched.
     torch.testing.assert_close(embs[:, :num_img], ref[:, :num_img])
     torch.testing.assert_close(embs[:, num_img + n :], ref[:, num_img + n :])

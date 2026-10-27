@@ -96,7 +96,6 @@ STAGE_PROMPT_LEN = 80
 PREDICATE_WORDS = {"on": "on", "in": "in", "open": "open", "close": "close", "turnon": "on", "turnoff": "off"}
 COUNT_WORDS = ("one", "two", "three", "four")
 ORDINAL_WORDS = ("first", "second", "third", "fourth")
-SPATIAL_SLOTS = ("OP", "OBJ", "TGT", "CTX")
 TEMPORAL_SLOTS = ("T_SUMMARY", "T_ACTIVE")
 # LIBERO-10 is task indices 0-9 and LIBERO-Goal 10-19 in physical-intelligence/libero.
 SUITE_SIZE = 10
@@ -130,16 +129,30 @@ class Args:
 
 
 def slot_names(model) -> list[str]:
+    """The model's module tokens in prefix order: per Spatial group g (in the module's slot
+    order) S{g}_ATOM / _OP / _OBJ / _TGT, then CTX; then the Temporal pair."""
+    from openpi.glow import module_encoders as _enc
+    from openpi.glow import module_inputs as _mi
+
     names = []
     if getattr(model, "glow_spatial_encoder", None) is not None:
-        names += SPATIAL_SLOTS
+        names += [f"S{g}_{slot}" for g in range(_mi.K_MAX) for slot in _enc.SPATIAL_SLOTS] + ["CTX"]
     if getattr(model, "glow_temporal_encoder", None) is not None:
         names += TEMPORAL_SLOTS
     return names
 
 
 def collapse_stats(tokens: np.ndarray) -> dict:
-    """tokens [M, D] (one slot, M distinct modules) -> cosine / spread / closest-pair stats."""
+    """tokens [M, D] (one slot, M distinct modules; zero rows = the slot is padding for that
+    module, left out) -> cosine / spread / closest-pair stats."""
+    tokens = tokens[np.linalg.norm(tokens, axis=-1) > 0]
+    if len(tokens) < 2:
+        return {
+            "modules": len(tokens),
+            "mean_cos": float("nan"),
+            "min_1_minus_cos": float("nan"),
+            "spread": float("nan"),
+        }
     t = tokens / np.linalg.norm(tokens, axis=-1, keepdims=True).clip(min=1e-12)
     cos = t @ t.T
     off = ~np.eye(len(t), dtype=bool)
@@ -274,26 +287,37 @@ def capture_attention(recorder: AttentionRecorder):
         mg.eager_attention_forward = original
 
 
-def head_words(task, stage_index: int, slots: list[str]) -> list[str | None]:
-    """One real word per module slot, for the head-token variants: the subgoal's verb (OP), the
-    head nouns of the object (OBJ) and target (TGT, None without one), the predicate (CTX), and
-    the stage count (T_SUMMARY) and ordinal (T_ACTIVE) as words."""
-    stage = task.stages[stage_index]
+def head_words(task, stage_index: int, slots: list[str], order=None) -> list[str | None]:
+    """One real word per module slot, for the head-token variants. Spatial group g shows stage
+    order[g] (default: execution order; None past the task's stages): its predicate (ATOM), the
+    subgoal's verb (OP), the head nouns of the object (OBJ) and target (TGT, None without one);
+    the active stage's predicate (CTX); the stage count (T_SUMMARY) and the active stage's
+    ordinal (T_ACTIVE) as words."""
+    order = list(range(task.num_plans)) if order is None else [int(o) for o in order]
 
     def head(noun: str) -> str | None:
         words = re.sub(r"\(.*?\)", " ", noun).replace("_", " ").split()
         return words[-1].lower() if words else None
 
-    verb = stage.subgoal_operation.split()
+    def group(stage):
+        verb = stage.subgoal_operation.split()
+        return {
+            "ATOM": PREDICATE_WORDS.get(stage.predicate),
+            "OP": verb[0].lower() if verb else None,
+            "OBJ": head(stage.object_noun),
+            "TGT": head(stage.target_noun),
+        }
+
+    active = task.stages[stage_index]
     words = {
-        "OP": verb[0].lower() if verb else None,
-        "OBJ": head(stage.object_noun),
-        "TGT": head(stage.target_noun),
-        "CTX": PREDICATE_WORDS.get(stage.predicate),
+        "CTX": PREDICATE_WORDS.get(active.predicate),
         "T_SUMMARY": COUNT_WORDS[task.num_plans - 1],
         "T_ACTIVE": ORDINAL_WORDS[stage_index],
     }
-    return [words[slot] for slot in slots]
+    for g, j in enumerate(order):
+        if j < task.num_plans:
+            words |= {f"S{g}_{slot}": word for slot, word in group(task.stages[j]).items()}
+    return [words.get(slot) for slot in slots]
 
 
 def stage_prompts(task, stage_index: int) -> dict[str, str]:
@@ -355,7 +379,9 @@ def word_rms(embed, tokens, mask, scale: float, device):
     return (rms * w).sum(1) / w.sum(1).clamp(min=1)
 
 
-def make_prefix(model, recorder, *, tokens=None, where="pre_bos", scale="language", target_rms=None, own=0):
+def make_prefix(
+    model, recorder, *, tokens=None, token_mask=None, where="pre_bos", scale="language", target_rms=None, own=0
+):
     """An embed_observation_prefix for one variant, which hands its position groups to
     `recorder` and leaves the per-group embedding RMS on the function (`.rms`).
 
@@ -363,7 +389,9 @@ def make_prefix(model, recorder, *, tokens=None, where="pre_bos", scale="languag
     stock prefix (images + language), with `tokens(observation)` [B, N, D] inserted before BOS
     (`where="pre_bos"`, after the images) or right after it (`"post_bos"`), each token rescaled
     to the language tokens' pooled RMS as the model does (`scale="language"`), to `target_rms`
-    [B] (`"word"`), or left as given (`"raw"`); `tokens=None` inserts nothing.
+    [B] (`"word"`), or left as given (`"raw"`); `tokens=None` inserts nothing. `token_mask`
+    (observation -> [B, N] bool) marks the inserted tokens that are padding, masked out of the
+    prefix as the model masks its own.
     """
     import torch
 
@@ -380,6 +408,11 @@ def make_prefix(model, recorder, *, tokens=None, where="pre_bos", scale="languag
             n_mod = 0
             if tokens is not None:
                 t = tokens(observation).float()
+                real = (
+                    pad_masks.new_ones(t.shape[:2])
+                    if token_mask is None
+                    else token_mask(observation).to(pad_masks.dtype)
+                )
                 if scale != "raw":
                     if scale == "language":
                         lang = embs[:, n_img:].float()
@@ -400,7 +433,7 @@ def make_prefix(model, recorder, *, tokens=None, where="pre_bos", scale="languag
                 n_mod = t.shape[1]
                 b = embs.shape[0]
                 embs = torch.cat([embs[:, :at], t.to(embs.dtype), embs[:, at:]], dim=1)
-                pad_masks = torch.cat([pad_masks[:, :at], pad_masks.new_ones(b, n_mod), pad_masks[:, at:]], dim=1)
+                pad_masks = torch.cat([pad_masks[:, :at], real, pad_masks[:, at:]], dim=1)
                 att_masks = torch.cat([att_masks[:, :at], att_masks.new_zeros(b, n_mod), att_masks[:, at:]], dim=1)
         n_img = embs.shape[1] - n_lang - n_mod
         groups = torch.full(pad_masks.shape, GROUPS.index("language"), dtype=torch.long, device=pad_masks.device)
@@ -608,7 +641,8 @@ def main(args: Args) -> dict:
             head_ids = np.zeros((len(frames), len(slots)), dtype=np.int64)
             head_valid = np.zeros((len(frames), len(slots)), dtype=bool)
             for i, (task, k) in enumerate(stages):
-                for j, word in enumerate(head_words(task, k, slots)):
+                order = module.encode(task.task, k)["glow_ints"][_mi.INT_SPATIAL_SLOT]
+                for j, word in enumerate(head_words(task, k, slots, order)):
                     if word:
                         head_ids[i, j] = module.tokenizer.encode_text(word)[0]
                         head_valid[i, j] = True
@@ -616,6 +650,7 @@ def main(args: Args) -> dict:
             head_valid_t = torch.as_tensor(head_valid, device=device)
             with torch.no_grad():
                 target_rms = word_rms(embed, task_tokens, task_mask, embed_scale, device)
+            token_masks = {"module": model.module_token_mask}
             token_sources = {
                 "module": model.module_tokens,
                 # Real vocabulary embeddings at the scale the prefix gives language tokens.
@@ -640,6 +675,7 @@ def main(args: Args) -> dict:
                     model,
                     recorders[name],
                     tokens=token_sources[source],
+                    token_mask=token_masks.get(source),
                     where=where,
                     scale=scale,
                     target_rms=target_rms,

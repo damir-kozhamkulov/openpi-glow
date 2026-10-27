@@ -399,9 +399,15 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     # The active plan is the whole prompt (the task string is dropped); plan_delta and
     # plan_corrupt_p do not apply.
     plan_as_prompt: bool = False
-    # The active stage as encoder inputs (GlowModuleInputs); plan_delta and plan_corrupt_p do not
-    # apply.
+    # The whole plan as encoder inputs (GlowModuleInputs); plan_delta and plan_corrupt_p do not
+    # apply. module_stage_order orders the Spatial groups ("sorted" by runtime key: a set, the
+    # execution order in the Temporal arrays alone; or "execution"). module_chain_p > 0 chains a
+    # training sample of a one-stage task in module_chain_tasks (task indices) with another such
+    # task, in random order, with that probability.
     module_inputs: bool = False
+    module_stage_order: str = "sorted"
+    module_chain_p: float = 0.0
+    module_chain_tasks: tuple[int, ...] = ()
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -450,7 +456,15 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                 if model_config.module_distill_weight > 0
                 else None
             )
-            plan = [_module_inputs.GlowModuleInputs(pack, stock[i].tokenizer, teacher), stock[i]]
+            module = _module_inputs.GlowModuleInputs(
+                pack,
+                stock[i].tokenizer,
+                teacher,
+                stage_order=self.module_stage_order,
+                chain_p=self.module_chain_p,
+                chain_tasks=self.module_chain_tasks,
+            )
+            plan = [module, stock[i]]
             model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
             return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
         if self.plan_as_prompt:
@@ -677,10 +691,12 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-def _glow_module_train_config(name: str, **module) -> "TrainConfig":
+def _glow_module_train_config(name: str, data: dict | None = None, **module) -> "TrainConfig":
     """A GLOW module row: GlowModulePi0Config (switches in `module`) reading the LIBERO-10 + Goal
-    pack's active stage, with pi05_libero_plan_prompt's data and recipe. The prompt is empty, so
-    max_token_len is cut to 8 (BOS and the newline answer token are the only language tokens)."""
+    pack's plans, with pi05_libero_plan_prompt's data and recipe; `data` overrides fields of the
+    LeRobotLiberoGlowDataConfig (the chain augmentation, the Spatial stage order). The prompt is
+    empty, so max_token_len is cut to 8 (BOS and the newline answer token are the only language
+    tokens)."""
     return TrainConfig(
         name=name,
         model=glow_model_config.GlowModulePi0Config(
@@ -693,6 +709,7 @@ def _glow_module_train_config(name: str, **module) -> "TrainConfig":
             plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
             module_inputs=True,
             train_episodes="0:807",
+            **(data or {}),
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1086,6 +1103,23 @@ _CONFIGS = [
         module_distill_weight=1.0,
     ),
     _glow_module_train_config("pi05_libero_glow_st_anchor", module_text_anchor=True, module_token_scale="words"),
+    # Chain rows: _st_anchor's model and recipe, training samples of the LIBERO-Goal tasks
+    # (task indices 10-19, one scene) chained in pairs in random order half of the time, so the
+    # Temporal pointer is the only input that says which stage is active. _chain shows the Spatial
+    # groups sorted by runtime key (the execution order lives in the Temporal arrays alone);
+    # _chain_exec shows them in execution order.
+    _glow_module_train_config(
+        "pi05_libero_glow_chain",
+        data={"module_chain_p": 0.5, "module_chain_tasks": tuple(range(10, 20))},
+        module_text_anchor=True,
+        module_token_scale="words",
+    ),
+    _glow_module_train_config(
+        "pi05_libero_glow_chain_exec",
+        data={"module_chain_p": 0.5, "module_chain_tasks": tuple(range(10, 20)), "module_stage_order": "execution"},
+        module_text_anchor=True,
+        module_token_scale="words",
+    ),
     #
     # Fine-tuning Aloha configs.
     #
