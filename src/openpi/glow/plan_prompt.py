@@ -85,6 +85,7 @@ class GlowPlanState(DataTransformFn):
         prompt = _scalar(prompt)
         plan_task = data.pop("plan_task", None)
         plan_prompt = prompt if plan_task is None or not _scalar(plan_task) else _scalar(plan_task)
+        data.pop("plan_stage_frames", None)  # the stage clock: only the module encoders read it
 
         if "episode_index" in data and "frame_index" in data:
             if plan_prompt != prompt:
@@ -138,7 +139,9 @@ class GlowPlanAsPrompt(DataTransformFn):
     plan at the frame. Inference samples must carry `oracle_plan_index` - the stage the client's
     tracker reports, or a forced stage - because this model has no planner to choose one; an
     optional `plan_task` renders that task's plan instead of the prompt's (steering, index clamped
-    to its stages). `prev_plan_index`, sent by every GLOW client, is accepted and ignored.
+    to its stages), and an optional `plan_chain` (pack task strings) runs those tasks' stages as
+    one plan, the index counting over the chain - the text a chain task of the pack with the same
+    stages renders. `prev_plan_index`, sent by every GLOW client, is accepted and ignored.
     """
 
     pack: _plan_pack.PlanPack
@@ -151,11 +154,14 @@ class GlowPlanAsPrompt(DataTransformFn):
         prompt = _scalar(prompt)
         plan_task = data.pop("plan_task", None)
         plan_prompt = prompt if plan_task is None or not _scalar(plan_task) else _scalar(plan_task)
+        plan_chain = data.pop("plan_chain", None)
+        plan_chain = None if plan_chain is None or len(plan_chain) == 0 else [_scalar(t) for t in plan_chain]
         data.pop("prev_plan_index", None)
+        data.pop("plan_stage_frames", None)  # the stage clock: only the module encoders read it
 
         if "episode_index" in data and "frame_index" in data:
-            if plan_prompt != prompt:
-                raise ValueError("GlowPlanAsPrompt: plan_task is an inference-time steering input")
+            if plan_prompt != prompt or plan_chain is not None:
+                raise ValueError("GlowPlanAsPrompt: plan_task and plan_chain are inference-time steering inputs")
             task = self.pack.task(prompt)
             episode_index = int(_scalar(data.pop("episode_index")))
             frame_index = int(_scalar(data.pop("frame_index")))
@@ -167,6 +173,12 @@ class GlowPlanAsPrompt(DataTransformFn):
             plan_index = self.pack.plan_index(episode_index, frame_index)
         elif (oracle := data.pop("oracle_plan_index", None)) is not None:
             plan_index = int(_scalar(oracle))
+            if plan_chain is not None:
+                if plan_prompt != prompt:
+                    raise ValueError("GlowPlanAsPrompt: plan_task and plan_chain exclude each other")
+                stages = tuple(s for t in plan_chain for s in self.pack.task(t).stages)
+                data["prompt"] = _plan_pack.render_stages(stages, plan_index, nouns=self.nouns, anchors=self.anchors)
+                return data
             if plan_prompt != prompt:
                 plan_index = min(plan_index, self.pack.task(plan_prompt).num_plans - 1)
         else:

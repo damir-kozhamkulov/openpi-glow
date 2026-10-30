@@ -624,6 +624,9 @@ def test_plan_as_prompt(goal_pack, tasks, chain, first_ep):
     # Inference: the client's stage (tracker or forced); prev_plan_index is dropped.
     out = t({"prompt": tasks[0], "prev_plan_index": 0, "oracle_plan_index": np.int64(1)})
     assert out["prompt"] == goal_pack.render_plan(tasks[0], 1) and "prev_plan_index" not in out
+    # The stage clock the client sends is for the module encoders: dropped here.
+    clocked = t({"prompt": tasks[0], "oracle_plan_index": np.int64(1), "plan_stage_frames": np.int64(9)})
+    assert clocked == {"prompt": out["prompt"]}
     # Steering: another task's plan, the stage clamped to its stages.
     out = t({"prompt": tasks[10], "plan_task": tasks[17], "prev_plan_index": 0, "oracle_plan_index": 0})
     assert out["prompt"] == goal_pack.render_plan(tasks[17], 0)
@@ -636,6 +639,81 @@ def test_plan_as_prompt(goal_pack, tasks, chain, first_ep):
         t({**_train_sample(tasks[10], goal_ep, 5), "plan_task": tasks[17]})
     with pytest.raises(IndexError):  # without steering a past-the-end stage is a client bug
         t({"prompt": tasks[10], "oracle_plan_index": 1})
+
+
+@needs_goal_pack
+def test_plan_as_prompt_chain(goal_pack, tasks, chain, first_ep, tmp_path):
+    """plan_chain renders the stage of the chain the index names, exactly as the chain task the
+    chain-dataset builder adds to the pack (the two stages copied, K = 2) renders it."""
+    t = _plan_prompt.GlowPlanAsPrompt(goal_pack)
+    a, b = tasks[17], tasks[16]
+    raw = json.loads(GOAL_PACK.read_text(encoding="utf-8"))
+    chain_task = f"{a} then {b}"
+    raw["tasks"][chain_task] = {
+        "K": 2,
+        "stages": [dict(raw["tasks"][name]["stages"][0], plan_index=j) for j, name in enumerate((a, b))],
+        "task_index": max(int(e["task_index"]) for e in raw["tasks"].values()) + 1,
+    }
+    (tmp_path / "pack.json").write_text(json.dumps(raw), encoding="utf-8")
+    chain_pack = _plan_pack.PlanPack.load(tmp_path / "pack.json")
+    for k in (0, 1):
+        out = t({"prompt": a, "prev_plan_index": 0, "oracle_plan_index": np.int64(k), "plan_chain": [a, b]})
+        assert out["prompt"] == chain_pack.render_plan(chain_task, k) and "plan_chain" not in out
+        assert out["prompt"].startswith(f"Stage {k + 1} of 2 ")
+    # The order is the chain's, not the prompt's: the reversed chain puts b first.
+    out = t({"prompt": a, "oracle_plan_index": 0, "plan_chain": [b, a]})
+    assert out["prompt"] == goal_pack.render_plan(b, 0).replace("Stage 1 of 1 ", "Stage 1 of 2 ")
+    # An empty chain is no chain; a chain excludes plan_task and training samples; past the end raises.
+    assert t({"prompt": a, "oracle_plan_index": 0, "plan_chain": []})["prompt"] == goal_pack.render_plan(a, 0)
+    with pytest.raises(ValueError, match="exclude"):
+        t({"prompt": a, "oracle_plan_index": 0, "plan_chain": [a, b], "plan_task": b})
+    ep0 = first_ep[0]
+    with pytest.raises(ValueError, match="steering"):
+        t({**_train_sample(tasks[0], ep0, 0), "plan_chain": [a, b]})
+    with pytest.raises(IndexError):
+        t({"prompt": a, "oracle_plan_index": 2, "plan_chain": [a, b]})
+
+
+@needs_goal_pack
+def test_plan_as_prompt_chain_through_policy_inputs(monkeypatch, goal_pack, tasks):
+    """A chain request as examples/libero sends it, over msgpack, through the served
+    pi05_libero_plan_prompt input transforms (LiberoInputs first): the tokenized prompt is the
+    chain's active stage."""
+    import openpi.training.config as _config
+    from openpi.policies import libero_policy
+    from openpi_client import msgpack_numpy
+
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+    cfg = _config.get_config("pi05_libero_plan_prompt")
+    dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
+    assert isinstance(dc.data_transforms.inputs[0], libero_policy.LiberoInputs)
+    served = _transforms.compose(
+        [
+            *dc.data_transforms.inputs,
+            _transforms.Normalize(None, use_quantiles=dc.use_quantile_norm),
+            *dc.model_transforms.inputs,
+        ]
+    )
+    plan = next(t for t in dc.model_transforms.inputs if isinstance(t, _plan_prompt.GlowPlanAsPrompt))
+    tokenize = next(t for t in dc.model_transforms.inputs if isinstance(t, _transforms.TokenizePrompt))
+    a, b = tasks[17], tasks[16]
+    for chain, k in (([a, b], 0), ([a, b], 1), ([b, a], 1)):
+        element = {
+            "observation/image": np.zeros((224, 224, 3), np.uint8),
+            "observation/wrist_image": np.zeros((224, 224, 3), np.uint8),
+            "observation/state": np.zeros(8),
+            "prompt": a,
+            "prev_plan_index": 0,
+            "oracle_plan_index": k,
+            "plan_chain": list(chain),
+        }
+        out = served(msgpack_numpy.unpackb(msgpack_numpy.packb(element)))
+        stages = tuple(goal_pack.task(t).stages[0] for t in chain)
+        text = _plan_pack.render_stages(stages, k, nouns=plan.nouns, anchors=plan.anchors)
+        assert text.startswith(f"Stage {k + 1} of 2 ")
+        expected = tokenize({"prompt": text, "state": element["observation/state"]})["tokenized_prompt"]
+        np.testing.assert_array_equal(out["tokenized_prompt"], expected)
+        assert "plan_chain" not in out
 
 
 def test_plan_prompt_config(monkeypatch):

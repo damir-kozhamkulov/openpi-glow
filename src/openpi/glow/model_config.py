@@ -37,17 +37,25 @@ class GlowPi0Config(pi0_config.Pi0Config):
 @dataclasses.dataclass(frozen=True)
 class GlowModulePi0Config(pi0_config.Pi0Config):
     # Which encoders feed the prefix (at least one), and the Spatial encoder's inputs: the anchors
-    # (grounding) and the subgoal_operation text.
+    # (grounding), the subgoal_operation text, the object / target nouns and the atom text.
     module_spatial: bool = True
     module_temporal: bool = True
     module_grounding: bool = True
     module_subgoal_text: bool = True
+    module_nouns: bool = True
+    module_atom: bool = True
+    # The Temporal active slot reads the frames since its stage began (the data config's
+    # module_stage_clock must match: inference then needs the client's plan_stage_frames).
+    module_stage_clock: bool = False
     # Encoder width and transformer depth.
     module_width: int = 512
     module_depth: int = 2
     # Each encoder token = its slot's pooled text embedding + a residual whose last layer starts at
     # zero (module_encoders), so a fresh encoder emits language-like tokens, not random ones.
     module_text_anchor: bool = False
+    # The anchor of each token: "mean" = its text's mean-pooled token embedding, "head" = one head
+    # word's embedding (module_inputs.head_words).
+    module_anchor: str = "mean"
     # The size each encoder token enters the prefix at: "language" = the RMS of the sample's
     # language tokens (with the task string dropped, only BOS and the newline answer token);
     # "words" = the mean RMS of the sample's own module-text tokens as the prefix embeds them.

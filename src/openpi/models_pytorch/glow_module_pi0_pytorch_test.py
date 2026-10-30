@@ -49,6 +49,7 @@ def _module_arrays(seed, bsize=B, num_stages=K):
         np.arange(_mi.K_MAX) < num_stages, g.integers(1, len(_mi.PREDICATES) + 1, (bsize, _mi.K_MAX)), 0
     )
     ints[:, _mi.INT_SPATIAL_SLOT] = [*range(num_stages - 1, -1, -1), *range(num_stages, _mi.K_MAX)]
+    ints[:, _mi.INT_SHOWN] = num_stages
     floats = np.zeros((bsize, _mi.FLOATS_LEN), dtype=np.float32)
     for j in range(num_stages):
         obj, obj_valid, tgt, tgt_valid = _mi.float_slices(j)
@@ -430,3 +431,101 @@ def test_word_token_scale():
     torch.testing.assert_close(embs[:, num_img + n :], ref[:, num_img + n :])
     with pytest.raises(ValueError, match="module_token_scale"):
         _model_with(module_token_scale="huge")
+
+
+def _with_heads(arrays, seed=3):
+    """`arrays` plus head-word ids: a random id per field of every stage in the plan, the
+    ordinal and count words on every stage."""
+    g = np.random.default_rng(seed)
+    out = {k: v.copy() for k, v in arrays.items()}
+    ints = out["glow_ints"]
+    for j in range(_mi.K_MAX):
+        for field in _mi.HEAD_FIELDS:
+            fill = j < K or field in ("ordinal", "count")
+            ints[:, _mi.head_index(j, field)] = g.integers(3, 1000, ints.shape[0]) if fill else 0
+    return out
+
+
+def test_head_anchor_init_emits_the_head_words():
+    m = _model_with(module_text_anchor=True, module_anchor="head")
+    arrays = _with_heads(_module_arrays(0))
+    tokens = m.module_tokens(_obs(0, arrays))
+    ints = torch.as_tensor(arrays["glow_ints"])
+    embed = m.paligemma_with_expert.embed_language_tokens
+
+    def head(j, field):
+        return embed(ints[:, _mi.head_index(j, field)]).to(torch.float32)
+
+    stage = ints[:, _mi.INT_STAGE]
+    order = arrays["glow_ints"][0, _mi.INT_SPATIAL_SLOT].tolist()
+    rows = torch.arange(B)
+    expected = [head(j, _enc.SLOT_HEAD[slot]) for j in order[:K] for slot in _enc.SPATIAL_SLOTS]
+    expected += [torch.zeros(B, WIDTH)] * ((_mi.K_MAX - K) * len(_enc.SPATIAL_SLOTS))
+    expected += [
+        torch.stack([head(j, "atom") for j in range(K)], dim=1)[rows, stage],  # CTX: the active predicate
+        head(K - 1, "count"),  # T_SUMMARY
+        torch.stack([head(j, "ordinal") for j in range(K)], dim=1)[rows, stage],  # T_ACTIVE
+    ]
+    torch.testing.assert_close(tokens, torch.stack(expected, dim=1), rtol=1e-5, atol=1e-6)
+
+
+def test_remaining_layout_masks_the_done_stages():
+    m = _model_with(module_text_anchor=True)
+    arrays = _module_arrays(0)
+    arrays["glow_ints"][:, _mi.INT_STAGE] = 1
+    arrays["glow_ints"][:, _mi.INT_SPATIAL_SLOT] = [1, 0, 2, 3]
+    arrays["glow_ints"][:, _mi.INT_SHOWN] = 1
+    obs = _obs(0, arrays)
+    shown = [True] * len(_enc.SPATIAL_SLOTS) + [False] * ((_mi.K_MAX - 1) * len(_enc.SPATIAL_SLOTS))
+    valid = torch.tensor(shown + [True] + [True] * _enc.TEMPORAL_TOKENS)
+    assert torch.equal(m.module_token_mask(obs), valid[None].expand(B, -1))
+    tokens = m.module_tokens(obs)
+    assert not tokens[:, ~valid].any()
+    # Group 0 is stage 1, and the CTX anchor pools only the shown stage's text.
+    fields = ("subgoal", "object", "target", "atom")
+    expected = [_pooled(m, arrays, [f"{f}1"]) for f in fields]
+    torch.testing.assert_close(tokens[:, : len(fields)], torch.stack(expected, dim=1), rtol=1e-5, atol=1e-6)
+    ctx = _mi.K_MAX * len(_enc.SPATIAL_SLOTS)
+    torch.testing.assert_close(tokens[:, ctx], _pooled(m, arrays, [f"{f}1" for f in fields]), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("anchor", ["mean", "head"])
+def test_text_switches_zero_their_slots(anchor):
+    arrays = _with_heads(_module_arrays(0))
+    obs = _obs(0, arrays)
+    off = _model_with(module_text_anchor=True, module_anchor=anchor, module_nouns=False, module_atom=False)
+    on = _model_with(module_text_anchor=True, module_anchor=anchor)
+    tokens, full = off.module_tokens(obs), on.module_tokens(obs)
+    for slot in ("OBJ", "TGT", "ATOM"):
+        index = [g * len(_enc.SPATIAL_SLOTS) + _enc.SPATIAL_SLOTS.index(slot) for g in range(K)]
+        assert not tokens[:, index].any() and full[:, index].abs().sum() > 0, slot
+    op = [g * len(_enc.SPATIAL_SLOTS) for g in range(K)]
+    torch.testing.assert_close(tokens[:, op], full[:, op])
+    # Unanchored, the switched-off texts do not reach the encoder: changing them changes nothing.
+    plain = _model_with(module_nouns=False, module_atom=False)
+    edited = {k: v.copy() for k, v in arrays.items()}
+    for j in range(K):
+        for field in ("object", "target", "atom"):
+            start, stop = _mi.TEXT_SEGMENTS[f"{field}{j}"]
+            edited["glow_text"][:, start:stop] = np.where(edited["glow_text_mask"][:, start:stop], 7, 0)
+    torch.testing.assert_close(plain.module_tokens(_obs(0, edited)), plain.module_tokens(obs))
+
+
+def test_stage_clock_reaches_the_temporal_tokens():
+    assert _enc.clock_bucket(torch.tensor([-1, 0, 1, 3, 4, 20, 31, 32, 500])).tolist() == [0, 1, 2, 2, 3, 5, 5, 6, 8]
+    m = _model_with(module_stage_clock=True)
+    assert _model_with().glow_temporal_encoder.clock is None
+
+    def temporal(frames):
+        arrays = _module_arrays(0)
+        arrays["glow_ints"][:, _mi.INT_STAGE_FRAMES] = frames
+        return m.module_tokens(_obs(0, arrays))[:, -_enc.TEMPORAL_TOKENS :]
+
+    torch.testing.assert_close(temporal(20), temporal(31))  # one bucket
+    assert not torch.allclose(temporal(20), temporal(32))
+    assert not torch.allclose(temporal(-1), temporal(0))
+    # The Spatial tokens never read the clock.
+    a, b = _module_arrays(0), _module_arrays(0)
+    b["glow_ints"][:, _mi.INT_STAGE_FRAMES] = 77
+    spatial = slice(0, _enc.SPATIAL_TOKENS)
+    torch.testing.assert_close(m.module_tokens(_obs(0, a))[:, spatial], m.module_tokens(_obs(0, b))[:, spatial])

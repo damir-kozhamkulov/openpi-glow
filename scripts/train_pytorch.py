@@ -347,6 +347,22 @@ def freeze_pretrained(model: torch.nn.Module) -> int:
     return frozen
 
 
+VLM_PREFIX = "paligemma_with_expert.paligemma."
+
+
+def freeze_vlm(model: torch.nn.Module) -> int:
+    """Stop gradients to the vision-language model's parameters (call before wrapping the model);
+    returns how many parameters that freezes."""
+    frozen = 0
+    for name, param in model.named_parameters():
+        if name.removeprefix("module.").startswith(VLM_PREFIX):
+            param.requires_grad_(False)
+            frozen += param.numel()
+    if frozen == 0:
+        raise ValueError(f"freeze_vlm: the model has no parameters under {VLM_PREFIX!r}")
+    return frozen
+
+
 def optimizer_param_groups(model: torch.nn.Module, lr_scale: float) -> list[dict]:
     """One group for the pretrained parameters and, when the model adds any, one for the new
     ones; each group's `lr_scale` multiplies the schedule's learning rate. Frozen parameters are
@@ -646,7 +662,11 @@ def train_loop(config: _config.TrainConfig):
         else openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
     ).to(device)
     if getattr(model_cfg, "freeze_pretrained", False):
+        if config.freeze_vlm:
+            raise ValueError("freeze_vlm and the model's freeze_pretrained exclude each other")
         logging.info(f"Frozen: {freeze_pretrained(model):,} pretrained parameters (only the new ones train)")
+    elif config.freeze_vlm:
+        logging.info(f"Frozen VLM: {freeze_vlm(model):,} parameters (the action expert and new parameters train)")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True

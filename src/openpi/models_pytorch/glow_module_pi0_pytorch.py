@@ -7,8 +7,9 @@ images and the language, all bidirectional as in the stock prefix:
 
 The action expert attends to the whole prefix, as stock; nothing else changes, so training and
 inference are the stock forward and sample_actions with this prefix (`embed_observation_prefix`).
-The Spatial groups of stages past the plan's K are padding: masked out like padded language
-tokens (`module_token_mask`), so they take no attention and no position. Each encoder token is
+The Spatial groups past the shown ones (the plan's K stages, or its remaining ones) are padding:
+masked out like padded language tokens (`module_token_mask`), so they take no attention and no
+position. Each encoder token is
 rescaled to a target RMS (`config.module_token_scale`): the RMS of the
 sample's language-token embeddings ("language"; with the task string dropped these are BOS and the
 newline answer token), or the mean RMS of the sample's own module-text tokens as the prefix embeds
@@ -59,14 +60,23 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
                 config.module_depth,
                 grounding=config.module_grounding,
                 subgoal_text=config.module_subgoal_text,
+                nouns=config.module_nouns,
+                atom=config.module_atom,
                 text_anchor=config.module_text_anchor,
+                anchor=config.module_anchor,
             )
             if config.module_spatial
             else None
         )
         self.glow_temporal_encoder = (
             _enc.TemporalEncoder(
-                width, width, config.module_width, config.module_depth, text_anchor=config.module_text_anchor
+                width,
+                width,
+                config.module_width,
+                config.module_depth,
+                text_anchor=config.module_text_anchor,
+                anchor=config.module_anchor,
+                stage_clock=config.module_stage_clock,
             )
             if config.module_temporal
             else None
@@ -90,8 +100,8 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         return torch.cat(tokens, dim=1)
 
     def module_token_mask(self, observation) -> torch.Tensor:
-        """[B, N] which of `module_tokens` are real: the Spatial groups of stages past the plan's K
-        are padding; the Spatial summary and the Temporal tokens always count."""
+        """[B, N] which of `module_tokens` are real: the Spatial groups past the shown ones are
+        padding; the Spatial summary and the Temporal tokens always count."""
         ints = observation.glow_ints
         if ints is None:
             raise ValueError("GlowModulePI0Pytorch: the observation has no planning-module arrays")

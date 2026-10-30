@@ -17,6 +17,8 @@ next query's previous plan. Modes:
           (`StageAtoms`) is sent as `oracle_plan_index`: order 0,1 is a simulator oracle, 1,0
           asks for the stages the other way round (do actions follow the stage when the scene
           does not settle it?)
+Every mode but self also sends the stage clock, `plan_stage_frames`: the frames since the stage
+it sends last changed (or since the episode began), as training reads it from the labels.
 The tracker runs in every mode, so the model's plan can be compared against it. When the plans
 come from another task than the environment's (steering), `tracker_plans` is the environment
 task's stage count and `num_plans` the plan task's.
@@ -213,6 +215,8 @@ class PlanEcho:
         self.switches = []  # (frame, from, to) of the plan the queries settled on
         self.regressions = 0  # switches to an earlier stage
         self._sent = None
+        self._clock_stage = None  # the stage the clock counts, and the frame it was first sent
+        self._clock_start = 0
 
     def request(self):
         """Keys to add to the next observation sent to the server."""
@@ -223,6 +227,11 @@ class PlanEcho:
             req["oracle_plan_index"] = self.forced_index
         elif self.mode == "atoms":
             req["oracle_plan_index"] = self.atoms.stage(self.order)
+        if "oracle_plan_index" in req:
+            if req["oracle_plan_index"] != self._clock_stage:
+                self._clock_stage = req["oracle_plan_index"]
+                self._clock_start = self.tracker.frame
+            req["plan_stage_frames"] = self.tracker.frame - self._clock_start
         self._sent = req
         return req
 

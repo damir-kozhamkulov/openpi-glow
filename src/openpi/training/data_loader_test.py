@@ -112,3 +112,15 @@ def test_episode_frame_indices():
     table = {"from": torch.tensor([0, 3, 7, 12]), "to": torch.tensor([3, 7, 12, 14])}
     assert _data_loader.episode_frame_indices(table, [1, 3]) == [3, 4, 5, 6, 12, 13]
     assert _data_loader.episode_frame_indices(table, []) == []
+
+
+def test_decision_rows():
+    import torch
+
+    table = {"from": torch.tensor([0, 3, 7, 12]), "to": torch.tensor([3, 7, 12, 14])}
+    # Episode 1 (rows 3-6) has stages starting at frames 0 and 2; episode 3 (rows 12-13) is not
+    # listed, so its rows appear once.
+    rows = _data_loader.decision_rows(table, [1, 3], {1: (0, 2)}, window=1, repeat=3)
+    assert rows == [3, 3, 3, 4, 5, 5, 5, 6, 12, 13]
+    assert _data_loader.decision_rows(table, [1], {1: (0, 2)}, window=10, repeat=2) == [3, 3, 4, 4, 5, 5, 6, 6]
+    assert _data_loader.decision_rows(table, [1, 3], {1: (0,)}, window=0, repeat=4) == [3, 4, 5, 6, 12, 13]

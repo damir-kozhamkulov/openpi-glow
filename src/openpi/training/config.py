@@ -98,6 +98,13 @@ class DataConfig:
     # list); the environment variable overrides it. None: the whole dataset.
     train_episodes: str | None = None
 
+    # Decision-frame oversampling: a training row within `decision_window` frames after one of
+    # its episode's stage starts appears `decision_repeat` times per epoch. Stage starts per
+    # episode as ((episode, (start, ...)), ...); episodes not listed are not oversampled.
+    decision_window: int = 0
+    decision_repeat: int = 1
+    episode_stage_starts: tuple[tuple[int, tuple[int, ...]], ...] = dataclasses.field(default=(), repr=False)
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -408,6 +415,14 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     module_stage_order: str = "sorted"
     module_chain_p: float = 0.0
     module_chain_tasks: tuple[int, ...] = ()
+    # The stage clock (must match the model's module_stage_clock), and training samples' own
+    # per-episode anchors (GlowModuleInputs.episode_grounding).
+    module_stage_clock: bool = False
+    module_episode_grounding: bool = False
+    # Decision-frame oversampling (DataConfig.decision_window / decision_repeat) over the pack's
+    # stage starts: the frames where the next stage's goal decides what the robot does next.
+    decision_window: int = 0
+    decision_repeat: int = 1
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -424,6 +439,12 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
         if model_config.model_type != ModelType.PI05:
             raise ValueError("GLOW is defined for the pi05 model type")
         assert isinstance(model_config, pi0_config.Pi0Config)
+        if self.module_stage_clock != bool(getattr(model_config, "module_stage_clock", False)):
+            raise ValueError("LeRobotLiberoGlowDataConfig.module_stage_clock must match the model's module_stage_clock")
+        if (self.module_stage_clock or self.module_episode_grounding) and not self.module_inputs:
+            raise ValueError("module_stage_clock and module_episode_grounding need module_inputs")
+        if self.decision_repeat < 1 or self.decision_window < 0:
+            raise ValueError("decision_repeat must be >= 1 and decision_window >= 0")
         base = super().create(assets_dirs, model_config)
 
         repack_transform = _transforms.Group(
@@ -442,6 +463,13 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
             ]
         )
         pack = _plan_pack.PlanPack.load(self.plan_pack_path)
+        if self.decision_repeat > 1:
+            base = dataclasses.replace(
+                base,
+                decision_window=self.decision_window,
+                decision_repeat=self.decision_repeat,
+                episode_stage_starts=tuple(sorted((ep, e.stage_starts) for ep, e in pack.episodes.items())),
+            )
         # Splice the two GLOW transforms into the stock pi05 list the parent already built - the
         # prompt rewrite immediately before the tokenizer, the plan block immediately after - and
         # reuse that tokenizer, so the SentencePiece model is loaded once.
@@ -461,6 +489,8 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                 stock[i].tokenizer,
                 teacher,
                 stage_order=self.module_stage_order,
+                stage_clock=self.module_stage_clock,
+                episode_grounding=self.module_episode_grounding,
                 chain_p=self.module_chain_p,
                 chain_tasks=self.module_chain_tasks,
             )
@@ -616,6 +646,10 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+    # PyTorch only: freeze the vision-language model (PaliGemma: vision tower and language model),
+    # so the action expert, its projections and any new parameters (GLOW's encoders) train. The
+    # gradients still flow through the frozen VLM to inputs that need them.
+    freeze_vlm: bool = False
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -689,6 +723,37 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _glow_plan_prompt_train_config(name: str, **data) -> "TrainConfig":
+    """The plan-as-prompt row (pi05 reading the active stage's rendered plan instead of the task
+    string) on the LIBERO-10 + Goal pack; `data` overrides fields of its
+    LeRobotLiberoGlowDataConfig."""
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoGlowDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
+            plan_as_prompt=True,
+            train_episodes="0:807",
+            **data,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=6.25e-6,
+            decay_steps=5_000,
+            decay_lr=6.25e-7,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=5_000,
+    )
 
 
 def _glow_module_train_config(name: str, data: dict | None = None, **module) -> "TrainConfig":
@@ -1027,30 +1092,7 @@ _CONFIGS = [
     # (the task string is dropped), on LIBERO-10 + LIBERO-Goal with pi05_libero_10_goal's recipe.
     # Plans are the labels at training; at evaluation the LIBERO client sends the stage (its
     # tracker's, or a forced one) and optionally another task to steer by.
-    TrainConfig(
-        name="pi05_libero_plan_prompt",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
-        data=LeRobotLiberoGlowDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
-            plan_as_prompt=True,
-            train_episodes="0:807",
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=300,
-            peak_lr=6.25e-6,
-            decay_steps=5_000,
-            decay_lr=6.25e-7,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=5_000,
-    ),
+    _glow_plan_prompt_train_config("pi05_libero_plan_prompt"),
     TrainConfig(
         name="pi05_libero_glow_bottleneck",
         model=glow_model_config.GlowPi0Config(
@@ -1119,6 +1161,54 @@ _CONFIGS = [
         data={"module_chain_p": 0.5, "module_chain_tasks": tuple(range(10, 20)), "module_stage_order": "execution"},
         module_text_anchor=True,
         module_token_scale="words",
+    ),
+    # Frozen-VLM rows (TrainConfig.freeze_vlm: the action expert and the encoders train), which fit
+    # one 48 GB GPU. _st_anchor_fv is _st_anchor so: the parity row against the joint fine-tune.
+    dataclasses.replace(
+        _glow_module_train_config(
+            "pi05_libero_glow_st_anchor_fv", module_text_anchor=True, module_token_scale="words"
+        ),
+        freeze_vlm=True,
+    ),
+    # The v2 inputs: the remaining plan (the active stage's Spatial group first, done stages not
+    # shown), head-word anchors, the Temporal stage clock, training samples' own per-episode
+    # anchors, and decision frames (the first 40 after every stage start) seen 3x per epoch. The
+    # suffixed rows switch Spatial inputs off: the anchors' xyz, the atom text, or every text
+    # (grounding_only: predicates and xyz only).
+    *(
+        dataclasses.replace(
+            _glow_module_train_config(
+                name,
+                data={
+                    "module_stage_order": "remaining",
+                    "module_stage_clock": True,
+                    "module_episode_grounding": True,
+                    "decision_window": 40,
+                    "decision_repeat": 3,
+                },
+                module_text_anchor=True,
+                module_token_scale="words",
+                module_anchor="head",
+                module_stage_clock=True,
+                **switches,
+            ),
+            freeze_vlm=True,
+        )
+        for name, switches in (
+            ("pi05_libero_glow_v2", {}),
+            ("pi05_libero_glow_v2_nogrounding", {"module_grounding": False}),
+            ("pi05_libero_glow_v2_noatom", {"module_atom": False}),
+            (
+                "pi05_libero_glow_v2_grounding_only",
+                {"module_subgoal_text": False, "module_nouns": False, "module_atom": False},
+            ),
+        )
+    ),
+    # The text control for the v2 rows: pi05_libero_plan_prompt with the same frozen VLM and
+    # decision oversampling.
+    dataclasses.replace(
+        _glow_plan_prompt_train_config("pi05_libero_plan_prompt_fv", decision_window=40, decision_repeat=3),
+        freeze_vlm=True,
     ),
     #
     # Fine-tuning Aloha configs.

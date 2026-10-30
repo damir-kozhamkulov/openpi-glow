@@ -167,6 +167,23 @@ def episode_frame_indices(episode_data_index: dict, episodes: list[int]) -> list
     return [i for e in episodes for i in range(int(starts[e]), int(stops[e]))]
 
 
+def decision_rows(
+    episode_data_index: dict, episodes: list[int], stage_starts: dict, window: int, repeat: int
+) -> list[int]:
+    """Dataset rows of `episodes` in order, each row within `window` frames after one of its
+    episode's `stage_starts` listed `repeat` times (episodes without stage starts once each)."""
+    rows = []
+    starts_of, stops_of = episode_data_index["from"], episode_data_index["to"]
+    for e in episodes:
+        start = int(starts_of[e])
+        starts = stage_starts.get(e, ())
+        for i in range(start, int(stops_of[e])):
+            frame = i - start
+            hit = any(s <= frame < s + window for s in starts)
+            rows.extend([i] * (repeat if hit else 1))
+    return rows
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -193,7 +210,21 @@ def create_torch_dataset(
         },
         episodes=prefix,
     )
-    if episodes is not None and episodes != prefix:
+    if data_config.decision_repeat > 1:
+        chosen = list(range(dataset.num_episodes)) if episodes is None else episodes
+        rows = decision_rows(
+            dataset.episode_data_index,
+            chosen,
+            dict(data_config.episode_stage_starts),
+            data_config.decision_window,
+            data_config.decision_repeat,
+        )
+        logging.info(
+            f"Decision oversampling: {len(rows)} rows over {len(chosen)} episodes "
+            f"(x{data_config.decision_repeat} within {data_config.decision_window} frames of a stage start)"
+        )
+        dataset = torch.utils.data.Subset(dataset, rows)
+    elif episodes is not None and episodes != prefix:
         dataset = torch.utils.data.Subset(dataset, episode_frame_indices(dataset.episode_data_index, episodes))
 
     if data_config.prompt_from_task:

@@ -14,11 +14,15 @@ per-sample differences from `correct` measure what the actions read from each en
                        other_task
   wrong_stage          the other stage of the same task active (a one-stage task keeps its stage)
                        - the Temporal pointer is wrong; the Spatial set is the same plan
-  wrong_stage_pointer  the same as wrong_stage (kept under both names: the Spatial arrays hold the
-                       whole plan, so a wrong stage is only a wrong pointer)
+  wrong_stage_pointer  only the pointer of wrong_stage (the same as wrong_stage when the Spatial
+                       groups do not depend on the pointer; with the "remaining" order they do)
   grounding_other      only the anchors (glow_floats) from other_task - the grounding is wrong
-  spatial_blank        atoms, subgoals, nouns, predicates and anchors removed
+  grounding_mean       the per-task anchors instead of the sample's own (its episode's, with
+                       episode_grounding; otherwise identical to correct)
+  spatial_blank        atoms, subgoals, nouns, predicates, head words and anchors removed
   temporal_blank       the runtime keys removed (stage pointer kept)
+  clock_unknown        the stage clock unknown (-1)
+Every variant keeps the sample's stage clock, and wrong_stage its anchors (the same task's).
 
 Chain variants, for samples of a one-stage task that has chain partners (module_inputs
 .chain_partners over the suite's one-stage tasks; the partner is the first in task-index order
@@ -64,8 +68,10 @@ VARIANTS = (
     "wrong_stage",
     "wrong_stage_pointer",
     "grounding_other",
+    "grounding_mean",
     "spatial_blank",
     "temporal_blank",
+    "clock_unknown",
     "chain_correct",
     "chain_second",
     "chain_wrong_pointer",
@@ -126,16 +132,16 @@ def _blank_text(arrays: dict, names) -> None:
 
 def splice(base: dict, donor: dict, part: str) -> dict:
     """`base`'s module arrays with one encoder's inputs taken from `donor`: "spatial" (atoms,
-    subgoals, object and target text, predicates, anchors, slot order) or "temporal" (runtime keys,
-    stage pointer, stage count)."""
+    subgoals, object and target text, predicates, anchors, slot order, shown groups, Spatial head
+    words) or "temporal" (runtime keys, stage pointer, stage count, stage clock)."""
     from openpi.glow import module_inputs as _mi
 
     if part == "spatial":
         segments = _segments(_mi.SPATIAL_FIELDS)
-        ints = (_mi.INT_PREDICATE, _mi.INT_SPATIAL_SLOT)
+        ints = (_mi.INT_PREDICATE, _mi.INT_SPATIAL_SLOT, _mi.INT_SHOWN, *_spatial_heads(range(_mi.K_MAX)))
     elif part == "temporal":
         segments = _segments(_mi.TEMPORAL_FIELDS)
-        ints = (_mi.INT_STAGE, _mi.INT_NUM_STAGES)
+        ints = (_mi.INT_STAGE, _mi.INT_NUM_STAGES, _mi.INT_STAGE_FRAMES)
     else:
         raise ValueError(f"unknown part {part!r}")
     out = _copy(base)
@@ -150,6 +156,13 @@ def splice(base: dict, donor: dict, part: str) -> dict:
     return out
 
 
+def _spatial_heads(stages) -> list[int]:
+    """glow_ints positions of the Spatial head words (verb, nouns, predicate word) of `stages`."""
+    from openpi.glow import module_inputs as _mi
+
+    return [_mi.head_index(j, f) for j in stages for f in ("op", "object", "target", "atom")]
+
+
 def spatial_blank(arrays: dict, stages=None) -> dict:
     """`arrays` with the Spatial text, predicates and anchors of `stages` (default: all) removed."""
     from openpi.glow import module_inputs as _mi
@@ -160,6 +173,7 @@ def spatial_blank(arrays: dict, stages=None) -> dict:
     for j in stages:
         out["glow_ints"][_mi.INT_PREDICATE.start + j] = 0
         out["glow_floats"][j * _mi.STAGE_FLOATS : (j + 1) * _mi.STAGE_FLOATS] = 0.0
+    out["glow_ints"][_spatial_heads(stages)] = 0
     return out
 
 
@@ -205,6 +219,10 @@ def module_variants(module, task_string: str, plan_index: int, correct: dict) ->
     other = other_task(pack, task_string)
     cross = module.encode(other.task, min(plan_index, other.num_plans - 1))
     swapped = module.encode(task_string, (plan_index + 1) % task.num_plans)
+    swapped["glow_floats"] = correct["glow_floats"].copy()
+    clock = int(correct["glow_ints"][_mi.INT_STAGE_FRAMES])
+    unknown = _copy(correct)
+    unknown["glow_ints"][_mi.INT_STAGE_FRAMES] = -1
 
     out = {
         "correct": correct,
@@ -215,8 +233,10 @@ def module_variants(module, task_string: str, plan_index: int, correct: dict) ->
         "wrong_stage": swapped,
         "wrong_stage_pointer": with_pointer(correct, int(swapped["glow_ints"][_mi.INT_STAGE])),
         "grounding_other": {**correct, "glow_floats": cross["glow_floats"]},
+        "grounding_mean": {**correct, "glow_floats": module.encode(task_string, plan_index)["glow_floats"]},
         "spatial_blank": spatial_blank(correct),
         "temporal_blank": temporal_blank(correct),
+        "clock_unknown": unknown,
     }
     partner = chain_partner(pack, task_string) if task.num_plans == 1 else None
     if partner is None:
@@ -230,6 +250,10 @@ def module_variants(module, task_string: str, plan_index: int, correct: dict) ->
             "chain_temporal_blank": temporal_blank(first),
             "chain_partner_blank": spatial_blank(first, stages=[1]),
         }
+    for name, arrays in out.items():
+        if name != "clock_unknown" and arrays is not correct and arrays["glow_ints"][_mi.INT_STAGE_FRAMES] != clock:
+            out[name] = {**arrays, "glow_ints": arrays["glow_ints"].copy()}
+            out[name]["glow_ints"][_mi.INT_STAGE_FRAMES] = clock
     return out
 
 

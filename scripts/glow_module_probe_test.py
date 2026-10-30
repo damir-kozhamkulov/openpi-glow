@@ -246,3 +246,37 @@ def test_main_end_to_end(monkeypatch, tmp_path):
     assert by_stage and sum(b["samples"] for b in by_stage) <= s["vs_correct_multistage"]["samples"]
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert len(payload["per_sample"]["correct"]) == 16
+
+
+def test_v2_variants_keep_the_clock_and_isolate_the_grounding(module):
+    from openpi.glow import module_inputs as _mi
+
+    v2 = dataclasses.replace(module, stage_order="remaining", stage_clock=True, episode_grounding=True)
+    pack = v2.pack
+    ep, plan = next((e, p) for e, p in sorted(pack.episodes.items()) if len(p.stage_starts) == 2 and p.anchors[1][0])
+    task = next(t for t in pack.tasks.values() if t.task_index == plan.task_index)
+    frame = plan.stage_starts[1] + 12
+    sample = v2({"prompt": task.task, "episode_index": np.int64(ep), "frame_index": np.int64(frame)})
+    correct = {key: sample[key] for key in ("glow_text", "glow_text_mask", "glow_ints", "glow_floats")}
+    assert correct["glow_ints"][_mi.INT_STAGE_FRAMES] == 12 and correct["glow_ints"][_mi.INT_SHOWN] == 1
+    v = gmp.module_variants(v2, task.task, 1, correct)
+    assert set(v) == set(gmp.VARIANTS)
+    for name, arrays in v.items():
+        want = -1 if name == "clock_unknown" else 12
+        assert arrays["glow_ints"][_mi.INT_STAGE_FRAMES] == want, name
+    np.testing.assert_array_equal(v["grounding_mean"]["glow_floats"], v2.encode(task.task, 1)["glow_floats"])
+    assert not np.array_equal(v["grounding_mean"]["glow_floats"], correct["glow_floats"])
+    np.testing.assert_array_equal(v["wrong_stage"]["glow_floats"], correct["glow_floats"])
+    # With the remaining order a wrong stage also changes the Spatial view, its pointer alone does not.
+    assert v["wrong_stage"]["glow_ints"][_mi.INT_SHOWN] == 2
+    assert v["wrong_stage_pointer"]["glow_ints"][_mi.INT_SHOWN] == 1
+    # spatial_blank removes the Spatial head words and keeps the Temporal ordinal / count words.
+    sb = v["spatial_blank"]["glow_ints"]
+    for j in range(_mi.K_MAX):
+        assert all(sb[_mi.head_index(j, f)] == 0 for f in ("op", "object", "target", "atom"))
+        assert all(sb[_mi.head_index(j, f)] == correct["glow_ints"][_mi.head_index(j, f)] for f in ("ordinal", "count"))
+    # The Spatial split carries the donor's shown count and head words.
+    s = v["other_task_spatial"]["glow_ints"]
+    donor = v["other_task"]["glow_ints"]
+    assert s[_mi.INT_SHOWN] == donor[_mi.INT_SHOWN] and s[_mi.INT_STAGE] == correct["glow_ints"][_mi.INT_STAGE]
+    assert all(s[_mi.head_index(0, f)] == donor[_mi.head_index(0, f)] for f in ("op", "object", "target", "atom"))

@@ -8,6 +8,7 @@ drift.
 """
 
 import bisect
+from collections.abc import Sequence
 import dataclasses
 import json
 import os
@@ -52,11 +53,18 @@ class TaskPlan:
         return len(self.stages)
 
 
+Anchor = tuple[float, float, float]
+
+
 @dataclasses.dataclass(frozen=True)
 class EpisodePlan:
     task_index: int
     n_frames: int
     stage_starts: tuple[int, ...]
+    # Per stage, this episode's own (object, target) anchors in the pack's normalized coordinates
+    # (the grasp / release positions of this demonstration; None where it has none), or None for
+    # a pack built without them. Training-only: inference has no demonstration to read them from.
+    anchors: tuple[tuple[Anchor | None, Anchor | None], ...] | None = None
 
     def plan_index(self, frame_index: int) -> int:
         if not 0 <= frame_index < self.n_frames:
@@ -70,6 +78,19 @@ def _bins(anchor) -> tuple[int, int, int] | None:
 
 def _xyz(anchor) -> tuple[float, float, float] | None:
     return None if anchor is None else tuple(float(v) for v in anchor["normalized"])
+
+
+def _episode_anchors(entry) -> tuple[tuple[Anchor | None, Anchor | None], ...] | None:
+    raw = entry.get("anchors")
+    if raw is None:
+        return None
+    if len(raw) != len(entry["stage_starts"]):
+        raise ValueError(f"episode anchors for {len(raw)} stages, but {len(entry['stage_starts'])} stage starts")
+
+    def xyz(v):
+        return None if v is None else tuple(float(x) for x in v)
+
+    return tuple((xyz(a["object"]), xyz(a["target"])) for a in raw)
 
 
 class PlanPack:
@@ -117,6 +138,7 @@ class PlanPack:
                 task_index=int(e["task_index"]),
                 n_frames=int(e["n_frames"]),
                 stage_starts=tuple(int(f) for f in e["stage_starts"]),
+                anchors=_episode_anchors(e),
             )
             for ep, e in raw["episodes"].items()
         }
@@ -154,16 +176,22 @@ class PlanPack:
         task = self.task(prompt)
         if not 0 <= plan_index < task.num_plans:
             raise IndexError(f"plan_index {plan_index} outside 0..{task.num_plans - 1} for {prompt!r}")
-        stage = task.stages[plan_index]
-        text = (
-            f"Stage {plan_index + 1} of {task.num_plans} [{stage.runtime_key}]: {stage.subgoal_operation}. {stage.atom}"
-        )
-        for role, noun, bins in (
-            ("object", stage.object_noun, stage.object_bins),
-            ("target", stage.target_noun, stage.target_bins),
-        ):
-            text += _grounding_fragment(role, noun if nouns else "", bins if anchors else None)
-        return text
+        return render_stages(task.stages, plan_index, nouns=nouns, anchors=anchors)
+
+
+def render_stages(stages: Sequence[Stage], plan_index: int, *, nouns: bool = True, anchors: bool = True) -> str:
+    """`PlanPack.render_plan` over any stage sequence, e.g. several tasks' stages run as one plan
+    (a chain): stage `plan_index` of len(stages)."""
+    if not 0 <= plan_index < len(stages):
+        raise IndexError(f"plan_index {plan_index} outside 0..{len(stages) - 1}")
+    stage = stages[plan_index]
+    text = f"Stage {plan_index + 1} of {len(stages)} [{stage.runtime_key}]: {stage.subgoal_operation}. {stage.atom}"
+    for role, noun, bins in (
+        ("object", stage.object_noun, stage.object_bins),
+        ("target", stage.target_noun, stage.target_bins),
+    ):
+        text += _grounding_fragment(role, noun if nouns else "", bins if anchors else None)
+    return text
 
 
 def _grounding_fragment(role: str, noun: str, bins: tuple[int, int, int] | None) -> str:

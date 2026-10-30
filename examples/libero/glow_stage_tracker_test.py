@@ -46,15 +46,32 @@ def test_self_mode_rejects_bad_responses():
 
 def test_oracle_mode_follows_the_tracker():
     echo = gst.PlanEcho("oracle", 2)
-    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0}
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0, "plan_stage_frames": 0}
     echo.update({"plan_choice": 0})  # the server's choice is ignored: the oracle is the plan
     _grasp_and_release(echo, gst.HOLD_MIN)
-    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1}
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1, "plan_stage_frames": 0}
     assert echo.update({"plan_choice": 0}) == 1
-    assert echo.request() == {"prev_plan_index": 1, "oracle_plan_index": 1}
+    assert echo.request() == {"prev_plan_index": 1, "oracle_plan_index": 1, "plan_stage_frames": 0}
     echo.update({})
     assert echo.agreements == echo.queries == 3
     assert echo.switches == [(gst.HOLD_MIN + 1, 0, 1)]
+
+
+def test_stage_clock_counts_frames_since_the_sent_stage_changed():
+    echo = gst.PlanEcho("oracle", 2)
+    assert echo.request()["plan_stage_frames"] == 0
+    echo.update({})
+    for _ in range(7):
+        echo.observe(-1.0)
+    assert echo.request()["plan_stage_frames"] == 7
+    echo.update({})
+    _grasp_and_release(echo, gst.HOLD_MIN)  # the tracker moves to stage 1: the clock restarts
+    req = echo.request()
+    assert req["oracle_plan_index"] == 1 and req["plan_stage_frames"] == 0
+    echo.update({})
+    echo.observe(-1.0)
+    assert echo.request()["plan_stage_frames"] == 1
+    assert "plan_stage_frames" not in gst.PlanEcho("self", 2).request()  # no stage sent, no clock
 
 
 def test_forced_mode():
@@ -63,11 +80,11 @@ def test_forced_mode():
     with pytest.raises(ValueError):
         gst.PlanEcho("bogus", 2)
     echo = gst.PlanEcho("forced", 1, forced_index=1)  # clamped to the one-stage task's stage
-    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0}
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0, "plan_stage_frames": 0}
     echo = gst.PlanEcho("forced", 2, forced_index=1)
-    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1}
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1, "plan_stage_frames": 0}
     assert echo.update({"plan_choice": 0}) == 1
-    assert echo.request() == {"prev_plan_index": 1, "oracle_plan_index": 1}
+    assert echo.request() == {"prev_plan_index": 1, "oracle_plan_index": 1, "plan_stage_frames": 0}
     assert echo.agreements == 0  # the tracker is still at stage 1
 
 
@@ -78,7 +95,7 @@ def test_steering_counts_plans_and_tracks_the_environment():
     for t in range(gst.HOLD_MIN + 2):
         echo.observe(1.0 if t <= gst.HOLD_MIN else -1.0)  # one qualifying grasp-release cycle
     assert echo.tracker.plan_index == 1  # the environment advanced; the steering plan stays at 0
-    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0}
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 0, "plan_stage_frames": 0}
     assert echo.update({}) == 0 and echo.agreements == 0
     assert gst.PlanEcho("self", 2).tracker.num_plans == 2  # default: the plans' own count
 
@@ -154,7 +171,7 @@ def test_atoms_mode_sends_the_ordered_stage():
     with pytest.raises(ValueError):
         gst.PlanEcho("atoms", 1, atoms=atoms, order=[0])  # not the environment task's stages
     echo = gst.PlanEcho("atoms", 2, atoms=atoms, order=[1, 0])
-    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1}
+    assert echo.request() == {"prev_plan_index": 0, "oracle_plan_index": 1, "plan_stage_frames": 0}
     assert echo.update({}) == 1
     holds["c_1"] = True
     atoms.observe(5)

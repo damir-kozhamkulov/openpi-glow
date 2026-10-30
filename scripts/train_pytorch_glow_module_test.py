@@ -130,3 +130,37 @@ def test_frozen_backbone_step_moves_only_the_encoders():
         assert not torch.equal(dict(model.named_parameters())[name], before[name]), name
     assert all(id(p) in {id(q) for q in optim.state} for p in model.parameters() if p.requires_grad)
     assert len(optim.state) == sum(1 for p in model.parameters() if p.requires_grad)
+
+
+def test_freeze_vlm_step_moves_the_action_expert_and_the_encoders():
+    from openpi.models_pytorch.glow_module_pi0_pytorch_test import _module_arrays
+    from openpi.models_pytorch.glow_module_pi0_pytorch_test import _obs
+
+    model = _module_model()
+    frozen = train_pytorch.freeze_vlm(model)
+    vlm = {n for n, _ in model.named_parameters() if n.startswith(train_pytorch.VLM_PREFIX)}
+    assert frozen == sum(p.numel() for n, p in model.named_parameters() if n in vlm) > 0
+    for name, p in model.named_parameters():
+        assert p.requires_grad == (name not in vlm), name
+    groups = train_pytorch.optimizer_param_groups(model, 16.0)
+    assert [g["name"] for g in groups] == ["pretrained", "new"]
+    assert {id(p) for g in groups for p in g["params"]} == {
+        id(p) for n, p in model.named_parameters() if n not in vlm
+    }
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    optim = torch.optim.AdamW(groups, lr=1e-3)
+    model.train()
+    g = torch.Generator().manual_seed(7)
+    actions, noise = torch.randn(4, 10, 32, generator=g), torch.randn(4, 10, 32, generator=g)
+    model(_obs(0, _module_arrays(0)), actions, noise=noise, time=torch.rand(4, generator=g)).mean().backward()
+    optim.step()
+    params = dict(model.named_parameters())
+    for name in vlm:
+        assert params[name].grad is None and torch.equal(params[name], before[name]), name
+    # The action expert trains, and the encoders get gradients through the frozen VLM.
+    expert = [n for n in params if n.startswith("paligemma_with_expert.gemma_expert.")]
+    assert expert and any(not torch.equal(params[n], before[n]) for n in expert)
+    assert any(params[n].grad is not None and params[n].grad.abs().sum() > 0
+               for n in params if n.startswith("glow_spatial_encoder."))
+    with pytest.raises(ValueError, match="no parameters"):
+        train_pytorch.freeze_vlm(torch.nn.Linear(2, 2))
