@@ -225,3 +225,45 @@ def test_atoms_mode_over_a_chain():
     echo.update({})
     assert atoms.first() == "0" and echo.tracker.num_plans == 1
     assert "order=0,1 mode=atoms plan=1" in echo.trace()
+
+
+def test_release_gate():
+    """With release_cap a stage is done once its atom holds after an open-gripper action (or the
+    cap runs out), as the chain demos switch; first_met still records the first hold."""
+    held = {("on", "bowl_1", "plate_1"): False, ("open", "drawer_1"): False}
+    atoms = gst.StageAtoms(
+        [("on", "bowl_1", "plate_1"), ("open", "drawer_1")], lambda a: held[a], release_cap=40
+    )
+    atoms.observe(0)
+    assert atoms.stage([0, 1]) == 0
+    held[("on", "bowl_1", "plate_1")] = True
+    atoms.observe(10, 1.0)  # placed, gripper still closed
+    assert atoms.first_met == [10, None] and atoms.released == [None, None] and atoms.stage([0, 1]) == 0
+    atoms.observe(11, 0.5)
+    assert atoms.stage([0, 1]) == 0
+    atoms.observe(12, -1.0)  # let go
+    assert atoms.released == [12, None] and atoms.stage([0, 1]) == 1
+    assert atoms.trace() == "atoms_first_met=[10, None] first_stage=0 atoms_released=[12, None]"
+    # The cap: never opened, done release_cap frames after the first hold.
+    capped = gst.StageAtoms([("on", "bowl_1", "plate_1")], lambda a: True, release_cap=3)
+    capped.observe(1, 1.0)
+    capped.observe(3, 1.0)
+    assert capped.released == [None]
+    capped.observe(4, 1.0)
+    assert capped.released == [4]
+    # Opening while the atom no longer holds does not count; an atom true before any action does.
+    lost = {"x": True}
+    flaky = gst.StageAtoms([("on", "x", "y")], lambda a: lost["x"], release_cap=40)
+    flaky.observe(5, 1.0)
+    lost["x"] = False
+    flaky.observe(6, -1.0)
+    assert flaky.released == [None] and flaky.first_met == [5]
+    start = gst.StageAtoms([("on", "x", "y")], lambda a: True, release_cap=40)
+    start.observe(0)
+    assert start.released == [0]
+    # Without release_cap the first hold is enough (the earlier rule).
+    plain = gst.StageAtoms([("on", "x", "y")], lambda a: True)
+    plain.observe(2, 1.0)
+    assert plain.done(0) and plain.released == [None]
+    with pytest.raises(ValueError):
+        gst.StageAtoms([("on", "x", "y")], lambda a: True, release_cap=-1)

@@ -41,9 +41,21 @@ of `chain_tasks` (a partner that moves a different object), the two in random or
 sample's own stage the active one. The partner's scene is the sample's own, so the images say
 nothing about which stage is active: only the Temporal pointer does.
 
-With a `teacher_tokenizer`, training samples also carry the task string as the stock pi05 prompt
+With a `teacher_tokenizer`, training samples also carry the stock pi05 prompt of their active stage
 (`glow_teacher_prompt` / `glow_teacher_prompt_mask`), for the distillation teacher pass of
-GlowModulePI0Pytorch. Inference samples never do.
+GlowModulePI0Pytorch: the stage's LIBERO-Goal instruction when its subgoal_operation is one (a Goal
+task, or a stage of a chain built from Goal tasks), else the sample's task string. Inference samples
+never do.
+
+Counterfactual samples (`counterfactual_p` > 0, training only, needs the teacher): every LIBERO-Goal
+task starts from the same scene, so a frame within `counterfactual_window` frames of the start of
+an episode whose first stage is one of `counterfactual_tasks`' is a valid start for any of them.
+With probability counterfactual_p such a sample gets the plan of ANOTHER of those tasks, chained
+with one of its partners (second, as chain augmentation pairs them), stage 0 active, the per-task
+anchors, and the teacher prompt of that active task. Its demo action belongs to its own task, so it
+carries `glow_flow_weight` 0 (every other training sample 1): only the teacher's velocity, which
+follows the active task, supervises it. The same images then call for different actions depending
+on which stage the plan makes active.
 """
 
 import dataclasses
@@ -57,6 +69,8 @@ from openpi.transforms import DataDict
 from openpi.transforms import DataTransformFn
 
 K_MAX = 4
+# subgoal_operation_source of a stage whose subgoal_operation is a LIBERO-Goal instruction.
+GOAL_INSTRUCTION_SOURCE = "libero_goal_instruction"
 PREDICATES = ("on", "in", "open", "close", "turnon", "turnoff")  # ids 1..; 0 = unknown
 ATOM_LEN = 24
 SUBGOAL_LEN = 24
@@ -164,6 +178,11 @@ def chain_partners(pack: _plan_pack.PlanPack, task_indices) -> dict[int, tuple[_
     return out
 
 
+def teacher_prompt(stage: _plan_pack.Stage, task_string: str) -> str:
+    """The stock pi05 prompt for a training sample whose active stage is `stage`."""
+    return stage.subgoal_operation if stage.subgoal_operation_source == GOAL_INSTRUCTION_SOURCE else task_string
+
+
 def _scalar(x):
     return x if isinstance(x, str | int) else np.asarray(x).item()
 
@@ -185,6 +204,11 @@ class GlowModuleInputs(DataTransformFn):
     # one-stage tasks (task indices) that may form chains.
     chain_p: float = 0.0
     chain_tasks: tuple[int, ...] = ()
+    # Counterfactual samples (see the module docstring); counterfactual_tasks are one-stage
+    # LIBERO-Goal tasks (task indices) sharing one scene.
+    counterfactual_p: float = 0.0
+    counterfactual_window: int = 0
+    counterfactual_tasks: tuple[int, ...] = ()
     # Random draws for the augmentation; None uses numpy's global generator, which the DataLoader
     # seeds per worker.
     rng: np.random.Generator | None = None
@@ -197,6 +221,23 @@ class GlowModuleInputs(DataTransformFn):
         if self.chain_p > 0 and not self.chain_tasks:
             raise ValueError("chain_p > 0 needs chain_tasks")
         object.__setattr__(self, "partners", chain_partners(self.pack, self.chain_tasks))
+        if not 0.0 <= self.counterfactual_p <= 1.0:
+            raise ValueError(f"counterfactual_p must be in [0, 1], got {self.counterfactual_p}")
+        counter = chain_partners(self.pack, self.counterfactual_tasks)
+        if self.counterfactual_p > 0:
+            if len(counter) < 2 or self.counterfactual_window <= 0:
+                raise ValueError(
+                    "counterfactual_p > 0 needs two or more counterfactual_tasks and counterfactual_window > 0"
+                )
+            if self.teacher_tokenizer is None:
+                raise ValueError("counterfactual_p > 0 needs the teacher (module_distill_weight > 0)")
+        by_index = {t.task_index: t for t in self.pack.tasks.values() if t.task_index in counter}
+        for i, t in by_index.items():
+            if t.stages[0].subgoal_operation_source != GOAL_INSTRUCTION_SOURCE:
+                raise ValueError(f"counterfactual task {i} ({t.task!r}) has no LIBERO-Goal instruction")
+        object.__setattr__(self, "counter_partners", counter)
+        object.__setattr__(self, "_counter_tasks", by_index)
+        object.__setattr__(self, "_counter_keys", {t.stages[0].runtime_key: i for i, t in by_index.items()})
         object.__setattr__(self, "_ids", {})
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -226,18 +267,24 @@ class GlowModuleInputs(DataTransformFn):
             own_index = episode.plan_index(frame_index)
             stage_frames = frame_index - episode.stage_starts[own_index]
             own = episode.anchors if self.episode_grounding else None
-            stages, plan_index = self.chain(task, own_index)
-            if own is not None:
-                # The own stages are the plan, or (a chain) its stage plan_index; a partner keeps
-                # the per-task anchors.
-                if stages is task.stages:
-                    grounding = list(own)
-                else:
-                    grounding = [None] * len(stages)
-                    grounding[plan_index] = own[own_index]
+            counterfactual = self.counterfactual(task, own_index, stage_frames)
+            if counterfactual is not None:
+                stages, plan_index = counterfactual
+            else:
+                stages, plan_index = self.chain(task, own_index)
+                if own is not None:
+                    # The own stages are the plan, or (a chain) its stage plan_index; a partner
+                    # keeps the per-task anchors.
+                    if stages is task.stages:
+                        grounding = list(own)
+                    else:
+                        grounding = [None] * len(stages)
+                        grounding[plan_index] = own[own_index]
             if self.teacher_tokenizer is not None:
-                tokens, mask = self.teacher_tokenizer.tokenize(prompt)
+                tokens, mask = self.teacher_tokenizer.tokenize(teacher_prompt(stages[plan_index], prompt))
                 data["glow_teacher_prompt"], data["glow_teacher_prompt_mask"] = tokens, mask
+            if self.counterfactual_p > 0:
+                data["glow_flow_weight"] = np.float32(0.0 if counterfactual is not None else 1.0)
         elif (oracle := data.pop("oracle_plan_index", None)) is not None:
             if stage_frames is None and self.stage_clock:
                 raise ValueError(
@@ -276,6 +323,29 @@ class GlowModuleInputs(DataTransformFn):
         own_first = rng.random() < 0.5
         stages = (task.stages[0], partner.stages[0]) if own_first else (partner.stages[0], task.stages[0])
         return stages, 0 if own_first else 1
+
+    def counterfactual(
+        self, task: _plan_pack.TaskPlan, own_index: int, stage_frames: int
+    ) -> tuple[tuple[_plan_pack.Stage, ...], int] | None:
+        """A counterfactual plan for a training sample (see the module docstring), or None: another
+        counterfactual task active at stage 0, then one of its partners."""
+        if (
+            self.counterfactual_p == 0
+            or own_index != 0
+            or stage_frames >= self.counterfactual_window
+            or task.stages[0].runtime_key not in self._counter_keys
+        ):
+            return None
+        rng = self.rng if self.rng is not None else np.random
+        if rng.random() >= self.counterfactual_p:
+            return None
+        own = self._counter_keys[task.stages[0].runtime_key]
+        others = [i for i in sorted(self._counter_tasks) if i != own]
+        active = self._counter_tasks[others[int(rng.choice(len(others)))]]
+        partners = self.counter_partners[active.task_index]
+        if not partners:
+            return (active.stages[0],), 0
+        return (active.stages[0], partners[int(rng.choice(len(partners)))].stages[0]), 0
 
     def encode(self, task_string: str, plan_index: int, *, stage_frames: int = -1) -> dict[str, np.ndarray]:
         """The module arrays for stage `plan_index` of `task_string`'s task (its per-task anchors)."""

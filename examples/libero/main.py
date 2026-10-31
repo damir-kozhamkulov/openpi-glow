@@ -73,6 +73,10 @@ class Args:
     plan_order: Optional[str] = None
     # Frames a grasp must be held before its release advances the tracker.
     plan_hold_min: int = glow_stage_tracker.HOLD_MIN
+    # --plan-mode atoms: a stage is done once its atom holds after an open-gripper action, or this
+    # many frames after it first held (the chain demos' switch rule). None: on the first frame
+    # its atom holds.
+    plan_release_cap: Optional[int] = None
     # Steering (needs --plan-pack): the plans sent are this pack task's instead of the
     # environment's - the input plan, the oracle / forced plan and the candidates, stage indices
     # clamped to its stages. Against a plan-bottleneck server (pi05_libero_glow_bottleneck) the
@@ -125,6 +129,8 @@ def eval_libero(args: Args) -> None:
         if args.plan_task is not None or args.plan_task_offset is not None:
             raise ValueError("--plan-mode atoms orders the environment task's own stages; it excludes steering")
         plan_order = glow_stage_tracker.parse_order(args.plan_order)
+    if args.plan_release_cap is not None and args.plan_mode != "atoms":
+        raise ValueError("--plan-release-cap needs --plan-mode atoms")
     if args.plan_chain_offset is not None:
         if args.plan_pack is None:
             raise ValueError("--plan-chain-offset needs --plan-pack")
@@ -263,7 +269,9 @@ def eval_libero(args: Args) -> None:
             if num_plans is not None:
                 problem_env = env.env
                 atoms = glow_stage_tracker.StageAtoms(
-                    atom_list, lambda atom, problem_env=problem_env: problem_env._eval_predicate(list(atom))  # noqa: SLF001
+                    atom_list,
+                    lambda atom, problem_env=problem_env: problem_env._eval_predicate(list(atom)),  # noqa: SLF001
+                    release_cap=args.plan_release_cap,
                 )
                 plan = glow_stage_tracker.PlanEcho(
                     args.plan_mode,
@@ -356,7 +364,7 @@ def eval_libero(args: Args) -> None:
                     obs, reward, done, info = env.step(action.tolist())
                     if plan is not None:
                         plan.observe(action[6])  # the gripper command just executed
-                        atoms.observe(plan.tracker.frame)
+                        atoms.observe(plan.tracker.frame, action[6])
                     success = success or done
                     if steered is not None:
                         steered_success = steered.check()

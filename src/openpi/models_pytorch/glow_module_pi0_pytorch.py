@@ -24,7 +24,9 @@ Distillation (`config.module_distill_weight` > 0, training mode only): a teacher
 gradients runs the stock prefix with the task string (`observation.glow_teacher_prompt`) on the
 same preprocessed images, state, noisy actions and time, and the loss adds the squared distance
 of the module model's velocity from the teacher's. The teacher pass runs first, so the student's
-is the last forward before the backward. Evaluation-mode forward is the plain flow loss.
+is the last forward before the backward. Evaluation-mode forward is the plain flow loss. With
+`observation.glow_flow_weight` (GlowModuleInputs' counterfactual samples) the flow term is the
+weighted mean of the per-sample flow losses; distillation always covers the whole batch.
 """
 
 import math
@@ -64,6 +66,7 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
                 atom=config.module_atom,
                 text_anchor=config.module_text_anchor,
                 anchor=config.module_anchor,
+                ctx_active=config.module_ctx_active,
             )
             if config.module_spatial
             else None
@@ -77,6 +80,7 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
                 text_anchor=config.module_text_anchor,
                 anchor=config.module_anchor,
                 stage_clock=config.module_stage_clock,
+                active_anchor=config.module_temporal_active_anchor,
             )
             if config.module_temporal
             else None
@@ -137,15 +141,24 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         student_prefix = self.embed_observation_prefix(observation, images, img_masks, lang_tokens, lang_masks)
         v_t = self.velocity_from_prefix(*student_prefix, state, x_t, time)
 
-        flow = F.mse_loss(u_t, v_t)
+        weight = getattr(observation, "glow_flow_weight", None)
+        if weight is None:
+            flow = F.mse_loss(u_t, v_t)
+        else:
+            weight = weight.to(torch.float32).reshape(-1)
+            per_sample = (u_t - v_t).pow(2).mean(dim=(1, 2))
+            flow = (weight * per_sample).sum() / weight.sum().clamp(min=1.0)
         distill = F.mse_loss(v_t, v_teacher)
         loss = self.config.module_flow_weight * flow + self.config.module_distill_weight * distill
-        return {
+        out = {
             "loss": loss,
             "flow": flow.detach(),
             "distill": distill.detach(),
             "teacher_flow": F.mse_loss(u_t, v_teacher).detach(),
         }
+        if weight is not None:
+            out["counterfactual"] = (weight == 0).to(torch.float32).mean()
+        return out
 
     def module_text_rms(self, observation) -> torch.Tensor:
         """Mean RMS [B, 1, 1] of the sample's module-text token embeddings at the prefix's language

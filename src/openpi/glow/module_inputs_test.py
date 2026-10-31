@@ -728,3 +728,127 @@ def test_stage_clock_through_policy_inputs(monkeypatch, pack):
     assert "plan_stage_frames" not in out
     with pytest.raises(ValueError, match="plan_stage_frames"):
         served(msgpack_numpy.unpackb(msgpack_numpy.packb({k: v for k, v in element.items() if k != "plan_stage_frames"})))
+
+
+def test_teacher_prompt_rule(pack):
+    # A Goal stage's instruction is its stock prompt; a LIBERO-10 stage keeps the task string.
+    goal = _by_index(pack, 17)
+    assert _mi.teacher_prompt(goal.stages[0], "put the bowl on the stove then open the top drawer") == goal.task
+    l10 = _by_index(pack, 0)
+    assert all(_mi.teacher_prompt(s, l10.task) == l10.task for s in l10.stages)
+
+
+def _counterfactual(pack, p=1.0, seed=0, **kw):
+    from openpi.models import tokenizer as _tokenizer
+
+    return _mi.GlowModuleInputs(
+        pack,
+        _tokenizer.PaligemmaTokenizer(8),
+        _tokenizer.PaligemmaTokenizer(48),
+        counterfactual_p=p,
+        counterfactual_window=40,
+        counterfactual_tasks=GOAL_TASKS,
+        rng=np.random.default_rng(seed),
+        **kw,
+    )
+
+
+def test_counterfactual_samples(pack):
+    t = _counterfactual(pack)
+    teacher = t.teacher_tokenizer
+    own = _by_index(pack, 17)
+    ep = next(e for e, p in pack.episodes.items() if p.task_index == own.task_index)
+    actives = collections.Counter()
+    for frame in (0, 39):
+        for _ in range(60):
+            out = t({"prompt": own.task, "episode_index": np.int64(ep), "frame_index": np.int64(frame)})
+            ints = out["glow_ints"]
+            assert ints[_mi.INT_STAGE] == 0 and ints[_mi.INT_NUM_STAGES] == 2 and out["glow_flow_weight"] == 0.0
+            def runtime_key_is(name, task, out=out):
+                return _segment(out, name) == t.tokenizer.encode_text(task.stages[0].runtime_key)
+
+            active = next(a for a in (_by_index(pack, i) for i in GOAL_TASKS) if runtime_key_is("rk0", a))
+            partner = next(a for a in t.counter_partners[active.task_index] if runtime_key_is("rk1", a))
+            assert active.task_index != own.task_index
+            # The plan is (another task, one of its partners), stage 0 active, the per-task anchors
+            # and the sample's own clock; the teacher reads the active task's instruction.
+            expected = t.encode_stages((active.stages[0], partner.stages[0]), 0, stage_frames=frame)
+            for key, value in expected.items():
+                np.testing.assert_array_equal(out[key], value)
+            np.testing.assert_array_equal(out["glow_teacher_prompt"], teacher.tokenize(active.task)[0])
+            actives[active.task_index] += 1
+    assert set(actives) == set(GOAL_TASKS) - {own.task_index}
+    # Past the window, a LIBERO-10 sample, or an inference sample: the own plan, weight 1, the own
+    # task's teacher prompt; inference samples carry neither field.
+    late = t({"prompt": own.task, "episode_index": np.int64(ep), "frame_index": np.int64(40)})
+    assert late["glow_flow_weight"] == 1.0 and late["glow_ints"][_mi.INT_NUM_STAGES] == 1
+    np.testing.assert_array_equal(late["glow_teacher_prompt"], teacher.tokenize(own.task)[0])
+    l10 = _by_index(pack, 0)
+    l10_ep = next(e for e, p in pack.episodes.items() if p.task_index == l10.task_index)
+    out = t({"prompt": l10.task, "episode_index": np.int64(l10_ep), "frame_index": np.int64(0)})
+    assert out["glow_flow_weight"] == 1.0 and out["glow_ints"][_mi.INT_NUM_STAGES] == l10.num_plans
+    served = t({"prompt": own.task, "oracle_plan_index": 0})
+    assert "glow_flow_weight" not in served and "glow_teacher_prompt" not in served
+    # About half the decision frames at p 0.5; none at p 0, which adds no weight field at all.
+    half = _counterfactual(pack, p=0.5, seed=1)
+    sample = {"prompt": own.task, "episode_index": np.int64(ep), "frame_index": np.int64(5)}
+    n = sum(half(dict(sample))["glow_flow_weight"] == 0.0 for _ in range(400))
+    assert 150 < n < 250
+    assert "glow_flow_weight" not in _counterfactual(pack, p=0.0)(dict(sample))
+
+
+def test_counterfactual_validation(pack, tokenizer):
+    from openpi.models import tokenizer as _tokenizer
+
+    with pytest.raises(ValueError, match="teacher"):
+        _mi.GlowModuleInputs(
+            pack, tokenizer, counterfactual_p=0.5, counterfactual_window=40, counterfactual_tasks=GOAL_TASKS
+        )
+    with pytest.raises(ValueError, match="counterfactual_window"):
+        _mi.GlowModuleInputs(
+            pack, tokenizer, _tokenizer.PaligemmaTokenizer(48), counterfactual_p=0.5, counterfactual_tasks=GOAL_TASKS
+        )
+    with pytest.raises(ValueError, match="counterfactual_p"):
+        _counterfactual(pack, p=1.5)
+    one_stage_l10 = next(t.task_index for t in pack.tasks.values() if t.task_index < 10 and t.num_plans == 1)
+    with pytest.raises(ValueError, match="LIBERO-Goal instruction"):
+        _mi.GlowModuleInputs(
+            pack,
+            tokenizer,
+            _tokenizer.PaligemmaTokenizer(48),
+            counterfactual_p=0.5,
+            counterfactual_window=40,
+            counterfactual_tasks=(one_stage_l10, *GOAL_TASKS),
+        )
+
+
+def test_ordering_configs(monkeypatch):
+    import openpi.training.config as _config
+
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+    v2 = _config.get_config("pi05_libero_glow_v2")
+    v2s = _config.get_config("pi05_libero_glow_v2s")
+    v2t = _config.get_config("pi05_libero_glow_v2t")
+    # v2s = the v2 inputs on the align recipe (only the encoders train, distillation 1).
+    assert not v2s.freeze_vlm and not v2t.freeze_vlm
+    assert v2s.model == dataclasses.replace(v2.model, freeze_pretrained=True, module_distill_weight=1.0)
+    # v2t differs from v2s only where the order lives.
+    assert v2t.model == dataclasses.replace(v2s.model, module_ctx_active=False, module_temporal_active_anchor="object")
+    assert v2t.data == dataclasses.replace(v2s.data, module_stage_order="sorted")
+    assert v2s.data == dataclasses.replace(
+        v2.data,
+        module_counterfactual_p=0.5,
+        module_counterfactual_window=40,
+        module_counterfactual_tasks=GOAL_TASKS,
+    )
+    for cfg in (v2s, v2t):
+        dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
+        module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
+        assert module.teacher_tokenizer is not None and module.counterfactual_p == 0.5
+        assert module.counterfactual_window == 40 and module.counterfactual_tasks == GOAL_TASKS
+        assert module.stage_order == cfg.data.module_stage_order
+    # Counterfactual samples need the teacher.
+    with pytest.raises(ValueError, match="teacher"):
+        dataclasses.replace(v2t.data, plan_pack_path=str(GOAL_PACK)).create(
+            pathlib.Path("."), dataclasses.replace(v2t.model, module_distill_weight=0.0)
+        )

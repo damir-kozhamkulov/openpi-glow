@@ -115,6 +115,8 @@ class Observation(Generic[ArrayT]):
     # The task string as the stock prompt, for GLOW's distillation teacher pass (training only).
     glow_teacher_prompt: at.Int[ArrayT, "*b gp"] | None = None
     glow_teacher_prompt_mask: at.Bool[ArrayT, "*b gp"] | None = None
+    # Per-sample weight of the flow term in GLOW's distillation training (training only).
+    glow_flow_weight: at.Float[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -142,6 +144,7 @@ class Observation(Generic[ArrayT]):
             glow_floats=data.get("glow_floats"),
             glow_teacher_prompt=data.get("glow_teacher_prompt"),
             glow_teacher_prompt_mask=data.get("glow_teacher_prompt_mask"),
+            glow_flow_weight=data.get("glow_flow_weight"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -227,6 +230,7 @@ def preprocess_observation(
         glow_floats=observation.glow_floats,
         glow_teacher_prompt=observation.glow_teacher_prompt,
         glow_teacher_prompt_mask=observation.glow_teacher_prompt_mask,
+        glow_flow_weight=observation.glow_flow_weight,
     )
 
 

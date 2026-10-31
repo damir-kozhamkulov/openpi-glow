@@ -529,3 +529,120 @@ def test_stage_clock_reaches_the_temporal_tokens():
     b["glow_ints"][:, _mi.INT_STAGE_FRAMES] = 77
     spatial = slice(0, _enc.SPATIAL_TOKENS)
     torch.testing.assert_close(m.module_tokens(_obs(0, a))[:, spatial], m.module_tokens(_obs(0, b))[:, spatial])
+
+
+def _swap_stages(arrays):
+    """`arrays` with stages 0 and 1 trading places in execution order (texts, predicates, anchors
+    and head words), the pointer kept at 0, and the Spatial slots remapped so every group shows
+    the same stage content as before: the same plan, the other stage first."""
+    out = {k: v.copy() for k, v in arrays.items()}
+    for field in _mi.STAGE_FIELDS:
+        a, b = _mi.TEXT_SEGMENTS[f"{field}0"], _mi.TEXT_SEGMENTS[f"{field}1"]
+        for key in ("glow_text", "glow_text_mask"):
+            out[key][:, a[0] : a[1]] = arrays[key][:, b[0] : b[1]]
+            out[key][:, b[0] : b[1]] = arrays[key][:, a[0] : a[1]]
+    ints, src = out["glow_ints"], arrays["glow_ints"]
+    pred = _mi.INT_PREDICATE.start
+    ints[:, pred], ints[:, pred + 1] = src[:, pred + 1], src[:, pred]
+    for field in ("op", "object", "target", "atom"):
+        ints[:, _mi.head_index(0, field)] = src[:, _mi.head_index(1, field)]
+        ints[:, _mi.head_index(1, field)] = src[:, _mi.head_index(0, field)]
+    slots = ints[:, _mi.INT_SPATIAL_SLOT]
+    ints[:, _mi.INT_SPATIAL_SLOT] = np.where(slots < K, K - 1 - slots, slots)
+    ints[:, _mi.INT_STAGE] = 0
+    n = _mi.STAGE_FLOATS
+    out["glow_floats"][:, :n] = arrays["glow_floats"][:, n : 2 * n]
+    out["glow_floats"][:, n : 2 * n] = arrays["glow_floats"][:, :n]
+    return out
+
+
+def _perturb_residuals(m, seed=5):
+    """Give the zero-initialized output layers random weights, as training would."""
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for enc in (m.glow_spatial_encoder, m.glow_temporal_encoder):
+            enc.out[1].weight.copy_(torch.randn(enc.out[1].weight.shape, generator=g) * 0.05)
+
+
+def test_order_reaches_only_the_temporal_tokens():
+    """With the CTX anchor over all shown stages and the Spatial groups a set, the Spatial tokens of
+    a plan and of the same plan in the other order are identical, trained or not; the Temporal
+    active token anchored to the active stage's object noun tells the two orders apart from
+    initialization on, while the ordinal anchor ("first" either way) does not."""
+    arrays = _with_heads(_module_arrays(0))
+    arrays["glow_ints"][:, _mi.INT_STAGE] = 0
+    swapped = _swap_stages(arrays)
+    spatial = slice(0, _enc.SPATIAL_TOKENS)
+    t_active = -1
+
+    def tokens(m, a):
+        return m.module_tokens(_obs(0, a))
+
+    ordinal = _model_with(module_text_anchor=True, module_anchor="head", module_ctx_active=False)
+    obj = _model_with(
+        module_text_anchor=True, module_anchor="head", module_ctx_active=False, module_temporal_active_anchor="object"
+    )
+    active = _model_with(module_text_anchor=True, module_anchor="head")
+    torch.testing.assert_close(tokens(ordinal, arrays)[:, t_active], tokens(ordinal, swapped)[:, t_active])
+    assert not torch.allclose(tokens(obj, arrays)[:, t_active], tokens(obj, swapped)[:, t_active])
+    for m in (ordinal, obj):
+        _perturb_residuals(m)
+        torch.testing.assert_close(tokens(m, arrays)[:, spatial], tokens(m, swapped)[:, spatial], rtol=1e-5, atol=1e-6)
+    # The active-stage CTX anchor (the v2 default) carries the order into the Spatial tokens.
+    assert not torch.allclose(tokens(active, arrays)[:, spatial], tokens(active, swapped)[:, spatial])
+
+
+def test_object_anchor_and_shown_ctx_at_init():
+    m = _model_with(
+        module_text_anchor=True, module_anchor="head", module_ctx_active=False, module_temporal_active_anchor="object"
+    )
+    arrays = _with_heads(_module_arrays(0))
+    ints = torch.as_tensor(arrays["glow_ints"])
+    embed = m.paligemma_with_expert.embed_language_tokens
+
+    def head(j, field):
+        return embed(ints[:, _mi.head_index(j, field)]).to(torch.float32)
+
+    rows, stage = torch.arange(B), ints[:, _mi.INT_STAGE]
+    tokens = m.module_tokens(_obs(0, arrays))
+    ctx = torch.stack([head(j, "atom") for j in range(K)], dim=1).mean(1)
+    torch.testing.assert_close(tokens[:, _enc.SPATIAL_TOKENS - 1], ctx, rtol=1e-5, atol=1e-6)
+    active_object = torch.stack([head(j, "object") for j in range(K)], dim=1)[rows, stage]
+    torch.testing.assert_close(tokens[:, -1], active_object, rtol=1e-5, atol=1e-6)
+    # No object noun: the target noun; neither: the subgoal's verb.
+    for missing, fallback in ((("object",), "target"), (("object", "target"), "op")):
+        edited = {k: v.copy() for k, v in arrays.items()}
+        for j in range(K):
+            for field in missing:
+                edited["glow_ints"][:, _mi.head_index(j, field)] = 0
+        expected = torch.stack([head(j, fallback) for j in range(K)], dim=1)[rows, stage]
+        torch.testing.assert_close(m.module_tokens(_obs(0, edited))[:, -1], expected, rtol=1e-5, atol=1e-6)
+    with pytest.raises(ValueError, match="active_anchor"):
+        _model_with(module_temporal_active_anchor="last")
+
+
+def test_flow_weight():
+    """Counterfactual samples (weight 0) leave the flow term; distillation covers every sample."""
+    m = _model_with(module_text_anchor=True, module_distill_weight=1.0)
+    actions, noise, time = _flow_inputs()
+    m.train()
+
+    def run(weight):
+        arrays = {**_module_arrays(0), **_teacher(0)}
+        if weight is not None:
+            arrays["glow_flow_weight"] = np.asarray(weight, dtype=np.float32)
+        torch.manual_seed(0)
+        return m(_obs(0, arrays), actions, noise=noise, time=time)
+
+    plain, ones, some = run(None), run([1, 1, 1, 1]), run([1, 0, 1, 0])
+    with torch.no_grad():
+        v, v_teacher = _by_hand(m, _distill_obs(), actions, noise, time)
+    per_sample = (noise - actions - v).pow(2).mean(dim=(1, 2))
+    torch.testing.assert_close(ones["flow"], plain["flow"])
+    torch.testing.assert_close(some["flow"], per_sample[[0, 2]].mean())
+    torch.testing.assert_close(some["distill"], plain["distill"])
+    torch.testing.assert_close(some["loss"], some["flow"] + some["distill"])
+    assert "counterfactual" not in plain and float(ones["counterfactual"]) == 0.0
+    assert float(some["counterfactual"]) == 0.5
+    # All counterfactual: no flow term at all.
+    assert float(run([0, 0, 0, 0])["flow"]) == 0.0

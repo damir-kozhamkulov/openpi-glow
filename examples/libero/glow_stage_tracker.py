@@ -65,24 +65,48 @@ def stage_order_for(order, num_plans):
 
 
 class StageAtoms:
-    def __init__(self, atoms, holds):
-        """atoms: one goal atom per stage, in stage order; holds(atom) -> bool on the simulator."""
+    def __init__(self, atoms, holds, release_cap=None):
+        """atoms: one goal atom per stage, in stage order; holds(atom) -> bool on the simulator.
+
+        release_cap None: a stage is done on the first frame its atom holds. Otherwise a stage is
+        done on the first frame its atom holds after an open-gripper action, or release_cap frames
+        after the atom first held - the switch rule of the chain demos (glow_chain_demo.ChainRun),
+        so the plan does not move on while the gripper still holds the object it just placed."""
         if not atoms:
             raise ValueError("a task has at least one stage atom")
+        if release_cap is not None and release_cap < 0:
+            raise ValueError("release_cap must be >= 0, got {}".format(release_cap))
         self.atoms = list(atoms)
         self._holds = holds
+        self.release_cap = release_cap
         self.first_met = [None] * len(self.atoms)  # frame each atom first held
+        self.released = [None] * len(self.atoms)  # frame each stage counts as done (with release_cap)
 
-    def observe(self, frame):
-        """Check every atom not met yet; call once per executed frame (and before the first)."""
+    def observe(self, frame, gripper_command=None):
+        """Check every atom not met yet; call once per executed frame (and before the first, where
+        no action has run: gripper_command None counts as open)."""
         for k, atom in enumerate(self.atoms):
-            if self.first_met[k] is None and self._holds(atom):
-                self.first_met[k] = frame
+            holds = None
+            if self.first_met[k] is None:
+                holds = bool(self._holds(atom))
+                if holds:
+                    self.first_met[k] = frame
+            if self.release_cap is None or self.first_met[k] is None or self.released[k] is not None:
+                continue
+            if holds is None:
+                holds = bool(self._holds(atom))
+            opened = gripper_command is None or float(gripper_command) <= 0
+            if (holds and opened) or frame - self.first_met[k] >= self.release_cap:
+                self.released[k] = frame
+
+    def done(self, k):
+        """Whether stage k is done (its atom held, and with release_cap, released)."""
+        return (self.first_met if self.release_cap is None else self.released)[k] is not None
 
     def stage(self, order):
-        """The first stage in `order` whose atom has not held yet (the last one once all have)."""
+        """The first stage in `order` that is not done (the last one once all are)."""
         for k in order:
-            if self.first_met[k] is None:
+            if not self.done(k):
                 return k
         return order[-1]
 
@@ -97,7 +121,9 @@ class StageAtoms:
         return str(firsts[0]) if len(firsts) == 1 else "together"
 
     def trace(self):
-        return "atoms_first_met={} first_stage={}".format(self.first_met, self.first())
+        if self.release_cap is None:
+            return "atoms_first_met={} first_stage={}".format(self.first_met, self.first())
+        return "atoms_first_met={} first_stage={} atoms_released={}".format(self.first_met, self.first(), self.released)
 
 
 def moved_object(runtime_key):

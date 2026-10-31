@@ -163,13 +163,21 @@ def test_chain_variants(module):
         pb["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS["rk1"])],
         first["glow_text_mask"][slice(*_mi.TEXT_SEGMENTS["rk1"])],
     )
+    swap = v["chain_spatial_swap"]
+    slots = first["glow_ints"][_mi.INT_SPATIAL_SLOT]
+    assert swap["glow_ints"][_mi.INT_SPATIAL_SLOT].tolist() == [slots[1], slots[0], *slots[2:]]
+    changed = np.flatnonzero(swap["glow_ints"] != first["glow_ints"])
+    assert set(changed) <= set(range(_mi.INT_SPATIAL_SLOT.start, _mi.INT_SPATIAL_SLOT.stop))
+    for key in ("glow_text", "glow_text_mask", "glow_floats"):
+        np.testing.assert_array_equal(swap[key], first[key])
 
 
 @pytest.mark.skipif(
     not ((DATASET / "meta/info.json").exists() and NORM_STATS.exists()),
     reason="local LeRobot copy or norm_stats not present",
 )
-def test_main_end_to_end(monkeypatch, tmp_path):
+@pytest.mark.parametrize("config", ["pi05_libero_glow_st", "pi05_libero_glow_v2t"])
+def test_main_end_to_end(monkeypatch, tmp_path, config):
     import json
 
     import safetensors.torch
@@ -217,7 +225,7 @@ def test_main_end_to_end(monkeypatch, tmp_path):
     weights.mkdir()
     torch.manual_seed(0)
     safetensors.torch.save_model(
-        get_config("pi05_libero_glow_st").model.create_pytorch(), str(weights / "model.safetensors")
+        get_config(config).model.create_pytorch(), str(weights / "model.safetensors")
     )
 
     out = tmp_path / "probe.json"
@@ -227,6 +235,7 @@ def test_main_end_to_end(monkeypatch, tmp_path):
             weights_dir=str(weights),
             norm_stats_dir=str(ASSETS),
             dataset_root=str(DATASET),
+            config=config,
             episodes="0:6,379:385",
             num_samples=16,
             batch_size=4,
@@ -238,14 +247,22 @@ def test_main_end_to_end(monkeypatch, tmp_path):
     assert s["vs_correct"]["samples"] == 16 and set(o) == set(gmp.VARIANTS)
     assert o["correct"]["diff"] == 0.0 and o["correct_again"]["diff"] == 0.0  # exact repeat on CPU
     assert all(np.isfinite(v["flow"]) for v in o.values())
-    # Random weights still read the module: every counterfactual moves the flow loss.
-    for name in ("other_task", "grounding_other", "spatial_blank", "temporal_blank"):
+    # Random weights still read the module: every counterfactual moves the flow loss. Text-anchored
+    # encoders (v2t) start as their head words with zero residuals, so only the inputs that change
+    # a head word (another task, blanked Spatial text) move a fresh model.
+    anchored = get_config(config).model.module_text_anchor
+    moved = ["other_task", "spatial_blank"]
+    if not anchored:
+        moved += ["grounding_other", "temporal_blank"]
+    for name in moved:
         assert o[name]["diff"] != 0.0, name
-    assert s["vs_correct_multistage"]["overall"]["wrong_stage"]["diff"] != 0.0
+    if not anchored:
+        assert s["vs_correct_multistage"]["overall"]["wrong_stage"]["diff"] != 0.0
     by_stage = [b for b in s["vs_correct_multistage_by_stage"].values() if b is not None]
     assert by_stage and sum(b["samples"] for b in by_stage) <= s["vs_correct_multistage"]["samples"]
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert len(payload["per_sample"]["correct"]) == 16
+    assert len(payload["per_sample"]["correct"]) == 16 and len(payload["clocks"]) == 16
+    assert "vs_chain_correct_decision" in s
 
 
 def test_v2_variants_keep_the_clock_and_isolate_the_grounding(module):

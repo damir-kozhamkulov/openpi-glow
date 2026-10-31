@@ -23,7 +23,9 @@ a summary:
          (a null embedding with neither)
     ATOM pooled atom                                          anchor: atom | the predicate word
     CTX  learned query                                        anchor: the shown stages' text |
-                                                              the active stage's predicate word
+                                                              the active stage's predicate word,
+                                                              or (`ctx_active` off) the mean of the
+                                                              shown stages' predicate words
 Only the first INT_SHOWN groups are shown (all K stages, or with the "remaining" order the active
 stage and the later ones); the rest are padding: masked inside the encoder and emitted as zero
 tokens with token_mask False. `subgoal_text`, `nouns` and `atom` switch those texts off (their
@@ -33,7 +35,10 @@ slots plus a summary query; a slot is pooled runtime_key + stage-position + stat
 active / to do) + stage-count embeddings, and with `stage_clock` the active slot adds an
 embedding of the frames since its stage began (log buckets, one for unknown); padding slots
 masked. Output: [summary, active slot]; anchors: every runtime key of the plan and the active
-stage's runtime key | the stage count and the active stage's ordinal as words.
+stage's runtime key | the stage count and, for the active slot, the active stage's ordinal
+(`active_anchor="ordinal"`) or its object head noun (`"object"`, falling back to the target head
+noun, then the subgoal's verb). The ordinal is the same word for either order of a two-stage plan;
+the object noun names which stage is active.
 
 A missing piece (no target, a text switched off) anchors to zero: a zero token, which the
 backbone's attention gives a zero value.
@@ -52,6 +57,7 @@ SPATIAL_SLOTS = ("OP", "OBJ", "TGT", "ATOM")
 SPATIAL_TOKENS = _mi.K_MAX * len(SPATIAL_SLOTS) + 1
 TEMPORAL_TOKENS = 2
 ANCHORS = ("mean", "head")
+TEMPORAL_ACTIVE_ANCHORS = ("ordinal", "object")
 # Stage-clock buckets: 0 = unknown, then [0, 1), [1, 4), [4, 8), ..., [128, inf) frames.
 CLOCK_EDGES = (1, 4, 8, 16, 32, 64, 128)
 # The text of each Spatial slot, and the head word that anchors it.
@@ -105,6 +111,19 @@ def _per_stage(emb, mask, field: str) -> tuple[torch.Tensor, torch.Tensor]:
     """Pooled `field` of every stage [B, K_MAX, D] and whether each has any token [B, K_MAX]."""
     pooled, has = zip(*(_pool(emb, mask, f"{field}{j}") for j in range(_mi.K_MAX)), strict=True)
     return torch.stack(pooled, dim=-2), torch.stack(has, dim=-1)
+
+
+def active_noun(head: torch.Tensor, ints: torch.Tensor) -> torch.Tensor:
+    """[B, D]: the active stage's object head noun, else its target head noun, else its subgoal's
+    verb (`head` = head_embeddings, zero where a stage has no such word)."""
+    rows = torch.arange(ints.shape[0], device=ints.device)
+    stage = ints[..., _mi.INT_STAGE].long()
+    ids = ints[..., _mi.INT_HEAD].long().reshape(ints.shape[0], _mi.K_MAX, len(_mi.HEAD_FIELDS))[rows, stage]
+    out = head[rows, stage, _mi.HEAD_FIELDS.index("op")]
+    for field in ("target", "object"):
+        f = _mi.HEAD_FIELDS.index(field)
+        out = torch.where((ids[:, f] > 0)[:, None], head[rows, stage, f], out)
+    return out
 
 
 def _zero_init(linear: nn.Linear) -> None:
@@ -177,6 +196,7 @@ class SpatialEncoder(nn.Module):
         atom: bool = True,
         text_anchor: bool = False,
         anchor: str = "mean",
+        ctx_active: bool = True,
     ):
         super().__init__()
         if text_anchor and text_width != out_width:
@@ -189,6 +209,7 @@ class SpatialEncoder(nn.Module):
         self.atom = atom
         self.text_anchor = text_anchor
         self.anchor = anchor
+        self.ctx_active = ctx_active
         # The slots whose text the encoder reads.
         self.texts = {"OP": subgoal_text, "OBJ": nouns, "TGT": nouns, "ATOM": atom}
         self.text_proj = nn.Sequential(nn.LayerNorm(text_width), nn.Linear(text_width, width))
@@ -210,8 +231,13 @@ class SpatialEncoder(nn.Module):
             per = torch.stack(
                 [head[:, :, _mi.HEAD_FIELDS.index(SLOT_HEAD[slot])] for slot in SPATIAL_SLOTS], dim=-2
             )  # [B, K, 4, D]
-            rows = torch.arange(ints.shape[0], device=ints.device)
-            ctx = head[rows, ints[..., _mi.INT_STAGE].long(), _mi.HEAD_FIELDS.index("atom")]
+            atom = head[:, :, _mi.HEAD_FIELDS.index("atom")]  # [B, K, D]
+            if self.ctx_active:
+                rows = torch.arange(ints.shape[0], device=ints.device)
+                ctx = atom[rows, ints[..., _mi.INT_STAGE].long()]
+            else:
+                shown = shown_stages(ints).to(atom.dtype)[..., None]
+                ctx = (atom * shown).sum(1) / shown.sum(1).clamp(min=1.0)
         else:
             per = torch.stack([_per_stage(emb, text_mask, SLOT_TEXT[slot])[0] for slot in SPATIAL_SLOTS], dim=-2)
             fields = [SLOT_TEXT[slot] for slot in ("OP", "OBJ", "ATOM") if self.texts[slot]]
@@ -265,14 +291,20 @@ class TemporalEncoder(nn.Module):
         text_anchor: bool = False,
         anchor: str = "mean",
         stage_clock: bool = False,
+        active_anchor: str = "ordinal",
     ):
         super().__init__()
         if text_anchor and text_width != out_width:
             raise ValueError("TemporalEncoder: text_anchor needs the text and output widths to match")
         if anchor not in ANCHORS:
             raise ValueError(f"TemporalEncoder: anchor must be one of {ANCHORS}, got {anchor!r}")
+        if active_anchor not in TEMPORAL_ACTIVE_ANCHORS:
+            raise ValueError(
+                f"TemporalEncoder: active_anchor must be one of {TEMPORAL_ACTIVE_ANCHORS}, got {active_anchor!r}"
+            )
         self.text_anchor = text_anchor
         self.anchor = anchor
+        self.active_anchor = active_anchor
         self.text_proj = nn.Sequential(nn.LayerNorm(text_width), nn.Linear(text_width, width))
         self.position = nn.Embedding(_mi.K_MAX, width)
         self.status = nn.Embedding(3, width)  # done, active, to do
@@ -306,11 +338,14 @@ class TemporalEncoder(nn.Module):
         if not self.text_anchor:
             return tokens
         if self.anchor == "head":
-            # Anchors: the stage count and the active stage's ordinal, as words.
+            # Anchors: the stage count, and the active stage's ordinal or object, as words.
             head = head_embeddings(embed, ints)
             count = head[rows, num_stages - 1, _mi.HEAD_FIELDS.index("count")]
-            ordinal = head[rows, stage, _mi.HEAD_FIELDS.index("ordinal")]
-            return tokens + torch.stack([count, ordinal], dim=-2).to(tokens.dtype)
+            if self.active_anchor == "ordinal":
+                active = head[rows, stage, _mi.HEAD_FIELDS.index("ordinal")]
+            else:
+                active = active_noun(head, ints)
+            return tokens + torch.stack([count, active], dim=-2).to(tokens.dtype)
         # Anchors: every runtime key of the plan, and the active stage's.
         every = _pool_many(emb, text_mask, [f"rk{j}" for j in range(_mi.K_MAX)])
         return tokens + torch.stack([every, keys[rows, stage]], dim=-2).to(tokens.dtype)

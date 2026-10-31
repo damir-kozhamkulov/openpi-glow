@@ -419,6 +419,10 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
     # per-episode anchors (GlowModuleInputs.episode_grounding).
     module_stage_clock: bool = False
     module_episode_grounding: bool = False
+    # Counterfactual samples (GlowModuleInputs.counterfactual_*; need the model's distillation).
+    module_counterfactual_p: float = 0.0
+    module_counterfactual_window: int = 0
+    module_counterfactual_tasks: tuple[int, ...] = ()
     # Decision-frame oversampling (DataConfig.decision_window / decision_repeat) over the pack's
     # stage starts: the frames where the next stage's goal decides what the robot does next.
     decision_window: int = 0
@@ -493,6 +497,9 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                 episode_grounding=self.module_episode_grounding,
                 chain_p=self.module_chain_p,
                 chain_tasks=self.module_chain_tasks,
+                counterfactual_p=self.module_counterfactual_p,
+                counterfactual_window=self.module_counterfactual_window,
+                counterfactual_tasks=self.module_counterfactual_tasks,
             )
             plan = [module, stock[i]]
             model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
@@ -1202,6 +1209,44 @@ _CONFIGS = [
                 "pi05_libero_glow_v2_grounding_only",
                 {"module_subgoal_text": False, "module_nouns": False, "module_atom": False},
             ),
+        )
+    ),
+    # Ordering rows (align recipe: only the encoders train, so the distillation teacher - the
+    # same frozen model reading the active stage's instruction - stays fixed). Both add
+    # counterfactual samples: within 40 frames of a Goal-scene episode's start, half the samples
+    # get another Goal task's plan and the teacher's velocity for it. _v2t keeps the order out of
+    # the Spatial tokens (sorted groups, a summary anchored to all shown stages) and anchors the
+    # Temporal active token to the active stage's object noun, so only Temporal says which stage
+    # comes first; _v2s is the v2 inputs (the remaining plan, active stage first) on the same
+    # recipe.
+    *(
+        _glow_module_train_config(
+            name,
+            data={
+                "module_stage_order": order,
+                "module_stage_clock": True,
+                "module_episode_grounding": True,
+                "module_counterfactual_p": 0.5,
+                "module_counterfactual_window": 40,
+                "module_counterfactual_tasks": tuple(range(10, 20)),
+                "decision_window": 40,
+                "decision_repeat": 3,
+            },
+            module_text_anchor=True,
+            module_token_scale="words",
+            module_anchor="head",
+            module_stage_clock=True,
+            freeze_pretrained=True,
+            module_distill_weight=1.0,
+            **switches,
+        )
+        for name, order, switches in (
+            (
+                "pi05_libero_glow_v2t",
+                "sorted",
+                {"module_ctx_active": False, "module_temporal_active_anchor": "object"},
+            ),
+            ("pi05_libero_glow_v2s", "remaining", {}),
         )
     ),
     # The text control for the v2 rows: pi05_libero_plan_prompt with the same frozen VLM and

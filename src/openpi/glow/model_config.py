@@ -56,6 +56,12 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # The anchor of each token: "mean" = its text's mean-pooled token embedding, "head" = one head
     # word's embedding (module_inputs.head_words).
     module_anchor: str = "mean"
+    # With "head" anchors: the Spatial summary (CTX) anchored to the active stage's predicate word
+    # (True), or to the mean of the shown stages' (False: the Spatial tokens then say nothing about
+    # which stage is active); the Temporal active token anchored to the active stage's "ordinal"
+    # word or its "object" head noun (module_encoders.TemporalEncoder).
+    module_ctx_active: bool = True
+    module_temporal_active_anchor: str = "ordinal"
     # The size each encoder token enters the prefix at: "language" = the RMS of the sample's
     # language tokens (with the task string dropped, only BOS and the newline answer token);
     # "words" = the mean RMS of the sample's own module-text tokens as the prefix embeds them.
@@ -67,7 +73,9 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # distillation target is the velocity the same model predicts from the task string instead of
     # the module tokens (a teacher pass without gradients, on the same images, state, noise and
     # time). The task string reaches the model only for that pass, tokenized to
-    # module_teacher_prompt_len; inference never sees it.
+    # module_teacher_prompt_len; inference never sees it. A training sample may carry a flow weight
+    # (glow_flow_weight, 0 for counterfactual samples whose demo action belongs to another task):
+    # the flow term is then the weighted mean over the batch.
     module_flow_weight: float = 1.0
     module_distill_weight: float = 0.0
     module_teacher_prompt_len: int = 48
