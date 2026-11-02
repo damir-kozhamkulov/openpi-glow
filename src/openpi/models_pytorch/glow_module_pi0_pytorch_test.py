@@ -621,6 +621,89 @@ def test_object_anchor_and_shown_ctx_at_init():
         _model_with(module_temporal_active_anchor="last")
 
 
+def _gated(gate=0.25, **kw):
+    return _model_with(
+        module_text_anchor=True,
+        module_token_scale="words",
+        module_anchor="head",
+        module_ctx_active=False,
+        module_temporal_active_anchor="object",
+        module_temporal_gate=gate,
+        **kw,
+    )
+
+
+def _prefix_tokens(m, arrays):
+    obs = _obs(0, arrays)
+    with torch.no_grad():
+        images, img_masks, lang_tokens, lang_masks, _ = m._preprocess_observation(obs, train=False)  # noqa: SLF001
+        embs = m.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)[0]
+        n = _enc.SPATIAL_TOKENS + _enc.TEMPORAL_TOKENS
+        return embs[:, embs.shape[1] - lang_tokens.shape[1] - n : embs.shape[1] - lang_tokens.shape[1]]
+
+
+def test_fresh_gate_scales_only_the_inactive_groups():
+    torch.manual_seed(0)
+    gated, plain = _gated(), _gated(0.0)
+    plain.load_state_dict(gated.state_dict(), strict=False)
+    arrays = _with_heads(_module_arrays(0))
+    a, b = _prefix_tokens(gated, arrays), _prefix_tokens(plain, arrays)
+    slots = len(_enc.SPATIAL_SLOTS)
+    ints = arrays["glow_ints"]
+    for i in range(B):
+        for group in range(K):
+            factor = 1.0 if ints[i, _mi.INT_SPATIAL_SLOT][group] == ints[i, _mi.INT_STAGE] else 0.25
+            at = group * slots
+            torch.testing.assert_close(a[i, at : at + slots], factor * b[i, at : at + slots], rtol=1e-4, atol=1e-5)
+    # The padded groups stay zero; the summary and the Temporal tokens are not gated.
+    assert not a[:, K * slots : _enc.SPATIAL_TOKENS - 1].any()
+    torch.testing.assert_close(a[:, _enc.SPATIAL_TOKENS - 1 :], b[:, _enc.SPATIAL_TOKENS - 1 :], rtol=1e-4, atol=1e-5)
+
+
+def test_gate_follows_the_pointer_and_leaves_the_spatial_encoder_alone():
+    m = _gated()
+    arrays = _with_heads(_module_arrays(0))
+    moved = {k: v.copy() for k, v in arrays.items()}
+    moved["glow_ints"][:, _mi.INT_STAGE] = 1 - arrays["glow_ints"][:, _mi.INT_STAGE]
+    one, two = m.module_tokens_and_gates(_obs(0, arrays)), m.module_tokens_and_gates(_obs(0, moved))
+    n = _enc.SPATIAL_TOKENS
+    torch.testing.assert_close(one[0][:, :n], two[0][:, :n], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(one[1][:, [0, 4]], two[1][:, [4, 0]], rtol=1e-5, atol=1e-6)
+
+
+def test_one_stage_plan_is_never_gated():
+    m = _gated()
+    torch.nn.init.normal_(m.glow_temporal_encoder.gate[1].weight, std=0.5)
+    gates = m.module_tokens_and_gates(_obs(0, _with_heads(_module_arrays(0, num_stages=1))))[1]
+    slots = len(_enc.SPATIAL_SLOTS)
+    assert torch.equal(gates[:, :slots], torch.ones(B, slots))
+    assert not gates[:, slots : _enc.SPATIAL_TOKENS - 1].any()
+
+
+def test_gate_trains_and_stays_at_most_one():
+    m = _gated()
+    actions, noise, time = _flow_inputs()
+    m.train()
+    arrays = _with_heads(_module_arrays(0))
+    head = m.glow_temporal_encoder.gate[1]
+    torch.manual_seed(0)
+    m(_obs(0, arrays), actions, noise=noise, time=time).mean().backward()
+    assert head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+    torch.nn.init.normal_(head.weight, std=0.5)
+    gates = m.module_tokens_and_gates(_obs(0, arrays))[1]
+    assert torch.isfinite(gates).all() and float(gates.max()) == pytest.approx(1.0)
+    assert float(gates[:, [0, 4]].min()) != pytest.approx(0.25)
+
+
+def test_gate_options():
+    with pytest.raises(ValueError, match="gate"):
+        _model_with(module_temporal_gate=1.0)
+    with pytest.raises(ValueError, match="module_temporal_gate"):
+        _model_with(module_temporal_gate=0.25, module_spatial=False)
+    assert _model_with().glow_temporal_encoder.gate is None
+    assert _model_with().module_tokens_and_gates(_obs(0, _module_arrays(0)))[1] is None
+
+
 def test_flow_weight():
     """Counterfactual samples (weight 0) leave the flow term; distillation covers every sample."""
     m = _model_with(module_text_anchor=True, module_distill_weight=1.0)

@@ -835,6 +835,10 @@ def test_ordering_configs(monkeypatch):
     # v2t differs from v2s only where the order lives.
     assert v2t.model == dataclasses.replace(v2s.model, module_ctx_active=False, module_temporal_active_anchor="object")
     assert v2t.data == dataclasses.replace(v2s.data, module_stage_order="sorted")
+    # The gated row is v2t plus the gate.
+    gate = _config.get_config("pi05_libero_glow_v2t_gate")
+    assert gate.model == dataclasses.replace(v2t.model, module_temporal_gate=0.25)
+    assert gate.data == v2t.data and gate.lr_schedule == v2t.lr_schedule
     assert v2s.data == dataclasses.replace(
         v2.data,
         module_counterfactual_p=0.5,

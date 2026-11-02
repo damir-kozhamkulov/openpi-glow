@@ -40,6 +40,13 @@ stage's runtime key | the stage count and, for the active slot, the active stage
 noun, then the subgoal's verb). The ordinal is the same word for either order of a two-stage plan;
 the object noun names which stage is active.
 
+With `gate` (0 < gate < 1) Temporal also sets how strongly each Spatial group enters the prefix: a
+log-gate per stage = log(gate) off the active stage, 0 on it, plus a zero-init linear read of that
+stage's slot, shifted so that the largest of the plan's stages is 1. A fresh encoder gives the
+active stage 1 and every other stage `gate`; a one-stage plan is always 1. Group sizes are the only
+thing the gate touches, so the Spatial encoder's own output still does not depend on the order. The
+gates apply after the caller's rescale, which would otherwise undo them.
+
 A missing piece (no target, a text switched off) anchors to zero: a zero token, which the
 backbone's attention gives a zero value.
 """
@@ -182,6 +189,13 @@ def spatial_token_mask(ints: torch.Tensor) -> torch.Tensor:
     return torch.cat([valid, valid.new_ones(valid.shape[0], 1)], dim=-1)
 
 
+def spatial_token_gates(stage_gates: torch.Tensor, ints: torch.Tensor) -> torch.Tensor:
+    """[B, SPATIAL_TOKENS]: each Spatial token's gate from the stages' [B, K_MAX]; the summary is 1."""
+    groups = _gather_groups(stage_gates, ints[..., _mi.INT_SPATIAL_SLOT].long())
+    groups = groups.repeat_interleave(len(SPATIAL_SLOTS), dim=-1)
+    return torch.cat([groups, groups.new_ones(groups.shape[0], 1)], dim=-1)
+
+
 class SpatialEncoder(nn.Module):
     def __init__(
         self,
@@ -292,8 +306,11 @@ class TemporalEncoder(nn.Module):
         anchor: str = "mean",
         stage_clock: bool = False,
         active_anchor: str = "ordinal",
+        gate: float = 0.0,
     ):
         super().__init__()
+        if not 0.0 <= gate < 1.0:
+            raise ValueError(f"TemporalEncoder: gate must be in [0, 1), got {gate}")
         if text_anchor and text_width != out_width:
             raise ValueError("TemporalEncoder: text_anchor needs the text and output widths to match")
         if anchor not in ANCHORS:
@@ -315,8 +332,21 @@ class TemporalEncoder(nn.Module):
         self.out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, out_width))
         if text_anchor:
             _zero_init(self.out[1])
+        self.gate_start = gate
+        self.gate = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 1)) if gate > 0 else None
+        if self.gate is not None:
+            _zero_init(self.gate[1])
 
-    def forward(self, embed, text, text_mask, ints) -> torch.Tensor:
+    def stage_gates(self, slots: torch.Tensor, ints: torch.Tensor) -> torch.Tensor:
+        """[B, K_MAX]: each stage's gate from its transformer slot [B, K_MAX, W]; 0 past the plan."""
+        j = torch.arange(_mi.K_MAX, device=slots.device)
+        active = j == ints[..., _mi.INT_STAGE, None].long()
+        log_gate = self.gate(slots)[..., 0] + (~active).to(slots.dtype) * math.log(self.gate_start)
+        log_gate = log_gate.masked_fill(~stage_valid(ints), -math.inf)
+        return torch.exp(log_gate - log_gate.amax(dim=-1, keepdim=True))
+
+    def forward(self, embed, text, text_mask, ints) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The tokens [B, TEMPORAL_TOKENS, D], and with a gate the stages' gates [B, K_MAX]."""
         emb = embed(text).to(torch.float32)
         keys, _ = _per_stage(emb, text_mask, "rk")
         stage = ints[..., _mi.INT_STAGE].long()
@@ -335,8 +365,9 @@ class TemporalEncoder(nn.Module):
         rows = torch.arange(out.shape[0], device=out.device)
         active = out[rows, 1 + stage]
         tokens = self.out(torch.stack([out[:, 0], active], dim=-2))
+        gates = self.stage_gates(out[:, 1:], ints) if self.gate is not None else None
         if not self.text_anchor:
-            return tokens
+            return tokens, gates
         if self.anchor == "head":
             # Anchors: the stage count, and the active stage's ordinal or object, as words.
             head = head_embeddings(embed, ints)
@@ -345,7 +376,7 @@ class TemporalEncoder(nn.Module):
                 active = head[rows, stage, _mi.HEAD_FIELDS.index("ordinal")]
             else:
                 active = active_noun(head, ints)
-            return tokens + torch.stack([count, active], dim=-2).to(tokens.dtype)
+            return tokens + torch.stack([count, active], dim=-2).to(tokens.dtype), gates
         # Anchors: every runtime key of the plan, and the active stage's.
         every = _pool_many(emb, text_mask, [f"rk{j}" for j in range(_mi.K_MAX)])
-        return tokens + torch.stack([every, keys[rows, stage]], dim=-2).to(tokens.dtype)
+        return tokens + torch.stack([every, keys[rows, stage]], dim=-2).to(tokens.dtype), gates

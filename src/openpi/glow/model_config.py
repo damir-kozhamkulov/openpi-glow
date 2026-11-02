@@ -62,6 +62,9 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # word or its "object" head noun (module_encoders.TemporalEncoder).
     module_ctx_active: bool = True
     module_temporal_active_anchor: str = "ordinal"
+    # Above 0: the Temporal encoder scales each Spatial group in the prefix, starting at 1 for the
+    # active stage and at this for the others (module_encoders.TemporalEncoder).
+    module_temporal_gate: float = 0.0
     # The size each encoder token enters the prefix at: "language" = the RMS of the sample's
     # language tokens (with the task string dropped, only BOS and the newline answer token);
     # "words" = the mean RMS of the sample's own module-text tokens as the prefix embeds them.

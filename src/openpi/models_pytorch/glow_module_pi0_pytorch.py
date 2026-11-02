@@ -14,7 +14,9 @@ rescaled to a target RMS (`config.module_token_scale`): the RMS of the
 sample's language-token embeddings ("language"; with the task string dropped these are BOS and the
 newline answer token), or the mean RMS of the sample's own module-text tokens as the prefix embeds
 language ("words", the size of an ordinary word token). The size matters beyond the first layer:
-a token keeps its input norm in the residual stream.
+a token keeps its input norm in the residual stream. With `config.module_temporal_gate` the Temporal
+encoder then scales each Spatial group (module_encoders), so order reaches the prefix as which
+stage's words are loud.
 
 The encoders are new parameters: the fine-tuning init (pi05_libero) has none of them, so the
 trainer loads it non-strictly for exactly the names under NEW_PARAM_PREFIXES, and trains them at
@@ -49,6 +51,8 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         super().__init__(config)
         if not (config.module_spatial or config.module_temporal):
             raise ValueError("GlowModulePI0Pytorch needs the spatial or the temporal encoder")
+        if config.module_temporal_gate > 0 and not (config.module_spatial and config.module_temporal):
+            raise ValueError("module_temporal_gate needs the spatial and the temporal encoder")
         if config.module_token_scale not in MODULE_TOKEN_SCALES:
             raise ValueError(
                 f"module_token_scale must be one of {MODULE_TOKEN_SCALES}, got {config.module_token_scale!r}"
@@ -81,13 +85,18 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
                 anchor=config.module_anchor,
                 stage_clock=config.module_stage_clock,
                 active_anchor=config.module_temporal_active_anchor,
+                gate=config.module_temporal_gate,
             )
             if config.module_temporal
             else None
         )
 
     def module_tokens(self, observation) -> torch.Tensor:
-        """The encoders' tokens [B, N, width], before rescaling."""
+        """The encoders' tokens [B, N, width], before rescaling and gating."""
+        return self.module_tokens_and_gates(observation)[0]
+
+    def module_tokens_and_gates(self, observation) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`module_tokens`, and the factor [B, N] each enters the prefix at (None without a gate)."""
         fields = (observation.glow_text, observation.glow_text_mask, observation.glow_ints, observation.glow_floats)
         if any(f is None for f in fields):
             raise ValueError(
@@ -96,12 +105,15 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
             )
         text, text_mask, ints, floats = fields
         embed = self.paligemma_with_expert.embed_language_tokens
-        tokens = []
+        tokens, gates = [], None
         if self.glow_spatial_encoder is not None:
             tokens.append(self.glow_spatial_encoder(embed, text, text_mask, ints, floats.to(torch.float32)))
         if self.glow_temporal_encoder is not None:
-            tokens.append(self.glow_temporal_encoder(embed, text, text_mask, ints))
-        return torch.cat(tokens, dim=1)
+            temporal, stage_gates = self.glow_temporal_encoder(embed, text, text_mask, ints)
+            tokens.append(temporal)
+            if stage_gates is not None:
+                gates = torch.cat([_enc.spatial_token_gates(stage_gates, ints), temporal.new_ones(temporal.shape[:2])], 1)
+        return torch.cat(tokens, dim=1), gates
 
     def module_token_mask(self, observation) -> torch.Tensor:
         """[B, N] which of `module_tokens` are real: the Spatial groups past the shown ones are
@@ -178,8 +190,10 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         lang_rms = torch.sqrt((lang.pow(2).mean(-1, keepdim=True) * valid).sum(1, keepdim=True)
                               / valid.sum(1, keepdim=True).clamp(min=1.0))
         target_rms = self.module_text_rms(observation) if self.config.module_token_scale == "words" else lang_rms
-        module = self.module_tokens(observation)
+        module, gates = self.module_tokens_and_gates(observation)
         module = module * torch.rsqrt(module.pow(2).mean(-1, keepdim=True) + 1e-6) * target_rms.detach()
+        if gates is not None:
+            module = module * gates[..., None]
         module = module.to(embs.dtype)
         module_mask = self.module_token_mask(observation).to(pad_masks.dtype)
 

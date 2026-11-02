@@ -1218,7 +1218,8 @@ _CONFIGS = [
     # the Spatial tokens (sorted groups, a summary anchored to all shown stages) and anchors the
     # Temporal active token to the active stage's object noun, so only Temporal says which stage
     # comes first; _v2s is the v2 inputs (the remaining plan, active stage first) on the same
-    # recipe.
+    # recipe; _v2t_gate is _v2t with the Temporal encoder also scaling the Spatial groups, the
+    # other stages' starting at a quarter of the active stage's.
     *(
         _glow_module_train_config(
             name,
@@ -1245,6 +1246,11 @@ _CONFIGS = [
                 "pi05_libero_glow_v2t",
                 "sorted",
                 {"module_ctx_active": False, "module_temporal_active_anchor": "object"},
+            ),
+            (
+                "pi05_libero_glow_v2t_gate",
+                "sorted",
+                {"module_ctx_active": False, "module_temporal_active_anchor": "object", "module_temporal_gate": 0.25},
             ),
             ("pi05_libero_glow_v2s", "remaining", {}),
         )
