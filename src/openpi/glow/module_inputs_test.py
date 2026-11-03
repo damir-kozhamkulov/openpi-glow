@@ -561,7 +561,20 @@ def test_remaining_order_shows_the_active_stage_first(pack, tokenizer):
 def test_head_words(pack, transform, tokenizer):
     stage = _by_index(pack, 0).stages[1]  # "put the yellow and white mug on the right plate"
     words = _mi.head_words(stage, 1)
-    assert words == {"op": "put", "object": "mug", "target": "plate", "atom": "on", "ordinal": "second", "count": "two"}
+    assert words == {
+        "op": "put",
+        "object": "mug",
+        "target": "plate",
+        "atom": "on",
+        "ordinal": "second",
+        "count": "two",
+        "key_predicate": "on",
+        "key_object": "mug",
+    }
+    assert _mi.key_words("on(moka_pot_1, flat_stove_1_cook_region)") == ("on", "pot")
+    assert _mi.key_words("open(wooden_cabinet_1_middle_region)") == ("open", "middle")
+    assert _mi.key_words("turnon(flat_stove_1)") == ("on", "stove")
+    assert all(all(_mi.key_words(s.runtime_key)) for t in pack.tasks.values() for s in t.stages)
     assert _mi.head_noun("black bowl (left)") == "bowl" and _mi.head_noun("") is None
     turnon = next(t for t in pack.tasks.values() if t.stages[0].predicate == "turnon")
     assert _mi.head_words(turnon.stages[0], 0)["atom"] == "on"
@@ -839,6 +852,13 @@ def test_ordering_configs(monkeypatch):
     gate = _config.get_config("pi05_libero_glow_v2t_gate")
     assert gate.model == dataclasses.replace(v2t.model, module_temporal_gate=0.25)
     assert gate.data == v2t.data and gate.lr_schedule == v2t.lr_schedule
+    # The key row is v2t with the Temporal encoder on the active runtime key alone.
+    key = _config.get_config("pi05_libero_glow_v2t_key")
+    assert key.model == dataclasses.replace(
+        v2t.model, module_temporal_key_only=True, module_stage_clock=False, module_temporal_active_anchor="ordinal"
+    )
+    assert key.data == dataclasses.replace(v2t.data, module_stage_clock=False)
+    assert key.lr_schedule == v2t.lr_schedule
     assert v2s.data == dataclasses.replace(
         v2.data,
         module_counterfactual_p=0.5,

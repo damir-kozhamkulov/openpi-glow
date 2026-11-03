@@ -1219,13 +1219,14 @@ _CONFIGS = [
     # Temporal active token to the active stage's object noun, so only Temporal says which stage
     # comes first; _v2s is the v2 inputs (the remaining plan, active stage first) on the same
     # recipe; _v2t_gate is _v2t with the Temporal encoder also scaling the Spatial groups, the
-    # other stages' starting at a quarter of the active stage's.
+    # other stages' starting at a quarter of the active stage's; _v2t_key is _v2t with the Temporal
+    # encoder reading only the active stage's runtime key, so no stage clock.
     *(
         _glow_module_train_config(
             name,
             data={
                 "module_stage_order": order,
-                "module_stage_clock": True,
+                "module_stage_clock": clock,
                 "module_episode_grounding": True,
                 "module_counterfactual_p": 0.5,
                 "module_counterfactual_window": 40,
@@ -1236,23 +1237,31 @@ _CONFIGS = [
             module_text_anchor=True,
             module_token_scale="words",
             module_anchor="head",
-            module_stage_clock=True,
+            module_stage_clock=clock,
             freeze_pretrained=True,
             module_distill_weight=1.0,
             **switches,
         )
-        for name, order, switches in (
+        for name, order, clock, switches in (
             (
                 "pi05_libero_glow_v2t",
                 "sorted",
+                True,
                 {"module_ctx_active": False, "module_temporal_active_anchor": "object"},
             ),
             (
                 "pi05_libero_glow_v2t_gate",
                 "sorted",
+                True,
                 {"module_ctx_active": False, "module_temporal_active_anchor": "object", "module_temporal_gate": 0.25},
             ),
-            ("pi05_libero_glow_v2s", "remaining", {}),
+            (
+                "pi05_libero_glow_v2t_key",
+                "sorted",
+                False,
+                {"module_ctx_active": False, "module_temporal_key_only": True},
+            ),
+            ("pi05_libero_glow_v2s", "remaining", True, {}),
         )
     ),
     # The text control for the v2 rows: pi05_libero_plan_prompt with the same frozen VLM and

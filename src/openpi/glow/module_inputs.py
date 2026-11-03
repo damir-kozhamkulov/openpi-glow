@@ -101,8 +101,9 @@ INT_SHOWN = 2 + 2 * K_MAX
 INT_STAGE_FRAMES = 3 + 2 * K_MAX
 # Per stage: the subgoal's verb, the object and target head nouns, the predicate as a word, and
 # the stage's ordinal and count words ("second", "two" for stage 1): the Temporal head anchors
-# gather the active stage's ordinal and the last stage's count.
-HEAD_FIELDS = ("op", "object", "target", "atom", "ordinal", "count")
+# gather the active stage's ordinal and the last stage's count. key_predicate and key_object are
+# words of the runtime key alone (key_words), for a Temporal encoder that reads nothing else.
+HEAD_FIELDS = ("op", "object", "target", "atom", "ordinal", "count", "key_predicate", "key_object")
 INT_HEAD = slice(4 + 2 * K_MAX, 4 + 2 * K_MAX + K_MAX * len(HEAD_FIELDS))
 INTS_LEN = INT_HEAD.stop
 STAGE_FLOATS = 8
@@ -130,9 +131,20 @@ def head_noun(noun: str) -> str | None:
     return words[-1].lower() if words else None
 
 
+def key_words(runtime_key: str) -> tuple[str | None, str | None]:
+    """A runtime key's predicate word and its first argument's last word, without instance numbers
+    and "region": "on(moka_pot_1, flat_stove_1_cook_region)" -> ("on", "pot"),
+    "open(wooden_cabinet_1_middle_region)" -> ("open", "middle")."""
+    predicate, inside = runtime_key.split("(", 1)
+    first = inside.split(",", 1)[0].strip().rstrip(")")
+    words = [w for w in first.split("_") if w and not w.isdigit() and w != "region"]
+    return PREDICATE_WORDS.get(predicate.strip().lower()), words[-1].lower() if words else None
+
+
 def head_words(stage: _plan_pack.Stage, j: int) -> dict[str, str | None]:
     """Stage j's head word per HEAD_FIELDS entry (None: the stage has none)."""
     verb = stage.subgoal_operation.split()
+    key_predicate, key_object = key_words(stage.runtime_key)
     return {
         "op": verb[0].lower() if verb else None,
         "object": head_noun(stage.object_noun),
@@ -140,6 +152,8 @@ def head_words(stage: _plan_pack.Stage, j: int) -> dict[str, str | None]:
         "atom": PREDICATE_WORDS.get(stage.predicate),
         "ordinal": ORDINAL_WORDS[j],
         "count": COUNT_WORDS[j],
+        "key_predicate": key_predicate,
+        "key_object": key_object,
     }
 
 

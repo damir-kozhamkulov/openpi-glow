@@ -704,6 +704,128 @@ def test_gate_options():
     assert _model_with().module_tokens_and_gates(_obs(0, _module_arrays(0)))[1] is None
 
 
+def _key_only():
+    return _model_with(
+        module_text_anchor=True,
+        module_token_scale="words",
+        module_anchor="head",
+        module_ctx_active=False,
+        module_temporal_key_only=True,
+    )
+
+
+def _temporal_tokens(m, arrays):
+    return m.module_tokens(_obs(0, arrays))[:, -_enc.TEMPORAL_TOKENS :]
+
+
+def test_key_only_init_emits_the_key_words():
+    m = _key_only()
+    arrays = _with_heads(_module_arrays(0))
+    ints = torch.as_tensor(arrays["glow_ints"])
+    embed = m.paligemma_with_expert.embed_language_tokens
+    rows, stage = torch.arange(B), ints[:, _mi.INT_STAGE]
+
+    def word(field):
+        ids = torch.stack([ints[:, _mi.head_index(j, field)] for j in range(K)], dim=1)[rows, stage]
+        return embed(ids).to(torch.float32)
+
+    expected = torch.stack([word("key_predicate"), word("key_object")], dim=1)
+    torch.testing.assert_close(_temporal_tokens(m, arrays), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_key_only_reads_only_the_active_key():
+    """A trained key-only encoder's tokens stay the same whatever else of the plan changes, and
+    whichever stage index holds the active key."""
+    m = _key_only()
+    _perturb_residuals(m)
+    arrays = _with_heads(_module_arrays(0))
+    arrays["glow_ints"][:, _mi.INT_STAGE] = 0
+    base = _temporal_tokens(m, arrays)
+
+    edited = {k: v.copy() for k, v in arrays.items()}
+    g = np.random.default_rng(9)
+    start, stop = _mi.TEXT_SEGMENTS["rk1"]
+    edited["glow_text"][:, start:stop] = g.integers(3, 1000, (B, stop - start))
+    edited["glow_text_mask"][:, start:stop] = True
+    for name in ("atom0", "subgoal0", "object0", "target0"):
+        start, stop = _mi.TEXT_SEGMENTS[name]
+        edited["glow_text"][:, start:stop] = g.integers(3, 1000, (B, stop - start))
+    ints = edited["glow_ints"]
+    ints[:, _mi.INT_NUM_STAGES] = 3
+    ints[:, _mi.INT_STAGE_FRAMES] = 77
+    ints[:, _mi.INT_PREDICATE] = 1
+    ints[:, _mi.INT_SHOWN] = 1
+    for field in ("op", "object", "target", "atom", "ordinal", "count"):
+        ints[:, _mi.head_index(0, field)] = 5
+    for field in _mi.HEAD_FIELDS:
+        ints[:, _mi.head_index(1, field)] = 5
+    edited["glow_floats"][:] = 0.5
+    torch.testing.assert_close(_temporal_tokens(m, edited), base)
+
+    # The same key at another stage index, the pointer there.
+    moved = {k: v.copy() for k, v in arrays.items()}
+    a, b = _mi.TEXT_SEGMENTS["rk0"], _mi.TEXT_SEGMENTS["rk1"]
+    for key in ("glow_text", "glow_text_mask"):
+        moved[key][:, b[0] : b[1]] = arrays[key][:, a[0] : a[1]]
+    for field in ("key_predicate", "key_object"):
+        moved["glow_ints"][:, _mi.head_index(1, field)] = arrays["glow_ints"][:, _mi.head_index(0, field)]
+    moved["glow_ints"][:, _mi.INT_STAGE] = 1
+    torch.testing.assert_close(_temporal_tokens(m, moved), base)
+
+
+def test_key_only_follows_the_active_key():
+    arrays = _with_heads(_module_arrays(0))
+    arrays["glow_ints"][:, _mi.INT_STAGE] = 0
+    other = {k: v.copy() for k, v in arrays.items()}
+    other["glow_ints"][:, _mi.INT_STAGE] = 1
+    fresh, trained = _key_only(), _key_only()
+    _perturb_residuals(trained)
+    for m in (fresh, trained):
+        assert not torch.allclose(_temporal_tokens(m, arrays), _temporal_tokens(m, other))
+
+    # The key's text alone moves a trained encoder's tokens, not a fresh one's.
+    start, stop = _mi.TEXT_SEGMENTS["rk0"]
+    text = {k: v.copy() for k, v in arrays.items()}
+    text["glow_text"][:, start:stop] = np.random.default_rng(4).integers(3, 1000, (B, stop - start))
+    torch.testing.assert_close(_temporal_tokens(fresh, text), _temporal_tokens(fresh, arrays))
+    assert not torch.allclose(_temporal_tokens(trained, text), _temporal_tokens(trained, arrays))
+
+
+def test_key_only_keeps_the_order_out_of_the_spatial_tokens():
+    m = _key_only()
+    _perturb_residuals(m)
+    arrays = _with_heads(_module_arrays(0))
+    arrays["glow_ints"][:, _mi.INT_STAGE] = 0
+    swapped = _swap_stages(arrays)
+    for field in ("key_predicate", "key_object"):
+        swapped["glow_ints"][:, _mi.head_index(0, field)] = arrays["glow_ints"][:, _mi.head_index(1, field)]
+        swapped["glow_ints"][:, _mi.head_index(1, field)] = arrays["glow_ints"][:, _mi.head_index(0, field)]
+    a, b = m.module_tokens(_obs(0, arrays)), m.module_tokens(_obs(0, swapped))
+    spatial = slice(0, _enc.SPATIAL_TOKENS)
+    torch.testing.assert_close(a[:, spatial], b[:, spatial], rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(a[:, -_enc.TEMPORAL_TOKENS :], b[:, -_enc.TEMPORAL_TOKENS :])
+
+
+def test_key_only_trains_every_parameter():
+    m = _key_only()
+    _perturb_residuals(m)
+    arrays = _with_heads(_module_arrays(0))
+    _flow(m, _obs(0, arrays)).mean().backward()
+    temporal = dict(m.glow_temporal_encoder.named_parameters())
+    assert not {n.split(".")[0] for n in temporal} & {"position", "status", "num_stages", "clock", "gate"}
+    assert all(p.grad is not None for p in temporal.values())
+
+
+def test_key_only_options():
+    head = {"module_text_anchor": True, "module_anchor": "head"}
+    with pytest.raises(ValueError, match="key_only"):
+        _model_with(module_temporal_key_only=True, module_stage_clock=True, **head)
+    with pytest.raises(ValueError, match="key_only"):
+        _model_with(module_temporal_key_only=True, module_temporal_gate=0.25, **head)
+    with pytest.raises(ValueError, match="key_only"):
+        _model_with(module_temporal_key_only=True, module_text_anchor=True)
+
+
 def test_flow_weight():
     """Counterfactual samples (weight 0) leave the flow term; distillation covers every sample."""
     m = _model_with(module_text_anchor=True, module_distill_weight=1.0)

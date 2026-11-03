@@ -40,6 +40,12 @@ stage's runtime key | the stage count and, for the active slot, the active stage
 noun, then the subgoal's verb). The ordinal is the same word for either order of a two-stage plan;
 the object noun names which stage is active.
 
+With `key_only` the Temporal encoder's only input is the active stage's runtime key: INT_STAGE picks
+which key it is given, and nothing else of the plan reaches it (no pointer, status, stage count,
+position or clock, no other stage's key). Two slots: a summary query and the pooled key. Output:
+[summary, key]; head anchors: the key's predicate word and its first argument's word
+(module_inputs.key_words). Two plans whose active stages have the same key get the same tokens.
+
 With `gate` (0 < gate < 1) Temporal also sets how strongly each Spatial group enters the prefix: a
 log-gate per stage = log(gate) off the active stage, 0 on it, plus a zero-init linear read of that
 stage's slot, shifted so that the largest of the plan's stages is 1. A fresh encoder gives the
@@ -307,10 +313,15 @@ class TemporalEncoder(nn.Module):
         stage_clock: bool = False,
         active_anchor: str = "ordinal",
         gate: float = 0.0,
+        key_only: bool = False,
     ):
         super().__init__()
         if not 0.0 <= gate < 1.0:
             raise ValueError(f"TemporalEncoder: gate must be in [0, 1), got {gate}")
+        if key_only and (stage_clock or gate > 0):
+            raise ValueError("TemporalEncoder: key_only reads the runtime key alone, no stage clock or gate")
+        if key_only and text_anchor and anchor != "head":
+            raise ValueError("TemporalEncoder: key_only anchors to the key's head words (anchor='head')")
         if text_anchor and text_width != out_width:
             raise ValueError("TemporalEncoder: text_anchor needs the text and output widths to match")
         if anchor not in ANCHORS:
@@ -322,10 +333,11 @@ class TemporalEncoder(nn.Module):
         self.text_anchor = text_anchor
         self.anchor = anchor
         self.active_anchor = active_anchor
+        self.key_only = key_only
         self.text_proj = nn.Sequential(nn.LayerNorm(text_width), nn.Linear(text_width, width))
-        self.position = nn.Embedding(_mi.K_MAX, width)
-        self.status = nn.Embedding(3, width)  # done, active, to do
-        self.num_stages = nn.Embedding(_mi.K_MAX + 1, width)
+        self.position = nn.Embedding(_mi.K_MAX, width) if not key_only else None
+        self.status = nn.Embedding(3, width) if not key_only else None  # done, active, to do
+        self.num_stages = nn.Embedding(_mi.K_MAX + 1, width) if not key_only else None
         self.clock = nn.Embedding(len(CLOCK_EDGES) + 2, width) if stage_clock else None
         self.summary = nn.Parameter(torch.zeros(width))
         self.transformer = _transformer(width, depth)
@@ -345,11 +357,24 @@ class TemporalEncoder(nn.Module):
         log_gate = log_gate.masked_fill(~stage_valid(ints), -math.inf)
         return torch.exp(log_gate - log_gate.amax(dim=-1, keepdim=True))
 
+    def key_tokens(self, embed, key: torch.Tensor, ints: torch.Tensor) -> torch.Tensor:
+        """The `key_only` tokens [B, TEMPORAL_TOKENS, D] from the active stage's pooled key [B, D]."""
+        slots = self.text_proj(key)
+        tokens = self.out(self.transformer(torch.stack([self.summary.expand_as(slots), slots], dim=-2)))
+        if not self.text_anchor:
+            return tokens
+        rows = torch.arange(ints.shape[0], device=ints.device)
+        head = head_embeddings(embed, ints)[rows, ints[..., _mi.INT_STAGE].long()]
+        words = [_mi.HEAD_FIELDS.index(field) for field in ("key_predicate", "key_object")]
+        return tokens + head[:, words].to(tokens.dtype)
+
     def forward(self, embed, text, text_mask, ints) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The tokens [B, TEMPORAL_TOKENS, D], and with a gate the stages' gates [B, K_MAX]."""
         emb = embed(text).to(torch.float32)
         keys, _ = _per_stage(emb, text_mask, "rk")
         stage = ints[..., _mi.INT_STAGE].long()
+        if self.key_only:
+            return self.key_tokens(embed, keys[torch.arange(keys.shape[0], device=keys.device), stage], ints), None
         num_stages = ints[..., _mi.INT_NUM_STAGES].long()
         j = torch.arange(_mi.K_MAX, device=text.device)
         status = torch.sign(j - stage[..., None]) + 1

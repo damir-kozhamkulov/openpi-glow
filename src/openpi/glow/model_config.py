@@ -65,6 +65,9 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # Above 0: the Temporal encoder scales each Spatial group in the prefix, starting at 1 for the
     # active stage and at this for the others (module_encoders.TemporalEncoder).
     module_temporal_gate: float = 0.0
+    # The Temporal encoder reads only the active stage's runtime key, nothing else of the plan
+    # (module_encoders.TemporalEncoder); excludes the stage clock and the gate.
+    module_temporal_key_only: bool = False
     # The size each encoder token enters the prefix at: "language" = the RMS of the sample's
     # language tokens (with the task string dropped, only BOS and the newline answer token);
     # "words" = the mean RMS of the sample's own module-text tokens as the prefix embeds them.

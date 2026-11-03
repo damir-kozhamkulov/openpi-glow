@@ -86,6 +86,7 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
                 stage_clock=config.module_stage_clock,
                 active_anchor=config.module_temporal_active_anchor,
                 gate=config.module_temporal_gate,
+                key_only=config.module_temporal_key_only,
             )
             if config.module_temporal
             else None
