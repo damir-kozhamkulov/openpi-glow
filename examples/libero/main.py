@@ -6,6 +6,7 @@ import math
 import pathlib
 from typing import Literal, Optional
 
+import glow_chain_demo
 import glow_stage_tracker
 import imageio
 from libero.libero import benchmark
@@ -45,6 +46,8 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    # Comma-separated suite task indices to run (default all), so parallel clients can share a suite.
+    task_ids: Optional[str] = None
 
     #################################################################################################################
     # Utils
@@ -102,6 +105,11 @@ class Args:
     # episode); the step budget doubles. Which atom held first says whether the actions followed
     # the chain's order.
     plan_chain_offset: Optional[int] = None
+    # Chains in --plan-mode atoms: once the chain's first stage is done, the arm follows the chain
+    # demos' scripted return to its start pose (glow_chain_demo.ReturnPlan) for at most this many
+    # steps, inside the same step budget, and the policy then takes over for the second stage.
+    # None: the policy goes on from wherever the first stage ended.
+    plan_return_steps: Optional[int] = None
     # Instruction sent to the server in place of the environment's task (the planner reads it).
     prompt: Optional[str] = None
 
@@ -120,6 +128,11 @@ def eval_libero(args: Args) -> None:
             raise ValueError("--plan-task and --plan-task-offset exclude each other")
         if args.plan_task_offset < 0:
             raise ValueError("--plan-task-offset must be >= 0")
+    if args.plan_return_steps is not None:
+        if args.plan_chain_offset is None or args.plan_mode != "atoms":
+            raise ValueError("--plan-return-steps needs --plan-chain-offset and --plan-mode atoms")
+        if args.plan_return_steps < 1:
+            raise ValueError("--plan-return-steps must be >= 1")
     plan_order = None
     if (args.plan_mode == "atoms") != (args.plan_order is not None):
         raise ValueError("--plan-mode atoms and --plan-order go together")
@@ -163,6 +176,7 @@ def eval_libero(args: Args) -> None:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
+    task_ids = _parse_task_ids(args.task_ids, num_tasks_in_suite)
     logging.info(f"Task suite: {args.task_suite_name}")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
@@ -211,7 +225,7 @@ def eval_libero(args: Args) -> None:
     # Episodes cut short because the policy server could not be reached. Their outcome is not a
     # policy result, so a run with any of them is invalid regardless of the rate it computes.
     aborted_episodes = []
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -266,6 +280,7 @@ def eval_libero(args: Args) -> None:
             env.reset()
             action_plan = collections.deque()
             plan = atoms = None
+            chain_return = ChainReturn(args.plan_return_steps) if args.plan_return_steps is not None else None
             if num_plans is not None:
                 problem_env = env.env
                 atoms = glow_stage_tracker.StageAtoms(
@@ -306,6 +321,8 @@ def eval_libero(args: Args) -> None:
                         steered_at_start = steered.check()
                     if atoms is not None and plan.tracker.frame == 0:
                         atoms.observe(0)  # an atom already true when the policy takes over
+                        if chain_return is not None:
+                            chain_return.set_start(obs["robot0_eef_pos"], obs["robot0_eef_quat"])
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -321,7 +338,11 @@ def eval_libero(args: Args) -> None:
                     # Save preprocessed image for replay video
                     replay_images.append(img)
 
-                    if not action_plan:
+                    return_action = None
+                    if chain_return is not None:
+                        return_action = chain_return.action(obs["robot0_eef_pos"], obs["robot0_eef_quat"])
+
+                    if return_action is None and not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
                         element = {
@@ -358,13 +379,16 @@ def eval_libero(args: Args) -> None:
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                         action_plan.extend(action_chunk[: args.replan_steps])
 
-                    action = action_plan.popleft()
+                    action = return_action if return_action is not None else action_plan.popleft()
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
                     if plan is not None:
                         plan.observe(action[6])  # the gripper command just executed
                         atoms.observe(plan.tracker.frame, action[6])
+                        if chain_return is not None and atoms.done(0):
+                            if chain_return.begin(plan.tracker.frame, obs["robot0_eef_pos"], obs["robot0_eef_quat"]):
+                                action_plan.clear()  # the first stage's remaining actions are not executed
                     success = success or done
                     if steered is not None:
                         steered_success = steered.check()
@@ -428,6 +452,8 @@ def eval_libero(args: Args) -> None:
                 logging.info(f"Partner success: {partner_success}; chain success: {chain_success}")
                 steered_fields = (
                     f"chain={chain_order} partner_success={partner_success} chain_success={chain_success} "
+                    f"chain_held_at_end={bool(env.env._check_success() and partner_goal.check())} "  # noqa: SLF001
+                    f"{chain_return.trace() + ' ' if chain_return is not None else ''}"
                 )
             if plan is not None:
                 # One line per episode for the stage-resolved failure analysis.
@@ -480,6 +506,56 @@ def eval_libero(args: Args) -> None:
             f"server was unreachable (first at episode {aborted_episodes[0]}). The success rate above is not a "
             f"policy result."
         )
+
+
+class ChainReturn:
+    """One episode's scripted return between a chain's two stages (glow_chain_demo.ReturnPlan)."""
+
+    def __init__(self, max_steps):
+        self.max_steps = max_steps
+        self.start = None  # the arm's pose when the policy took over
+        self.frame = None  # frame the return began
+        self.steps = 0
+        self.reached = None
+        self.skipped = []
+        self._plan = None
+
+    def set_start(self, pos, quat):
+        self.start = (np.array(pos), np.array(quat))
+
+    def begin(self, frame, pos, quat):
+        """Start the return from this pose; True the first time only."""
+        if self.frame is not None:
+            return False
+        self.frame = frame
+        self._plan = glow_chain_demo.ReturnPlan(np.array(pos), np.array(quat), *self.start)
+        return True
+
+    def action(self, pos, quat):
+        """The next action while the return runs, else None (the policy's turn)."""
+        if self._plan is None:
+            return None
+        action, reached = self._plan.action(pos, quat)
+        if reached or self.steps >= self.max_steps:
+            self.reached, self.skipped = reached, self._plan.skipped
+            self._plan = None
+            return None
+        self.steps += 1
+        return action
+
+    def trace(self):
+        skipped = ",".join(self.skipped) or "-"
+        return f"return_frame={self.frame} return_steps={self.steps} return_reached={self.reached} return_skipped={skipped}"
+
+
+def _parse_task_ids(text: Optional[str], num_tasks: int) -> list:
+    """The suite task indices in `text` (comma-separated), or every task when it is None."""
+    if text is None:
+        return list(range(num_tasks))
+    task_ids = [int(part) for part in text.split(",")]
+    if len(set(task_ids)) != len(task_ids) or not all(0 <= i < num_tasks for i in task_ids):
+        raise ValueError(f"--task-ids needs distinct indices in [0, {num_tasks}), got {text!r}")
+    return task_ids
 
 
 def _get_libero_env(task, resolution, seed):

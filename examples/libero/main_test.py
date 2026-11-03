@@ -79,6 +79,56 @@ def suite(monkeypatch):
     return _Suite(problems)
 
 
+def _chain_return(max_steps=200):
+    r = main.ChainReturn(max_steps)
+    r.set_start([0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0])
+    return r
+
+
+def test_chain_return_is_silent_until_it_begins_and_begins_once():
+    r = _chain_return()
+    pos, quat = [0.2, 0.1, 0.9], [0.0, 0.0, 0.0, 1.0]
+    assert r.action(pos, quat) is None
+    assert r.begin(120, pos, quat) is True
+    assert r.begin(121, pos, quat) is False
+    assert r.frame == 120
+    assert r.action(pos, quat) is not None
+
+
+def test_chain_return_hands_back_at_the_start_pose():
+    r = _chain_return()
+    pos, quat = [0.2, 0.1, 0.9], [0.0, 0.0, 0.0, 1.0]
+    r.begin(120, pos, quat)
+    targets = [target for target, _ in r._plan.targets]  # noqa: SLF001
+    for target in targets[:-1]:
+        assert r.action(target, quat) is not None
+    assert r.action(targets[-1], quat) is None
+    assert r.reached is True
+    assert r.action(targets[-1], quat) is None  # the policy's turn from here on
+    assert f"return_frame=120 return_steps={r.steps} return_reached=True return_skipped=-" in r.trace()
+
+
+def test_chain_return_gives_up_after_max_steps():
+    r = _chain_return(max_steps=2)
+    pos, quat = [0.2, 0.1, 0.9], [0.0, 0.0, 0.0, 1.0]
+    r.begin(120, pos, quat)
+    assert r.action(pos, quat) is not None
+    assert r.action(pos, quat) is not None
+    assert r.action(pos, quat) is None
+    assert r.reached is False
+
+
+def test_task_ids_default_to_the_whole_suite():
+    assert main._parse_task_ids(None, 3) == [0, 1, 2]
+    assert main._parse_task_ids("8,9", 10) == [8, 9]
+
+
+@pytest.mark.parametrize("text", ["10", "-1", "1,1"])
+def test_task_ids_refuse_a_bad_index(text):
+    with pytest.raises(ValueError, match="--task-ids"):
+        main._parse_task_ids(text, 10)
+
+
 def test_scene_differences_ignore_goal_language_and_objects_of_interest():
     a = _problem([["on", "bowl_1", "stove_region"]], language="a")
     b = _problem([["open", "drawer_1"]], language="b")
