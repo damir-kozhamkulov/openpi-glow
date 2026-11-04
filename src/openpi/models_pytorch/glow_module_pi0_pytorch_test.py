@@ -11,6 +11,7 @@ Runs in-container with `uv pip install --python /venv-server/bin/python pytest p
 
 import numpy as np
 import pytest
+import safetensors.torch
 import torch
 
 from openpi.glow import module_encoders as _enc
@@ -658,6 +659,71 @@ def test_fresh_gate_scales_only_the_inactive_groups():
     # The padded groups stay zero; the summary and the Temporal tokens are not gated.
     assert not a[:, K * slots : _enc.SPATIAL_TOKENS - 1].any()
     torch.testing.assert_close(a[:, _enc.SPATIAL_TOKENS - 1 :], b[:, _enc.SPATIAL_TOKENS - 1 :], rtol=1e-4, atol=1e-5)
+
+
+def test_fixed_stage_gate_scales_the_inactive_groups_from_the_pointer():
+    torch.manual_seed(0)
+    plain, fixed = _gated(0.0), _gated(0.0, module_stage_gate=0.06)
+    fixed.load_state_dict(plain.state_dict())
+    for stage in (0, 1):
+        arrays = _with_heads(_module_arrays(0))
+        arrays["glow_ints"][:, _mi.INT_STAGE] = stage
+        a, b = _prefix_tokens(fixed, arrays), _prefix_tokens(plain, arrays)
+        slots = len(_enc.SPATIAL_SLOTS)
+        ints = arrays["glow_ints"]
+        for i in range(B):
+            for group in range(K):
+                factor = 1.0 if ints[i, _mi.INT_SPATIAL_SLOT][group] == stage else 0.06
+                at = group * slots
+                torch.testing.assert_close(a[i, at : at + slots], factor * b[i, at : at + slots], rtol=1e-4, atol=1e-5)
+        # The summary and the Temporal tokens are not scaled.
+        torch.testing.assert_close(a[:, _enc.SPATIAL_TOKENS - 1 :], b[:, _enc.SPATIAL_TOKENS - 1 :], rtol=1e-4, atol=1e-5)
+
+
+def test_fixed_stage_gate_options():
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match="module_stage_gate"):
+            _model_with(module_stage_gate=bad)
+    with pytest.raises(ValueError, match="module_stage_gate"):
+        _model_with(module_stage_gate=0.06, module_spatial=False)
+    with pytest.raises(ValueError, match="module_stage_gate"):
+        _gated(module_stage_gate=0.06)
+    # No new parameters: the row loads a plain row's weights.
+    assert set(_gated(0.0, module_stage_gate=0.06).state_dict()) == set(_gated(0.0).state_dict())
+
+
+def test_masked_temporal_tokens_are_padding():
+    torch.manual_seed(0)
+    plain, masked = _gated(0.0), _gated(0.0, module_temporal_masked=True)
+    masked.load_state_dict(plain.state_dict())
+    arrays = _with_heads(_module_arrays(0))
+    obs = _obs(0, arrays)
+    own, hidden = plain.module_token_mask(obs), masked.module_token_mask(obs)
+    assert own[:, -_enc.TEMPORAL_TOKENS :].all() and not hidden[:, -_enc.TEMPORAL_TOKENS :].any()
+    assert hidden[:, : _enc.SPATIAL_TOKENS].equal(own[:, : _enc.SPATIAL_TOKENS])
+    with pytest.raises(ValueError, match="module_temporal_masked"):
+        _model_with(module_temporal_masked=True, module_temporal=False)
+
+
+def test_load_spatial_encoder_replaces_only_the_spatial_encoder(tmp_path):
+    torch.manual_seed(0)
+    row, donor = _gated(0.0), _gated(0.25)
+    donor.load_state_dict(row.state_dict(), strict=False)
+    torch.nn.init.normal_(donor.glow_spatial_encoder.out[1].weight, std=0.5)
+    safetensors.torch.save_model(donor, str(tmp_path / "model.safetensors"))
+    before = {k: v.clone() for k, v in row.state_dict().items() if not k.startswith("glow_spatial_encoder.")}
+
+    count = row.load_spatial_encoder(str(tmp_path))
+
+    assert count == len(donor.glow_spatial_encoder.state_dict())
+    for k, v in donor.glow_spatial_encoder.state_dict().items():
+        assert row.glow_spatial_encoder.state_dict()[k].equal(v), k
+    for k, v in before.items():
+        assert row.state_dict()[k].equal(v), k
+    # A checkpoint without the encoder is refused.
+    safetensors.torch.save_file({"other": torch.zeros(1)}, str(tmp_path / "model.safetensors"))
+    with pytest.raises(RuntimeError, match="Missing key"):
+        row.load_spatial_encoder(str(tmp_path))
 
 
 def test_gate_follows_the_pointer_and_leaves_the_spatial_encoder_alone():

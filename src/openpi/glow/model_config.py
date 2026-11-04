@@ -65,6 +65,11 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # Above 0: the Temporal encoder scales each Spatial group in the prefix, starting at 1 for the
     # active stage and at this for the others (module_encoders.TemporalEncoder).
     module_temporal_gate: float = 0.0
+    # Above 0: each Spatial group enters the prefix at a constant, the active stage's at 1 and the
+    # others' at this; the stage pointer alone decides which. Excludes module_temporal_gate.
+    module_stage_gate: float = 0.0
+    # The Temporal tokens are masked out of the prefix, like padding.
+    module_temporal_masked: bool = False
     # The Temporal encoder reads only the active stage's runtime key, nothing else of the plan
     # (module_encoders.TemporalEncoder); excludes the stage clock and the gate.
     module_temporal_key_only: bool = False

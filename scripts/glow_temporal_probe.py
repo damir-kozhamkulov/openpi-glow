@@ -20,6 +20,8 @@ the other task B, pooled over samples:
             temporal_off_ba  order_ba with the Temporal tokens masked out of the prefix
             gate_off_ab      order_ab with every stage's gate at 1 (a gated row only)
             gate_off_ba      order_ba with every stage's gate at 1 (a gated row only)
+            tokens_off_ab    order_ab with the Temporal tokens masked, the gates kept (a gated row only)
+            tokens_off_ba    order_ba with the Temporal tokens masked, the gates kept (a gated row only)
           temporal_off also sets a gated row's gates to 1, so it removes Temporal altogether. Also
           how far the Spatial tokens move between the two orders (0 for a "sorted" row: its order
           can only come through Temporal) and, for a gated row, the smaller group's mean gate.
@@ -38,6 +40,12 @@ the other task B, pooled over samples:
             v2s               the active stage's group first, then the other's (v2s's layout)
             active_only       the active stage's group alone
 
+`--spatial-from name=weights_dir` gives row `name` the Spatial encoder saved in another checkpoint,
+every parameter of it, and keeps everything else from the row's own: encoders from two checkpoints in
+one model, forward only, with no training. `--fixed-gate name=value` scales row `name`'s Spatial groups
+by a constant instead of a learned gate: the active stage's group at 1, every other stage's at `value`.
+A one-stage plan is unchanged. Nothing else reads the active stage, so it counts as a gated row above.
+
 Samples are held-out demos of the Goal tasks: "start" frames (below --start-window), where the scene
 is valid for any Goal task, with a pair drawn from EVAL_PAIRS; "mid" frames (up to --mid-window),
 with a pair holding the demo's own task as A, so only variants with A active mean anything there.
@@ -51,6 +59,7 @@ are touched, no dataset-wide Arrow cache is built.
       --dataset-root <lerobot repo dir> --exclude-episodes 379:427 --out temporal_probe.json
 """
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -90,6 +99,8 @@ ROW_VARIANTS = {
     "temporal_off_ba": ("BA", 0, "temporal"),
     "gate_off_ab": ("AB", 0, "gate"),
     "gate_off_ba": ("BA", 0, "gate"),
+    "tokens_off_ab": ("AB", 0, "tokens"),
+    "tokens_off_ba": ("BA", 0, "tokens"),
 }
 LAYOUTS = (
     "set",
@@ -116,6 +127,10 @@ class Args:
     dataset_root: str
     # Trained checkpoints, name=config:weights_dir (the directory holding model.safetensors).
     rows: tuple[str, ...] = ()
+    # Rows that take their Spatial encoder from another checkpoint, name=weights_dir.
+    spatial_from: tuple[str, ...] = ()
+    # Rows whose inactive stages' Spatial groups enter at a constant, name=value.
+    fixed_gate: tuple[str, ...] = ()
     # The fine-tuning init (no encoders) for the layout grid; None skips the grid.
     grid_weights: str | None = None
     # The config whose data pipeline renders the samples, and whose model the grid uses.
@@ -142,6 +157,66 @@ def parse_row(row: str) -> tuple[str, str, str]:
     if not (name and config and weights):
         raise ValueError(f"a row is name=config:weights_dir, got {row!r}")
     return name, config, weights
+
+
+def parse_spatial_from(spatial_from, rows) -> dict[str, str]:
+    """name=weights_dir items -> {row name: weights_dir}; `rows` are parse_row's."""
+    names = {name for name, _, _ in rows}
+    out = {}
+    for item in spatial_from:
+        name, _, weights = item.partition("=")
+        if not (name and weights):
+            raise ValueError(f"a spatial-from is name=weights_dir, got {item!r}")
+        if name not in names:
+            raise ValueError(f"spatial-from {item!r} names no row; the rows are {sorted(names)}")
+        out[name] = weights
+    return out
+
+
+def parse_fixed_gate(fixed_gate, rows) -> dict[str, float]:
+    """name=value items -> {row name: value in (0, 1]}; `rows` are parse_row's."""
+    names = {name for name, _, _ in rows}
+    out = {}
+    for item in fixed_gate:
+        name, _, value = item.partition("=")
+        if not (name and value):
+            raise ValueError(f"a fixed-gate is name=value, got {item!r}")
+        if name not in names:
+            raise ValueError(f"fixed-gate {item!r} names no row; the rows are {sorted(names)}")
+        if not 0.0 < float(value) <= 1.0:
+            raise ValueError(f"a fixed gate is in (0, 1], got {item!r}")
+        out[name] = float(value)
+    return out
+
+
+def set_fixed_gate(model, value: float) -> None:
+    """Makes the model enter its Spatial groups at a constant: the active stage's at 1, the others'
+    at `value`, the summary and the Temporal tokens at 1. A row with a learned gate has its own."""
+    if model.glow_temporal_encoder.gate is not None:
+        raise ValueError("a fixed gate takes a row without a learned gate")
+    model.config = dataclasses.replace(model.config, module_stage_gate=value)
+
+
+@contextlib.contextmanager
+def gates_at_one(model):
+    """Every Spatial group at full size, for a fixed gate or a learned one."""
+    import torch
+
+    from openpi.glow import module_encoders as _enc
+
+    own = model.config
+    temporal = model.glow_temporal_encoder
+    if own.module_stage_gate > 0:
+        model.config = dataclasses.replace(own, module_stage_gate=1.0)
+    else:
+        temporal.stage_gates = lambda _, ints: _enc.stage_valid(ints).to(torch.float32)
+    try:
+        yield
+    finally:
+        if own.module_stage_gate > 0:
+            model.config = own
+        else:
+            del temporal.stage_gates
 
 
 def heldout_episodes(pack, exclude, per_task: int, rng) -> dict[int, list[int]]:
@@ -279,18 +354,20 @@ def make_build_batch(module_pipeline, root: pathlib.Path, action_horizon: int, t
     return build
 
 
-def plan_stages(pack, pair: tuple[str, str], plan: str) -> tuple:
-    """The stages of `plan` ("AB", "BA" or "A") for the (A, B) task strings."""
+def plan_stages(pack, pair: tuple[str, str], plan: str, then: str | None = None) -> tuple:
+    """The stages of `plan` ("AB", "BA" or "A") for the (A, B) task strings, then task `then`'s."""
     by_name = {"A": pack.task(pair[0]).stages[0], "B": pack.task(pair[1]).stages[0]}
-    return tuple(by_name[c] for c in plan)
+    stages = tuple(by_name[c] for c in plan)
+    return stages if then is None else (*stages, pack.task(then).stages[0])
 
 
-def module_arrays(module, samples, plan: str, pointer: int, device):
-    """The module arrays of one plan for every sample, stacked, as a namespace `module_tokens` reads."""
+def module_arrays(module, samples, plan: str, pointer: int, device, then: str | None = None):
+    """The module arrays of one plan (plan_stages') for every sample, stacked, as a namespace
+    `module_tokens` reads."""
     import torch
 
     arrays = [
-        module.encode_stages(plan_stages(module.pack, s["pair"], plan), pointer, stage_frames=s["frame"])
+        module.encode_stages(plan_stages(module.pack, s["pair"], plan, then), pointer, stage_frames=s["frame"])
         for s in samples
     ]
     return types.SimpleNamespace(
@@ -464,7 +541,7 @@ def run_row(name, model, module, store, args, device, *, grid: bool) -> dict:
     acc = Accumulator()
     moved, smaller_gate = [], []
     temporal = getattr(model, "glow_temporal_encoder", None)
-    gated = temporal is not None and temporal.gate is not None
+    gated = temporal is not None and (temporal.gate is not None or model.config.module_stage_gate > 0)
     t0, forwards = time.monotonic(), 0
     for b in range(store.num_batches):
         item = store.get(b)
@@ -501,7 +578,7 @@ def run_row(name, model, module, store, args, device, *, grid: bool) -> dict:
                 embed = model.paligemma_with_expert.embed_language_tokens
                 spatial = []
                 for variant, (plan, pointer, off) in ROW_VARIANTS.items():
-                    if off == "gate" and not gated:
+                    if off in ("gate", "tokens") and not gated:
                         continue
                     arrays = module_arrays(module, samples, plan, pointer, device)
                     if variant in ("order_ab", "order_ba"):
@@ -510,18 +587,16 @@ def run_row(name, model, module, store, args, device, *, grid: bool) -> dict:
                                 embed, arrays.glow_text, arrays.glow_text_mask, arrays.glow_ints, arrays.glow_floats.float()
                             )
                         )
-                    if off and gated:
-                        temporal.stage_gates = lambda _, ints: _enc.stage_valid(ints).to(torch.float32)
-                    if off == "temporal":
+                    if off in ("temporal", "tokens"):
                         own_mask = model.module_token_mask
                         keep = torch.ones_like(own_mask(arrays))
                         keep[:, -_enc.TEMPORAL_TOKENS :] = False
                         model.module_token_mask = lambda o, own_mask=own_mask, keep=keep: own_mask(o) & keep
-                    prefix = model.embed_observation_prefix(arrays, images, img_masks, lang_tokens, lang_masks)
-                    if off == "temporal":
+                    full_size = off in ("temporal", "gate") and gated
+                    with gates_at_one(model) if full_size else contextlib.nullcontext():
+                        prefix = model.embed_observation_prefix(arrays, images, img_masks, lang_tokens, lang_masks)
+                    if off in ("temporal", "tokens"):
                         del model.module_token_mask
-                    if off and gated:
-                        del temporal.stage_gates
                     if gated and variant == "order_ab":
                         gates = model.module_tokens_and_gates(arrays)[1]
                         smaller_gate.append(float(gates[:, [0, len(_enc.SPATIAL_SLOTS)]].min(dim=1).values.mean()))
@@ -563,10 +638,12 @@ def run_row(name, model, module, store, args, device, *, grid: bool) -> dict:
     result["temporal_off"] = acc.stats(("temporal_off_ab", "temporal_off_ba"), rng)
     if gated:
         result["gate_off"] = acc.stats(("gate_off_ab", "gate_off_ba"), rng)
+        result["tokens_off"] = acc.stats(("tokens_off_ab", "tokens_off_ba"), rng)
         result["smaller_group_gate_mean"] = float(np.mean(smaller_gate))
         logging.info(
             f"GATE {name}: gates at 1 margin {result['gate_off']['margin']:+.3f} +- "
-            f"{result['gate_off']['margin_se']:.3f}; smaller group's mean gate {result['smaller_group_gate_mean']:.3f}"
+            f"{result['gate_off']['margin_se']:.3f}; Temporal tokens masked {result['tokens_off']['margin']:+.3f} +- "
+            f"{result['tokens_off']['margin_se']:.3f}; smaller group's mean gate {result['smaller_group_gate_mean']:.3f}"
         )
     logging.info(f"ORDER {name}: Spatial tokens move at most {max(moved):.3e} between the two orders")
     logging.info(
@@ -599,38 +676,31 @@ def release(model, device) -> None:
         logging.info(f"released a model: {torch.cuda.memory_allocated(device) / 2**30:.2f} GiB still allocated")
 
 
-def main(args: Args) -> dict:
-    import torch
-
-    from openpi import transforms as _transforms
+def data_config(config_name: str, norm_stats_dir: str, repo_id: str):
+    """(train config, data config, its GlowModuleInputs, its model input transforms), with the plans
+    left to the probe: no chain or counterfactual plan in the rendering."""
     from openpi.glow import module_inputs as _mi
     from openpi.training import config as _config
-    from openpi.training import data_loader as _data_loader
 
-    if not args.rows and args.grid_weights is None:
-        raise ValueError("nothing to do: give --rows and/or --grid-weights")
-    rows = [parse_row(r) for r in args.rows]
-    device = torch.device(args.device)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    assets = _config.AssetsConfig(assets_dir=args.norm_stats_dir, asset_id=args.repo_id)
+    cfg = _config.get_config(config_name)
+    assets = _config.AssetsConfig(assets_dir=norm_stats_dir, asset_id=repo_id)
+    dc = dataclasses.replace(cfg.data, assets=assets).create(cfg.assets_dirs, cfg.model)
+    if dc.norm_stats is None:
+        raise ValueError(f"no norm_stats under {norm_stats_dir}/{repo_id}")
+    inputs = list(dc.model_transforms.inputs)
+    at = [i for i, t in enumerate(inputs) if isinstance(t, _mi.GlowModuleInputs)]
+    if len(at) != 1:
+        raise ValueError(f"expected one GlowModuleInputs in {config_name}'s model transforms, got {len(at)}")
+    module = dataclasses.replace(inputs[at[0]], chain_p=0.0, chain_tasks=(), counterfactual_p=0.0)
+    inputs[at[0]] = module
+    return cfg, dc, module, inputs
 
-    def data_config(config_name):
-        cfg = _config.get_config(config_name)
-        dc = dataclasses.replace(cfg.data, assets=assets).create(cfg.assets_dirs, cfg.model)
-        if dc.norm_stats is None:
-            raise ValueError(f"no norm_stats under {args.norm_stats_dir}/{args.repo_id}")
-        inputs = list(dc.model_transforms.inputs)
-        at = [i for i, t in enumerate(inputs) if isinstance(t, _mi.GlowModuleInputs)]
-        if len(at) != 1:
-            raise ValueError(f"expected one GlowModuleInputs in {config_name}'s model transforms, got {len(at)}")
-        # The probe builds its plans itself: no chain or counterfactual plan in the rendering.
-        module = dataclasses.replace(inputs[at[0]], chain_p=0.0, chain_tasks=(), counterfactual_p=0.0)
-        inputs[at[0]] = module
-        return cfg, dc, module, inputs
 
-    cfg, dc, module, inputs = data_config(args.config)
-    pipeline = _transforms.compose(
+def render_pipeline(dc, inputs):
+    """A raw frame -> the sample the model takes, without image augmentation."""
+    from openpi import transforms as _transforms
+
+    return _transforms.compose(
         [
             *dc.repack_transforms.inputs,
             *dc.data_transforms.inputs,
@@ -638,6 +708,56 @@ def main(args: Args) -> dict:
             *inputs,
         ]
     )
+
+
+def load_spatial(model, weights: str) -> None:
+    """Replaces the model's whole Spatial encoder with the one saved in `weights`; a missing or
+    mismatched parameter raises."""
+    logging.info(f"Spatial encoder from {weights}: {model.load_spatial_encoder(weights)} tensors")
+
+
+def load_model(
+    config_name: str,
+    weights: str,
+    args,
+    device,
+    *,
+    init: bool,
+    spatial_weights: str | None = None,
+    fixed_gate: float | None = None,
+):
+    from openpi.training import config as _config
+
+    ns = types.SimpleNamespace(
+        weights_dir=weights, precision=args.precision, init=init, init_seed=args.seed, config=config_name
+    )
+    # Built on the device: on the host, creating a model peaks above 14 GiB of RSS against ~3 GiB
+    # while the probe runs.
+    with device:
+        model = _diag.load_model(_config.get_config(config_name), ns, device)
+    if spatial_weights is not None:
+        load_spatial(model, spatial_weights)
+    if fixed_gate is not None:
+        set_fixed_gate(model, fixed_gate)
+    return model
+
+
+def main(args: Args) -> dict:
+    import torch
+
+    from openpi.training import data_loader as _data_loader
+
+    if not args.rows and args.grid_weights is None:
+        raise ValueError("nothing to do: give --rows and/or --grid-weights")
+    rows = [parse_row(r) for r in args.rows]
+    spatial_from = parse_spatial_from(args.spatial_from, rows)
+    fixed_gate = parse_fixed_gate(args.fixed_gate, rows)
+    device = torch.device(args.device)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    cfg, dc, module, inputs = data_config(args.config, args.norm_stats_dir, args.repo_id)
+    pipeline = render_pipeline(dc, inputs)
     rng = np.random.default_rng(args.seed)
     exclude = _data_loader.resolve_train_episodes(args.exclude_episodes) if args.exclude_episodes else []
     heldout = heldout_episodes(module.pack, exclude, args.episodes_per_task, rng)
@@ -665,25 +785,24 @@ def main(args: Args) -> dict:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(result, indent=1), encoding="utf-8")
 
-    def load(config_name, weights, init):
-        ns = types.SimpleNamespace(
-            weights_dir=weights, precision=args.precision, init=init, init_seed=args.seed, config=config_name
-        )
-        # Built on the device: on the host, creating a model peaks above 14 GiB of RSS against ~3 GiB
-        # while the probe runs.
-        with device:
-            return _diag.load_model(_config.get_config(config_name), ns, device)
-
     for name, config_name, weights in rows:
-        model = load(config_name, weights, False)
-        _, _, row_module, _ = data_config(config_name)
+        model = load_model(
+            config_name,
+            weights,
+            args,
+            device,
+            init=False,
+            spatial_weights=spatial_from.get(name),
+            fixed_gate=fixed_gate.get(name),
+        )
+        _, _, row_module, _ = data_config(config_name, args.norm_stats_dir, args.repo_id)
         logging.info(f"{name}: {config_name} from {weights}, Spatial order {row_module.stage_order}")
         result["rows"][name] = run_row(name, model, row_module, store, args, device, grid=False)
         write()
         release(model, device)
         del model
     if args.grid_weights is not None:
-        model = load(args.config, args.grid_weights, True)
+        model = load_model(args.config, args.grid_weights, args, device, init=True)
         if module.stage_order != "sorted":
             raise ValueError(f"the grid reads sorted arrays; {args.config} has order {module.stage_order!r}")
         result["grid"] = run_row("grid", model, module, store, args, device, grid=True)

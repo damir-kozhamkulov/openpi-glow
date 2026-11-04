@@ -238,8 +238,8 @@ def test_main_rows_and_grid(monkeypatch, tmp_path):
     assert v["spatial_tokens_moved_between_orders_max"] > 1e-3
     assert t["plan_first"]["samples"] == 16 and set(t["variants"]) == {"start", "mid"}
     for variant, (_, _, off) in gtp.ROW_VARIANTS.items():
-        assert t["variants"]["start"][variant].get("samples", 0) == (0 if off == "gate" else 8)
-        assert t["variants"]["mid"][variant].get("samples", 0) == (0 if off == "gate" else 4)
+        assert t["variants"]["start"][variant].get("samples", 0) == (0 if off in ("gate", "tokens") else 8)
+        assert t["variants"]["mid"][variant].get("samples", 0) == (0 if off in ("gate", "tokens") else 4)
     # With Temporal masked a sorted row's two orders are one prefix, so the margins are opposite.
     off = t["variants"]["start"]
     assert off["temporal_off_ab"]["margin"] == pytest.approx(-off["temporal_off_ba"]["margin"], abs=1e-5)
@@ -282,5 +282,41 @@ def test_main_gated_row(monkeypatch, tmp_path):
     # With Temporal off altogether the two orders are one prefix again.
     assert s["temporal_off"]["margin"] == pytest.approx(0.0, abs=1e-5)
     assert s["gate_off"]["samples"] == 16
+    assert s["tokens_off"]["samples"] == 16
     # The gate does something on its own.
     assert s["plan_first"]["margin"] != pytest.approx(s["gate_off"]["margin"], abs=1e-4)
+
+
+@needs_data
+def test_main_fixed_gate_row(monkeypatch, tmp_path):
+    import safetensors.torch
+    import torch
+
+    get_config = _diag_test._dummy_configs(monkeypatch)  # noqa: SLF001
+    torch.manual_seed(0)
+    model = get_config("pi05_libero_glow_v2t_key").model.create_pytorch()
+    for name, p in model.named_parameters():
+        if name.endswith("out.1.weight"):
+            torch.nn.init.normal_(p, std=0.02)
+    safetensors.torch.save_model(model, str(tmp_path / "model.safetensors"))
+    rows = (f"plain=pi05_libero_glow_v2t_key:{tmp_path}", f"fixed=pi05_libero_glow_v2t_key:{tmp_path}")
+    s = gtp.main(
+        gtp.Args(
+            norm_stats_dir=str(ASSETS),
+            dataset_root=str(DATASET),
+            rows=rows,
+            fixed_gate=("fixed=0.25",),
+            exclude_episodes="379:427",
+            episodes_per_task=1,
+            start_samples=8,
+            mid_samples=4,
+            batch_size=4,
+            device="cpu",
+        )
+    )["rows"]
+    assert s["fixed"]["smaller_group_gate_mean"] == pytest.approx(0.25)
+    # Gates at 1 are the row without the gate; masking the tokens as well removes Temporal altogether.
+    assert s["fixed"]["gate_off"]["margin"] == pytest.approx(s["plain"]["plan_first"]["margin"], abs=1e-6)
+    assert s["fixed"]["temporal_off"]["margin"] == pytest.approx(s["plain"]["temporal_off"]["margin"], abs=1e-6)
+    assert s["fixed"]["plan_first"]["margin"] != pytest.approx(s["plain"]["plan_first"]["margin"], abs=1e-4)
+    assert "tokens_off" in s["fixed"] and "tokens_off" not in s["plain"]

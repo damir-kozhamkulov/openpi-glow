@@ -28,6 +28,8 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Another checkpoint directory to take the GLOW Spatial encoder from.
+    spatial_from: str | None = None
 
 
 @dataclasses.dataclass
@@ -90,7 +92,10 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                spatial_from=args.policy.spatial_from,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

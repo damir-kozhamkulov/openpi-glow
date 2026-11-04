@@ -195,6 +195,12 @@ def spatial_token_mask(ints: torch.Tensor) -> torch.Tensor:
     return torch.cat([valid, valid.new_ones(valid.shape[0], 1)], dim=-1)
 
 
+def fixed_stage_gates(ints: torch.Tensor, value: float) -> torch.Tensor:
+    """[B, K_MAX]: the active stage's gate is 1, the other stages' `value`, 0 past the plan."""
+    active = torch.arange(_mi.K_MAX, device=ints.device) == ints[..., _mi.INT_STAGE, None].long()
+    return torch.where(active, 1.0, value) * stage_valid(ints)
+
+
 def spatial_token_gates(stage_gates: torch.Tensor, ints: torch.Tensor) -> torch.Tensor:
     """[B, SPATIAL_TOKENS]: each Spatial token's gate from the stages' [B, K_MAX]; the summary is 1."""
     groups = _gather_groups(stage_gates, ints[..., _mi.INT_SPATIAL_SLOT].long())

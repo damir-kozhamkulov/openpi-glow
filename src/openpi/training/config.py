@@ -1220,7 +1220,10 @@ _CONFIGS = [
     # comes first; _v2s is the v2 inputs (the remaining plan, active stage first) on the same
     # recipe; _v2t_gate is _v2t with the Temporal encoder also scaling the Spatial groups, the
     # other stages' starting at a quarter of the active stage's; _v2t_key is _v2t with the Temporal
-    # encoder reading only the active stage's runtime key, so no stage clock.
+    # encoder reading only the active stage's runtime key, so no stage clock; _v2t_fixed is _v2t_key
+    # with the other stages' Spatial groups at a constant set by the stage pointer, _v2t_fixed_masked
+    # the same without the Temporal tokens in the prefix. Both serve _v2t_key's weights with _v2t_gate's
+    # Spatial encoder (serve_policy's --policy.spatial-from).
     *(
         _glow_module_train_config(
             name,
@@ -1260,6 +1263,23 @@ _CONFIGS = [
                 "sorted",
                 False,
                 {"module_ctx_active": False, "module_temporal_key_only": True},
+            ),
+            (
+                "pi05_libero_glow_v2t_fixed",
+                "sorted",
+                False,
+                {"module_ctx_active": False, "module_temporal_key_only": True, "module_stage_gate": 0.06},
+            ),
+            (
+                "pi05_libero_glow_v2t_fixed_masked",
+                "sorted",
+                False,
+                {
+                    "module_ctx_active": False,
+                    "module_temporal_key_only": True,
+                    "module_stage_gate": 0.06,
+                    "module_temporal_masked": True,
+                },
             ),
             ("pi05_libero_glow_v2s", "remaining", True, {}),
         )

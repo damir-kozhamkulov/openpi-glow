@@ -859,6 +859,13 @@ def test_ordering_configs(monkeypatch):
     )
     assert key.data == dataclasses.replace(v2t.data, module_stage_clock=False)
     assert key.lr_schedule == v2t.lr_schedule
+    # The fixed rows are the key row plus the constant turn-down, and without the Temporal tokens.
+    fixed = _config.get_config("pi05_libero_glow_v2t_fixed")
+    assert fixed.model == dataclasses.replace(key.model, module_stage_gate=0.06)
+    assert fixed.data == key.data
+    masked = _config.get_config("pi05_libero_glow_v2t_fixed_masked")
+    assert masked.model == dataclasses.replace(fixed.model, module_temporal_masked=True)
+    assert masked.data == key.data
     assert v2s.data == dataclasses.replace(
         v2.data,
         module_counterfactual_p=0.5,

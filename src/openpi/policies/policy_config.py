@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    spatial_from: str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +38,7 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        spatial_from: Another PyTorch checkpoint directory to take the GLOW Spatial encoder from.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -50,8 +52,12 @@ def create_trained_policy(
     is_pytorch = os.path.exists(weight_path)
 
     logging.info("Loading model...")
+    if spatial_from is not None and not is_pytorch:
+        raise ValueError("spatial_from needs a PyTorch checkpoint")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
+        if spatial_from is not None:
+            logging.info(f"Spatial encoder from {spatial_from}: {model.load_spatial_encoder(spatial_from)} tensors")
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))

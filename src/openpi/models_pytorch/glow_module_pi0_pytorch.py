@@ -16,7 +16,8 @@ newline answer token), or the mean RMS of the sample's own module-text tokens as
 language ("words", the size of an ordinary word token). The size matters beyond the first layer:
 a token keeps its input norm in the residual stream. With `config.module_temporal_gate` the Temporal
 encoder then scales each Spatial group (module_encoders), so order reaches the prefix as which
-stage's words are loud.
+stage's words are loud; `config.module_stage_gate` scales them by constants instead, from the stage
+pointer alone. `config.module_temporal_masked` masks the Temporal tokens like padding.
 
 The encoders are new parameters: the fine-tuning init (pi05_libero) has none of them, so the
 trainer loads it non-strictly for exactly the names under NEW_PARAM_PREFIXES, and trains them at
@@ -32,7 +33,9 @@ weighted mean of the per-sample flow losses; distillation always covers the whol
 """
 
 import math
+import pathlib
 
+import safetensors
 import torch
 import torch.nn.functional as F  # noqa: N812
 
@@ -53,6 +56,12 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
             raise ValueError("GlowModulePI0Pytorch needs the spatial or the temporal encoder")
         if config.module_temporal_gate > 0 and not (config.module_spatial and config.module_temporal):
             raise ValueError("module_temporal_gate needs the spatial and the temporal encoder")
+        if not 0 <= config.module_stage_gate <= 1:
+            raise ValueError(f"module_stage_gate must be in [0, 1], got {config.module_stage_gate}")
+        if config.module_stage_gate > 0 and (config.module_temporal_gate > 0 or not config.module_spatial):
+            raise ValueError("module_stage_gate needs the spatial encoder and excludes module_temporal_gate")
+        if config.module_temporal_masked and not config.module_temporal:
+            raise ValueError("module_temporal_masked needs the temporal encoder")
         if config.module_token_scale not in MODULE_TOKEN_SCALES:
             raise ValueError(
                 f"module_token_scale must be one of {MODULE_TOKEN_SCALES}, got {config.module_token_scale!r}"
@@ -92,6 +101,15 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
             else None
         )
 
+    def load_spatial_encoder(self, weights: str) -> int:
+        """Replaces the whole Spatial encoder with the one in the checkpoint directory `weights`,
+        reading only its tensors; a missing or mismatched parameter raises. Returns their number."""
+        prefix = "glow_spatial_encoder."
+        with safetensors.safe_open(str(pathlib.Path(weights) / "model.safetensors"), framework="pt") as f:
+            state = {k[len(prefix) :]: f.get_tensor(k) for k in f.keys() if k.startswith(prefix)}  # noqa: SIM118
+        self.glow_spatial_encoder.load_state_dict(state)
+        return len(state)
+
     def module_tokens(self, observation) -> torch.Tensor:
         """The encoders' tokens [B, N, width], before rescaling and gating."""
         return self.module_tokens_and_gates(observation)[0]
@@ -106,15 +124,19 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
             )
         text, text_mask, ints, floats = fields
         embed = self.paligemma_with_expert.embed_language_tokens
-        tokens, gates = [], None
+        tokens, stage_gates = [], None
         if self.glow_spatial_encoder is not None:
             tokens.append(self.glow_spatial_encoder(embed, text, text_mask, ints, floats.to(torch.float32)))
         if self.glow_temporal_encoder is not None:
             temporal, stage_gates = self.glow_temporal_encoder(embed, text, text_mask, ints)
             tokens.append(temporal)
-            if stage_gates is not None:
-                gates = torch.cat([_enc.spatial_token_gates(stage_gates, ints), temporal.new_ones(temporal.shape[:2])], 1)
-        return torch.cat(tokens, dim=1), gates
+        module = torch.cat(tokens, dim=1)
+        if self.config.module_stage_gate > 0:
+            stage_gates = _enc.fixed_stage_gates(ints, self.config.module_stage_gate).to(module.dtype)
+        if stage_gates is None:
+            return module, None
+        spatial = _enc.spatial_token_gates(stage_gates, ints)
+        return module, torch.cat([spatial, spatial.new_ones(spatial.shape[0], module.shape[1] - spatial.shape[1])], 1)
 
     def module_token_mask(self, observation) -> torch.Tensor:
         """[B, N] which of `module_tokens` are real: the Spatial groups past the shown ones are
@@ -126,7 +148,8 @@ class GlowModulePI0Pytorch(pi0_pytorch.PI0Pytorch):
         if self.glow_spatial_encoder is not None:
             masks.append(_enc.spatial_token_mask(ints))
         if self.glow_temporal_encoder is not None:
-            masks.append(torch.ones(ints.shape[0], _enc.TEMPORAL_TOKENS, dtype=torch.bool, device=ints.device))
+            shown = not self.config.module_temporal_masked
+            masks.append(torch.full((ints.shape[0], _enc.TEMPORAL_TOKENS), shown, dtype=torch.bool, device=ints.device))
         return torch.cat(masks, dim=1)
 
     def forward(self, observation, actions, noise=None, time=None):
