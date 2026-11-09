@@ -55,6 +55,11 @@ gates apply after the caller's rescale, which would otherwise undo them.
 
 A missing piece (no target, a text switched off) anchors to zero: a zero token, which the
 backbone's attention gives a zero value.
+
+ProgressMonitor checks the plan against the cameras: per stage, has its runtime key been reached
+(a done logit)? `soft_active` turns the done probabilities into the active stage (the first stage
+in execution order not done) and `soft_stage_gates` into Spatial group gates, the soft form of
+`fixed_stage_gates`, so the stage can come from the model instead of from INT_STAGE.
 """
 
 import math
@@ -199,6 +204,100 @@ def fixed_stage_gates(ints: torch.Tensor, value: float) -> torch.Tensor:
     """[B, K_MAX]: the active stage's gate is 1, the other stages' `value`, 0 past the plan."""
     active = torch.arange(_mi.K_MAX, device=ints.device) == ints[..., _mi.INT_STAGE, None].long()
     return torch.where(active, 1.0, value) * stage_valid(ints)
+
+
+def soft_active(done: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """[B, K_MAX]: the active stage as a distribution, from each stage's done probability [B, K_MAX]
+    in execution order: a_j = (1 - d_j) * prod_{i<j} d_i, the last valid stage also taking
+    prod_i d_i (a finished plan keeps its last stage active); 0 past the plan. At saturated d it is
+    the one-hot of the first stage not done."""
+    d = torch.where(valid, done, torch.ones_like(done))
+    before = torch.cumprod(torch.cat([torch.ones_like(d[..., :1]), d[..., :-1]], dim=-1), dim=-1)
+    active = (1.0 - d) * before * valid.to(d.dtype)
+    last = valid.long().sum(dim=-1) - 1
+    finished = d.prod(dim=-1)
+    return active + finished[..., None] * torch.nn.functional.one_hot(last, _mi.K_MAX).to(d.dtype)
+
+
+def soft_stage_gates(active: torch.Tensor, valid: torch.Tensor, value: float) -> torch.Tensor:
+    """[B, K_MAX]: `fixed_stage_gates` with the one-hot active stage replaced by `active`
+    (soft_active's): a_j + (1 - a_j) * value, 0 past the plan."""
+    return (active + (1.0 - active) * value) * valid.to(active.dtype)
+
+
+MONITOR_KEY_FIELDS = ("key_predicate", "key_object")
+
+
+def monitor_key_inputs(embed, text, text_mask, ints) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ProgressMonitor's plan inputs from module arrays: every stage's pooled runtime key [B, K_MAX, D],
+    its MONITOR_KEY_FIELDS head words [B, K_MAX, 2, D] (zero where none), and which stages are in
+    the plan [B, K_MAX]. All in execution order."""
+    keys, _ = _per_stage(embed(text).to(torch.float32), text_mask, "rk")
+    fields = [_mi.HEAD_FIELDS.index(f) for f in MONITOR_KEY_FIELDS]
+    return keys, head_embeddings(embed, ints)[:, :, fields], stage_valid(ints)
+
+
+class ProgressMonitor(nn.Module):
+    """Has each stage's runtime key been reached? One query per stage, built from its key (pooled text
+    + head words) and its position in execution order, cross-attends the camera tokens and the other
+    stages' queries; out comes a done logit per stage [B, K_MAX], -inf past the plan.
+
+    `keys=False` drops the key text from the queries (position and stage count only): the baseline
+    that can only tell how far along a plan is, not which key holds.
+
+    Images are [B, C, T, D_image] (C cameras of T tokens each) with `image_mask` [B, C] for the
+    cameras that exist; each camera gets a learned embedding."""
+
+    def __init__(
+        self,
+        text_width: int,
+        image_width: int,
+        width: int = 512,
+        depth: int = 2,
+        *,
+        keys: bool = True,
+        heads: int = 8,
+        cameras: int = 3,
+    ):
+        super().__init__()
+        self.keys = keys
+        key_width = text_width * (1 + len(MONITOR_KEY_FIELDS))
+        self.key_proj = nn.Sequential(nn.LayerNorm(key_width), nn.Linear(key_width, width)) if keys else None
+        self.position = nn.Embedding(_mi.K_MAX, width)
+        self.num_stages = nn.Embedding(_mi.K_MAX + 1, width)
+        self.image_proj = nn.Sequential(nn.LayerNorm(image_width), nn.Linear(image_width, width))
+        self.camera = nn.Embedding(cameras, width)
+        layer = nn.TransformerDecoderLayer(
+            width, nhead=heads, dim_feedforward=4 * width, dropout=0.0, activation="gelu", batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(layer, depth)
+        self.head = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 1))
+
+    def forward(
+        self,
+        keys: torch.Tensor,
+        key_heads: torch.Tensor,
+        valid: torch.Tensor,
+        images: torch.Tensor,
+        image_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, c, t, _ = images.shape
+        j = torch.arange(_mi.K_MAX, device=valid.device)
+        queries = self.position(j)[None] + self.num_stages(valid.long().sum(-1))[:, None]
+        if self.key_proj is not None:
+            text = torch.cat([keys, key_heads.flatten(-2)], dim=-1).to(queries.dtype)
+            queries = queries + self.key_proj(text)
+        memory = self.image_proj(images.to(queries.dtype)) + self.camera(torch.arange(c, device=images.device))[:, None]
+        memory_pad = ~image_mask[..., None].expand(b, c, t).reshape(b, c * t)
+        out = self.decoder(
+            queries,
+            memory.reshape(b, c * t, -1),
+            tgt_key_padding_mask=~valid,
+            memory_key_padding_mask=memory_pad,
+        )
+        logits = self.head(out)[..., 0]
+        return logits.masked_fill(~valid, -math.inf)
 
 
 def spatial_token_gates(stage_gates: torch.Tensor, ints: torch.Tensor) -> torch.Tensor:
