@@ -242,6 +242,11 @@ class PI0Pytorch(nn.Module):
         """
         return self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
 
+    def sample_prefix(self, observation, images, img_masks, lang_tokens, lang_masks):
+        """`embed_observation_prefix` for sample_actions, plus a dict of extra outputs (batched
+        tensors) that sample_actions returns next to the actions; stock: none."""
+        return (*self.embed_observation_prefix(observation, images, img_masks, lang_tokens, lang_masks), {})
+
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -396,7 +401,7 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_observation_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, extras = self.sample_prefix(
             observation, images, img_masks, lang_tokens, lang_masks
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -432,7 +437,9 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
-        return x_t
+        # A variant with extra outputs returns a dict, which Policy.infer passes to the output
+        # transforms; the stock model returns the bare actions.
+        return {"actions": x_t, **extras} if extras else x_t
 
     def denoise_step(
         self,

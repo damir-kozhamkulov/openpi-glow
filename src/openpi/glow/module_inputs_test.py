@@ -883,3 +883,121 @@ def test_ordering_configs(monkeypatch):
         dataclasses.replace(v2t.data, plan_pack_path=str(GOAL_PACK)).create(
             pathlib.Path("."), dataclasses.replace(v2t.model, module_distill_weight=0.0)
         )
+
+
+def _two_stage_episode(pack):
+    ep, plan = next((e, p) for e, p in sorted(pack.episodes.items()) if len(p.stage_starts) == 2)
+    return ep, plan, next(t for t in pack.tasks.values() if t.task_index == plan.task_index)
+
+
+def test_done_labels_follow_the_next_stage_start():
+    ep = _plan_pack.EpisodePlan(task_index=0, n_frames=100, stage_starts=(0, 50))
+    assert [_mi.done_labels(ep, f)[0].tolist() for f in (0, 49, 50, 99)] == [[0, 0], [0, 0], [1, 0], [1, 0]]
+    assert _mi.done_labels(ep, 84)[1].tolist() == [True, True]
+    assert _mi.done_labels(ep, 85)[1].tolist() == [True, False]
+
+
+def test_monitor_training_samples_carry_done_labels(pack, tokenizer):
+    t = _mi.GlowModuleInputs(pack, tokenizer, monitor=True)
+    ep, plan, task = _two_stage_episode(pack)
+    switch = plan.stage_starts[1]
+    for frame, done in ((0, [0, 0]), (switch, [1, 0])):
+        out = t({"prompt": task.task, "episode_index": np.int64(ep), "frame_index": np.int64(frame)})
+        assert out["glow_done"].tolist() == [*map(float, done), 0.0, 0.0]
+        assert out["glow_done_mask"].tolist() == [True, True, False, False]
+        assert bool(out["glow_stage_given"])
+        assert "glow_prev_done" not in out
+    # Without the monitor nothing is added.
+    plain = _mi.GlowModuleInputs(pack, tokenizer)({"prompt": task.task, "episode_index": np.int64(ep), "frame_index": np.int64(0)})
+    assert not {"glow_done", "glow_done_mask", "glow_stage_given"} & set(plain)
+
+
+def test_monitor_counterfactual_samples_are_not_done(pack):
+    t = _counterfactual(pack, monitor=True)
+    own = _by_index(pack, 17)
+    ep = next(e for e, p in pack.episodes.items() if p.task_index == own.task_index)
+    out = t({"prompt": own.task, "episode_index": np.int64(ep), "frame_index": np.int64(3)})
+    assert out["glow_flow_weight"] == 0.0
+    assert out["glow_done"].tolist() == [0.0] * _mi.K_MAX
+    assert out["glow_done_mask"].tolist() == [True, True, False, False]
+
+
+def test_monitor_inference_without_a_stage(pack, tokenizer):
+    t = _mi.GlowModuleInputs(pack, tokenizer, monitor=True)
+    _, _, task = _two_stage_episode(pack)
+    free = t({"prompt": task.task})
+    assert not bool(free["glow_stage_given"]) and free["glow_ints"][_mi.INT_STAGE] == 0
+    assert free["glow_prev_done"].tolist() == [0.0] * _mi.K_MAX
+    np.testing.assert_array_equal(free["glow_text"], t.encode(task.task, 0)["glow_text"])
+    latched = t({"prompt": task.task, "plan_prev_done": [1.0, 0.0]})
+    assert latched["glow_prev_done"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    oracle = t({"prompt": task.task, "oracle_plan_index": 1, "plan_prev_done": [1.0, 0.0]})
+    assert bool(oracle["glow_stage_given"]) and oracle["glow_ints"][_mi.INT_STAGE] == 1
+    chain = [_by_index(pack, 17).task, _by_index(pack, 16).task]
+    chained = t({"prompt": chain[0], "plan_chain": chain, "plan_prev_done": [0.0, 0.0]})
+    assert chained["glow_ints"][_mi.INT_NUM_STAGES] == 2 and not bool(chained["glow_stage_given"])
+    with pytest.raises(ValueError, match="plan_prev_done"):
+        t({"prompt": task.task, "plan_prev_done": [1.0]})
+    # A model without the monitor needs a stage, and ignores a latched one.
+    plain = _mi.GlowModuleInputs(pack, tokenizer)
+    with pytest.raises(ValueError, match="oracle_plan_index"):
+        plain({"prompt": task.task})
+    out = plain({"prompt": task.task, "oracle_plan_index": 0, "plan_prev_done": [1.0, 0.0]})
+    assert "glow_prev_done" not in out and "plan_prev_done" not in out
+
+
+def test_monitor_excludes_chain_augmentation(pack, tokenizer):
+    with pytest.raises(ValueError, match="chain_p must be 0"):
+        _mi.GlowModuleInputs(pack, tokenizer, monitor=True, chain_p=0.5, chain_tasks=GOAL_TASKS)
+
+
+def test_monitor_config_resolves():
+    from openpi.training import config as _config
+
+    cfg = _config.get_config("pi05_libero_glow_monitor")
+    gate = _config.get_config("pi05_libero_glow_v2t_gate")
+    assert cfg.model.module_temporal_monitor and not cfg.model.module_temporal
+    assert cfg.model.module_stage_gate == 0.06 and cfg.model.module_freeze_spatial
+    assert cfg.data.module_chain_p == 0.0
+    # The Spatial encoder is the gate row's, so the gate row's weights load into it.
+    for field in ("module_grounding", "module_subgoal_text", "module_nouns", "module_atom", "module_text_anchor",
+                  "module_anchor", "module_ctx_active", "module_width", "module_depth", "module_token_scale"):
+        assert getattr(cfg.model, field) == getattr(gate.model, field), field
+    assert cfg.data.module_stage_order == gate.data.module_stage_order
+
+
+def test_monitor_request_through_policy_transforms(monkeypatch, pack):
+    """A monitor-mode request (no stage, latched stages) through the served monitor config's input
+    transforms, and the model's done probabilities through LiberoOutputs."""
+    import openpi.training.config as _config
+    from openpi import transforms as _transforms
+    from openpi.policies import libero_policy
+    from openpi_client import msgpack_numpy
+
+    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
+    cfg = _config.get_config("pi05_libero_glow_monitor")
+    dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
+    served = _transforms.compose(
+        [
+            *dc.data_transforms.inputs,
+            _transforms.Normalize(None, use_quantiles=dc.use_quantile_norm),
+            *dc.model_transforms.inputs,
+        ]
+    )
+    a, b = _by_index(pack, 17), _by_index(pack, 16)
+    element = {
+        "observation/image": np.zeros((224, 224, 3), np.uint8),
+        "observation/wrist_image": np.zeros((224, 224, 3), np.uint8),
+        "observation/state": np.zeros(8),
+        "prompt": a.task,
+        "prev_plan_index": 0,
+        "plan_chain": [a.task, b.task],
+        "plan_prev_done": [1.0, 0.0],
+    }
+    out = served(msgpack_numpy.unpackb(msgpack_numpy.packb(element)))
+    assert not bool(out["glow_stage_given"])
+    assert out["glow_prev_done"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    assert out["glow_ints"][_mi.INT_NUM_STAGES] == 2
+    done = np.array([0.9, 0.1, 0.0, 0.0], np.float32)
+    back = libero_policy.LiberoOutputs()({"actions": np.zeros((10, 32)), "glow_done": done})
+    np.testing.assert_array_equal(back["glow_done"], done)

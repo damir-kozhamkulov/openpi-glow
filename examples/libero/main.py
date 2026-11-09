@@ -67,12 +67,18 @@ class Args:
     # self: the model chooses each plan and reads its own choice back; oracle: the tracker's stage
     # is the plan; forced: --plan-forced-index is the plan throughout (clamped to a task's last stage);
     # atoms: the plan is the first stage in --plan-order whose goal atom has not held yet on the
-    # simulator. Every mode logs when each stage's goal atom first held and which held first.
-    plan_mode: Literal["self", "oracle", "forced", "atoms"] = "self"
+    # simulator; monitor: no stage is sent, the server's progress monitor decides it, and the stages
+    # its done probabilities pass --plan-monitor-threshold for --plan-monitor-consecutive queries
+    # are latched and sent back (glow_stage_tracker.MonitorLatch). Every mode logs when each
+    # stage's goal atom first held and which held first.
+    plan_mode: Literal["self", "oracle", "forced", "atoms", "monitor"] = "self"
     plan_forced_index: Optional[int] = None
+    plan_monitor_threshold: float = glow_stage_tracker.MONITOR_THRESHOLD
+    plan_monitor_consecutive: int = glow_stage_tracker.MONITOR_CONSECUTIVE
     # Stage order for --plan-mode atoms: 0-based stage indices, comma-separated, restricted per task
     # to its own stages ("1,0": every two-stage task gets its second stage first, a one-stage task
-    # its stage). The episode still ends on the environment's success (every atom held).
+    # its stage). The episode still ends on the environment's success (every atom held). With
+    # --plan-mode monitor it orders a chain only (--plan-chain-offset).
     plan_order: Optional[str] = None
     # Frames a grasp must be held before its release advances the tracker.
     plan_hold_min: int = glow_stage_tracker.HOLD_MIN
@@ -105,10 +111,11 @@ class Args:
     # episode); the step budget doubles. Which atom held first says whether the actions followed
     # the chain's order.
     plan_chain_offset: Optional[int] = None
-    # Chains in --plan-mode atoms: once the chain's first stage is done, the arm follows the chain
-    # demos' scripted return to its start pose (glow_chain_demo.ReturnPlan) for at most this many
-    # steps, inside the same step budget, and the policy then takes over for the second stage.
-    # None: the policy goes on from wherever the first stage ended.
+    # Chains in --plan-mode atoms or monitor: once the chain's first stage is done (its atom in atoms
+    # mode, the monitor's latch in monitor mode), the arm follows the chain demos' scripted return to
+    # its start pose (glow_chain_demo.ReturnPlan) for at most this many steps, inside the same step
+    # budget, and the policy then takes over for the second stage. None: the policy goes on from
+    # wherever the first stage ended.
     plan_return_steps: Optional[int] = None
     # Instruction sent to the server in place of the environment's task (the planner reads it).
     prompt: Optional[str] = None
@@ -129,13 +136,17 @@ def eval_libero(args: Args) -> None:
         if args.plan_task_offset < 0:
             raise ValueError("--plan-task-offset must be >= 0")
     if args.plan_return_steps is not None:
-        if args.plan_chain_offset is None or args.plan_mode != "atoms":
-            raise ValueError("--plan-return-steps needs --plan-chain-offset and --plan-mode atoms")
+        if args.plan_chain_offset is None or args.plan_mode not in ("atoms", "monitor"):
+            raise ValueError("--plan-return-steps needs --plan-chain-offset and --plan-mode atoms or monitor")
         if args.plan_return_steps < 1:
             raise ValueError("--plan-return-steps must be >= 1")
     plan_order = None
-    if (args.plan_mode == "atoms") != (args.plan_order is not None):
+    if args.plan_mode == "atoms" and args.plan_order is None:
         raise ValueError("--plan-mode atoms and --plan-order go together")
+    if args.plan_order is not None and args.plan_mode not in ("atoms", "monitor"):
+        raise ValueError("--plan-mode atoms and --plan-order go together")
+    if args.plan_mode == "monitor" and args.plan_order is not None and args.plan_chain_offset is None:
+        raise ValueError("--plan-order with --plan-mode monitor orders a chain: it needs --plan-chain-offset")
     if args.plan_order is not None:
         if args.plan_pack is None:
             raise ValueError("--plan-mode atoms needs --plan-pack")
@@ -147,8 +158,8 @@ def eval_libero(args: Args) -> None:
     if args.plan_chain_offset is not None:
         if args.plan_pack is None:
             raise ValueError("--plan-chain-offset needs --plan-pack")
-        if args.plan_mode not in ("atoms", "forced"):
-            raise ValueError("--plan-chain-offset needs --plan-mode atoms (the chain's order) or forced")
+        if args.plan_mode not in ("atoms", "forced", "monitor"):
+            raise ValueError("--plan-chain-offset needs --plan-mode atoms (the chain's order), forced or monitor")
         if args.plan_task is not None or args.plan_task_offset is not None:
             raise ValueError("--plan-chain-offset and steering exclude each other")
         if args.plan_chain_offset < 1:
@@ -296,6 +307,10 @@ def eval_libero(args: Args) -> None:
                     tracker_plans=tracker_plans,
                     atoms=atoms if plan_order_used is not None else None,
                     order=plan_order_used,
+                    monitor={
+                        "threshold": args.plan_monitor_threshold,
+                        "consecutive": args.plan_monitor_consecutive,
+                    },
                 )
 
             # Set initial states
@@ -370,9 +385,15 @@ def eval_libero(args: Args) -> None:
                         if plan is not None:
                             used = plan.update(response)
                             logp = response.get("plan_logp")
+                            done = response.get("glow_done")
                             logging.info(
                                 f"plan query: frame={plan.tracker.frame} plan={used} tracker={plan.tracker.plan_index} "
                                 f"logp={None if logp is None else np.round(np.asarray(logp, dtype=float), 3).tolist()}"
+                                + (
+                                    ""
+                                    if done is None
+                                    else f" done={np.round(np.asarray(done, dtype=float)[:num_plans], 3).tolist()}"
+                                )
                             )
                         assert (
                             len(action_chunk) >= args.replan_steps
@@ -386,8 +407,13 @@ def eval_libero(args: Args) -> None:
                     if plan is not None:
                         plan.observe(action[6])  # the gripper command just executed
                         atoms.observe(plan.tracker.frame, action[6])
-                        if chain_return is not None and atoms.done(0):
-                            if chain_return.begin(plan.tracker.frame, obs["robot0_eef_pos"], obs["robot0_eef_quat"]):
+                        if chain_return is not None:
+                            # The switch: the chain's first stage done by the monitor's latch in
+                            # monitor mode, by its atom otherwise.
+                            first_done = plan.monitor_done(0) if args.plan_mode == "monitor" else atoms.done(0)
+                            if first_done and chain_return.begin(
+                                plan.tracker.frame, obs["robot0_eef_pos"], obs["robot0_eef_quat"]
+                            ):
                                 action_plan.clear()  # the first stage's remaining actions are not executed
                     success = success or done
                     if steered is not None:

@@ -500,6 +500,7 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                 counterfactual_p=self.module_counterfactual_p,
                 counterfactual_window=self.module_counterfactual_window,
                 counterfactual_tasks=self.module_counterfactual_tasks,
+                monitor=model_config.module_temporal_monitor,
             )
             plan = [module, stock[i]]
             model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
@@ -1282,6 +1283,22 @@ _CONFIGS = [
                 },
             ),
             ("pi05_libero_glow_v2s", "remaining", True, {}),
+            # The progress monitor decides the stage: the fixed rows' 0.06 turn-down of the stages
+            # it does not make active, no Temporal encoder; only the monitor trains. Served with
+            # run8-gate's weights and a monitor from scripts/glow_progress_monitor.py --save-dir
+            # (serve_policy --policy.monitor-from), or trained from them (module_monitor_init).
+            (
+                "pi05_libero_glow_monitor",
+                "sorted",
+                False,
+                {
+                    "module_ctx_active": False,
+                    "module_temporal": False,
+                    "module_temporal_monitor": True,
+                    "module_stage_gate": 0.06,
+                    "module_freeze_spatial": True,
+                },
+            ),
         )
     ),
     # The text control for the v2 rows: pi05_libero_plan_prompt with the same frozen VLM and

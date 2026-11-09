@@ -226,6 +226,47 @@ def soft_stage_gates(active: torch.Tensor, valid: torch.Tensor, value: float) ->
 
 
 MONITOR_KEY_FIELDS = ("key_predicate", "key_object")
+# Cameras the monitor tells apart: the prefix's image slots (openpi.models.model.IMAGE_KEYS order).
+MONITOR_CAMERAS = 3
+
+
+def pool_image_tokens(tokens: torch.Tensor, pool: int) -> torch.Tensor:
+    """[..., T, D] patch tokens on a square grid -> [..., T / pool^2, D], averaged over pool x pool
+    cells (in float32)."""
+    *lead, t, d = tokens.shape
+    side = int(round(t**0.5))
+    if side * side != t or side % pool:
+        raise ValueError(f"{t} tokens are not a square grid divisible by {pool}")
+    grid = tokens.reshape(-1, side, side, d).permute(0, 3, 1, 2).float()
+    grid = torch.nn.functional.avg_pool2d(grid, pool)
+    return grid.flatten(2).transpose(1, 2).reshape(*lead, -1, d)
+
+
+def cyclic_stage_perm(valid: torch.Tensor) -> torch.Tensor:
+    """[B, K_MAX] index: the plan's stages shifted by one (stage j+1 at position j), padding kept."""
+    k = valid.long().sum(-1, keepdim=True)
+    j = torch.arange(valid.shape[-1], device=valid.device).expand_as(valid)
+    return torch.where(valid, (j + 1) % k.clamp(min=1), j)
+
+
+def random_stage_perm(valid: torch.Tensor, generator=None) -> torch.Tensor:
+    """[B, K_MAX] index: the plan's stages in a random order other than their own (plans of two or
+    more stages; a one-stage plan keeps its order), padding positions kept."""
+    r = torch.rand(valid.shape, generator=generator, device=valid.device)
+    perm = torch.argsort(torch.where(valid, r, torch.inf), dim=-1)
+    j = torch.arange(valid.shape[-1], device=valid.device).expand_as(valid)
+    perm = torch.where(valid, perm, j)
+    same = (perm == j).all(-1, keepdim=True)
+    return torch.where(same, cyclic_stage_perm(valid), perm)
+
+
+def permute_stages(perm: torch.Tensor, *xs: torch.Tensor) -> list[torch.Tensor]:
+    """Each x [B, K_MAX, ...] reordered so that position i holds stage perm[i]."""
+    out = []
+    for x in xs:
+        index = perm.reshape(*perm.shape, *([1] * (x.ndim - 2))).expand(-1, -1, *x.shape[2:])
+        out.append(torch.gather(x, 1, index))
+    return out
 
 
 def monitor_key_inputs(embed, text, text_mask, ints) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -257,7 +298,7 @@ class ProgressMonitor(nn.Module):
         *,
         keys: bool = True,
         heads: int = 8,
-        cameras: int = 3,
+        cameras: int = MONITOR_CAMERAS,
     ):
         super().__init__()
         self.keys = keys

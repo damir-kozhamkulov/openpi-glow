@@ -177,4 +177,8 @@ def preprocess_observation_pytorch(
         glow_teacher_prompt=getattr(observation, "glow_teacher_prompt", None),
         glow_teacher_prompt_mask=getattr(observation, "glow_teacher_prompt_mask", None),
         glow_flow_weight=getattr(observation, "glow_flow_weight", None),
+        glow_done=getattr(observation, "glow_done", None),
+        glow_done_mask=getattr(observation, "glow_done_mask", None),
+        glow_stage_given=getattr(observation, "glow_stage_given", None),
+        glow_prev_done=getattr(observation, "glow_prev_done", None),
     )

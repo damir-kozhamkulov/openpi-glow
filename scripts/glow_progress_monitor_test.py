@@ -8,6 +8,7 @@ not the numbers.
 
 import dataclasses
 import itertools
+import json
 import time
 import types
 
@@ -242,8 +243,17 @@ def test_main_end_to_end_on_dummy_weights(monkeypatch, tmp_path):
         single_stride=40,
         device="cuda" if torch.cuda.is_available() else "cpu",
         out=str(tmp_path / "out.json"),
+        save_dir=str(tmp_path / "monitors"),
     )
     result = gpm.main(args)
+    # The saved monitor is what a monitor row loads (load_progress_monitor), shapes included.
+    monitor_cfg = _config.get_config("pi05_libero_glow_monitor")
+    row = dataclasses.replace(
+        monitor_cfg.model, module_monitor_width=16, module_monitor_depth=1, module_monitor_heads=2
+    ).create_pytorch()
+    saved = tmp_path / "monitors" / "monitor"
+    assert row.load_progress_monitor(str(saved)) > 0
+    assert json.loads((saved / "monitor.json").read_text())["pool"] == args.pool
     assert set(result["variants"]) == set(gpm.VARIANTS)
     assert result["counts"]["libero10"]["episodes"] == 6 and result["counts"]["goal"]["episodes"] == 3
     assert "swapped" in result["variants"]["monitor"]["libero10"]

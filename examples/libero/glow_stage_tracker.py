@@ -30,7 +30,49 @@ an evaluation could not have.
 """
 
 HOLD_MIN = 30
-PLAN_MODES = ("self", "oracle", "forced", "atoms")
+PLAN_MODES = ("self", "oracle", "forced", "atoms", "monitor")
+# --plan-mode monitor: a stage counts as done once the server's done probability for it is above
+# MONITOR_THRESHOLD on MONITOR_CONSECUTIVE queries in a row, and stays done.
+MONITOR_THRESHOLD = 0.7
+MONITOR_CONSECUTIVE = 2
+
+
+class MonitorLatch:
+    """The stages a progress-monitor server reports done, latched: each query's done probabilities
+    (one per stage) count a stage once they pass `threshold` on `consecutive` queries in a row; a
+    latched stage never unlatches. The plan is the first stage not latched (the last once all are)."""
+
+    def __init__(self, num_plans, threshold=MONITOR_THRESHOLD, consecutive=MONITOR_CONSECUTIVE):
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("monitor threshold must be in (0, 1), got {}".format(threshold))
+        if consecutive < 1:
+            raise ValueError("monitor consecutive must be >= 1, got {}".format(consecutive))
+        self.num_plans = num_plans
+        self.threshold = threshold
+        self.consecutive = consecutive
+        self.latched = [False] * num_plans
+        self._above = [0] * num_plans
+        self.last = None
+
+    def update(self, done):
+        """Take one query's done probabilities (at least num_plans of them); returns the plan."""
+        if len(done) < self.num_plans:
+            raise ValueError("server sent {} done probabilities for {} stages".format(len(done), self.num_plans))
+        self.last = [float(p) for p in done[: self.num_plans]]
+        for j, p in enumerate(self.last):
+            self._above[j] = self._above[j] + 1 if p > self.threshold else 0
+            if self._above[j] >= self.consecutive:
+                self.latched[j] = True
+        return self.plan()
+
+    def plan(self):
+        for j, done in enumerate(self.latched):
+            if not done:
+                return j
+        return self.num_plans - 1
+
+    def request(self):
+        return [1.0 if done else 0.0 for done in self.latched]
 
 
 def parse_atom(runtime_key):
@@ -214,7 +256,15 @@ class StageTracker:
 
 class PlanEcho:
     def __init__(
-        self, mode, num_plans, forced_index=None, hold_min=HOLD_MIN, tracker_plans=None, atoms=None, order=None
+        self,
+        mode,
+        num_plans,
+        forced_index=None,
+        hold_min=HOLD_MIN,
+        tracker_plans=None,
+        atoms=None,
+        order=None,
+        monitor=None,
     ):
         if mode not in PLAN_MODES:
             raise ValueError("mode must be one of {}, got {!r}".format(PLAN_MODES, mode))
@@ -230,6 +280,7 @@ class PlanEcho:
                 raise ValueError("atoms mode plans the environment task's own {} stages".format(len(atoms.atoms)))
             order = stage_order_for(order, num_plans)
         self.mode = mode
+        self.monitor = MonitorLatch(num_plans, **(monitor or {})) if mode == "monitor" else None
         self.num_plans = num_plans
         self.forced_index = forced_index
         self.atoms = atoms
@@ -253,6 +304,8 @@ class PlanEcho:
             req["oracle_plan_index"] = self.forced_index
         elif self.mode == "atoms":
             req["oracle_plan_index"] = self.atoms.stage(self.order)
+        elif self.mode == "monitor":
+            req["plan_prev_done"] = self.monitor.request()
         if "oracle_plan_index" in req:
             if req["oracle_plan_index"] != self._clock_stage:
                 self._clock_stage = req["oracle_plan_index"]
@@ -269,6 +322,10 @@ class PlanEcho:
             plan = int(response["plan_choice"])
             if not 0 <= plan < self.num_plans:
                 raise ValueError("server chose plan {} outside 0..{}".format(plan, self.num_plans - 1))
+        elif self.mode == "monitor":
+            if "glow_done" not in response:
+                raise ValueError("monitor mode needs a progress-monitor server (no glow_done in the response)")
+            plan = self.monitor.update(response["glow_done"])
         else:
             plan = int(self._sent["oracle_plan_index"])
         self._sent = None
@@ -284,9 +341,18 @@ class PlanEcho:
         """Record the gripper command of the action just executed (drives the tracker)."""
         return self.tracker.observe(gripper_command)
 
+    def monitor_done(self, stage):
+        """Monitor mode: whether the server's monitor has latched `stage` done."""
+        return self.monitor is not None and self.monitor.latched[stage]
+
     def trace(self):
         """One-line episode summary for the stage-resolved analysis."""
         order = "" if self.order is None else "order={} ".format(",".join(str(k) for k in self.order))
+        if self.monitor is not None:
+            order += "monitor_latched={} monitor_last={} ".format(
+                [int(d) for d in self.monitor.latched],
+                None if self.monitor.last is None else [round(p, 3) for p in self.monitor.last],
+            )
         return order + (
             "mode={} plan={} tracker={} of {} queries={} agreement={}/{} switches={} "
             "regressions={} tracker_releases={}".format(

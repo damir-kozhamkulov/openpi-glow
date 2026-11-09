@@ -93,6 +93,31 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
     # Train only the encoders: every pretrained parameter is frozen, so the teacher pass is the
     # fine-tuning init itself.
     freeze_pretrained: bool = False
+    # The progress monitor decides the active stage (module_encoders.ProgressMonitor): a done
+    # probability per stage from the plan's runtime keys and the prefix's camera tokens, the first
+    # stage not done is active, and the Spatial groups enter at soft_stage_gates with
+    # module_stage_gate as the other stages' size. Needs the Spatial encoder and module_stage_gate,
+    # replaces the Temporal encoder (module_temporal off). An inference sample whose client gives
+    # the stage (oracle_plan_index) enters at the fixed gates instead, as an ablation.
+    module_temporal_monitor: bool = False
+    module_monitor_width: int = 512
+    module_monitor_depth: int = 2
+    module_monitor_heads: int = 8
+    # Camera tokens are averaged over pool x pool patches before the monitor reads them.
+    module_monitor_pool: int = 2
+    # Training: loss += module_done_weight x the done BCE; with probability module_monitor_swap_p a
+    # sample's done BCE is also taken on its plan with the stages permuted (the labels follow
+    # their keys), so the monitor reads the keys, not the stage positions; with probability
+    # module_monitor_teacher_forcing a sample's gates come from its labelled stage instead of the
+    # monitor.
+    module_done_weight: float = 1.0
+    module_monitor_swap_p: float = 0.3
+    module_monitor_teacher_forcing: float = 0.5
+    # A trained monitor (directory with model.safetensors, parameters under glow_progress_monitor.)
+    # loaded over the init weights before training, e.g. scripts/glow_progress_monitor.py --save-dir.
+    module_monitor_init: str | None = None
+    # Freeze the Spatial encoder too (with freeze_pretrained only the monitor then trains).
+    module_freeze_spatial: bool = False
 
     def create(self, rng):
         raise NotImplementedError("GLOW trains on the PyTorch path only (scripts/train_pytorch.py)")
@@ -103,6 +128,13 @@ class GlowModulePi0Config(pi0_config.Pi0Config):
         return glow_module_pi0_pytorch.GlowModulePI0Pytorch(self)
 
     def load_pytorch(self, train_config, weight_path: str):
+        """Strict, except that a monitor row also takes a checkpoint with no monitor (its monitor
+        then has to come from elsewhere: `model.monitor_missing`) and with a Temporal encoder it
+        does not use."""
         model = self.create_pytorch()
-        safetensors.torch.load_model(model, weight_path)
+        if not self.module_temporal_monitor:
+            safetensors.torch.load_model(model, weight_path)
+            return model
+        missing, unexpected = safetensors.torch.load_model(model, weight_path, strict=False)
+        model.check_partial_load(weight_path, missing, unexpected)
         return model

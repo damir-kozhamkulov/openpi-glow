@@ -83,7 +83,8 @@ class LiberoInputs(transforms.DataTransformFn):
         # GLOW plan-state keys, consumed by the GlowPlanState model transform: the dataset's
         # episode/frame at training; at inference the model's previous plan as echoed by the
         # client, plus an optional oracle plan, an optional steering task whose plans are used, an
-        # optional chain of tasks whose stages run as one plan, and the stage clock. Absent otherwise.
+        # optional chain of tasks whose stages run as one plan, the stage clock, and the stages the
+        # client has latched as done from a progress monitor's outputs. Absent otherwise.
         for key in (
             "episode_index",
             "frame_index",
@@ -92,6 +93,7 @@ class LiberoInputs(transforms.DataTransformFn):
             "plan_task",
             "plan_chain",
             "plan_stage_frames",
+            "plan_prev_done",
         ):
             if key in data:
                 inputs[key] = data[key]
@@ -116,7 +118,9 @@ class LiberoOutputs(transforms.DataTransformFn):
         out = {"actions": np.asarray(data["actions"][..., :7])}
         # GLOW: the model's plan choice (a plan index when every stage was a candidate) and the
         # candidate scores; the client echoes the choice back as the next query's previous plan.
-        for key in ("plan_choice", "plan_logp"):
+        # A progress monitor's done probability per stage (K_MAX, 0 past the plan), which the
+        # client latches.
+        for key in ("plan_choice", "plan_logp", "glow_done"):
             if key in data:
                 out[key] = np.asarray(data[key])
         return out

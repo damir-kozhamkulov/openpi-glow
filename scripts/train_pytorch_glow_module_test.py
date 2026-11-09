@@ -164,3 +164,66 @@ def test_freeze_vlm_step_moves_the_action_expert_and_the_encoders():
                for n in params if n.startswith("glow_spatial_encoder."))
     with pytest.raises(ValueError, match="no parameters"):
         train_pytorch.freeze_vlm(torch.nn.Linear(2, 2))
+
+
+def _monitor_model(**kw):
+    torch.manual_seed(2)
+    return GlowModulePI0Pytorch(
+        _cfg(
+            GlowModulePi0Config,
+            module_width=32,
+            module_temporal=False,
+            module_temporal_monitor=True,
+            module_stage_gate=0.06,
+            module_monitor_width=16,
+            module_monitor_depth=1,
+            module_monitor_heads=2,
+            **kw,
+        )
+    )
+
+
+def test_monitor_row_inits_from_a_temporal_row_and_its_monitor(tmp_path):
+    torch.manual_seed(3)
+    gate_row = GlowModulePI0Pytorch(_cfg(GlowModulePi0Config, module_width=32, module_temporal_gate=0.25))
+    path = tmp_path / "model.safetensors"
+    safetensors.torch.save_model(gate_row, str(path))
+    model = _monitor_model()
+    train_pytorch.load_init_weights(model, str(path), "cpu")
+    for name, p in model.named_parameters():
+        if name.startswith("glow_spatial_encoder."):
+            assert torch.equal(p, dict(gate_row.named_parameters())[name]), name
+    # The monitor from its own file, over the init.
+    trained = _monitor_model()
+    with torch.no_grad():
+        for p in trained.glow_progress_monitor.parameters():
+            p.add_(0.5)
+    monitor = tmp_path / "monitor.safetensors"
+    safetensors.torch.save_file(
+        {"glow_progress_monitor." + k: v for k, v in trained.glow_progress_monitor.state_dict().items()}, str(monitor)
+    )
+    cfg = _cfg(GlowModulePi0Config, module_temporal_monitor=True, module_monitor_init=str(monitor))
+    train_pytorch.load_module_init(model, cfg)
+    for k, v in trained.glow_progress_monitor.state_dict().items():
+        assert torch.equal(model.glow_progress_monitor.state_dict()[k], v), k
+    # A Temporal tensor is skipped only where the model has no Temporal encoder.
+    with pytest.raises(RuntimeError, match="unexpected"):
+        train_pytorch.load_init_weights(_module_model_without_temporal(), str(path), "cpu")
+
+
+def _module_model_without_temporal():
+    torch.manual_seed(1)
+    return GlowModulePI0Pytorch(_cfg(GlowModulePi0Config, module_width=32, module_temporal=False))
+
+
+def test_freeze_spatial_leaves_only_the_monitor_new():
+    model = _monitor_model(module_freeze_spatial=True)
+    train_pytorch.freeze_pretrained(model)
+    frozen = train_pytorch.freeze_spatial(model)
+    assert frozen == sum(p.numel() for p in model.glow_spatial_encoder.parameters())
+    trainable = {n.split(".")[0] for n, p in model.named_parameters() if p.requires_grad}
+    assert trainable == {"glow_progress_monitor"}
+    groups = train_pytorch.optimizer_param_groups(model, 16.0)
+    assert [g["name"] for g in groups] == ["new"]
+    with pytest.raises(ValueError, match="no Spatial encoder"):
+        train_pytorch.freeze_spatial(PI0Pytorch(_cfg(pi0_config.Pi0Config)))

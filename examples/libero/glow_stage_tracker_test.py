@@ -267,3 +267,38 @@ def test_release_gate():
     assert plain.done(0) and plain.released == [None]
     with pytest.raises(ValueError):
         gst.StageAtoms([("on", "x", "y")], lambda a: True, release_cap=-1)
+
+
+def test_monitor_latch_needs_consecutive_queries_and_never_unlatches():
+    latch = gst.MonitorLatch(2, threshold=0.7, consecutive=2)
+    assert latch.update([0.9, 0.0, 0.0, 0.0]) == 0  # once above: not yet
+    assert latch.update([0.2, 0.0, 0.0, 0.0]) == 0  # the run is broken
+    assert latch.update([0.8, 0.0, 0.0, 0.0]) == 0
+    assert latch.update([0.95, 0.1, 0.0, 0.0]) == 1  # two in a row: stage 0 done
+    assert latch.request() == [1.0, 0.0]
+    assert latch.update([0.0, 0.0, 0.0, 0.0]) == 1  # stays done
+    latch.update([0.0, 0.9, 0.0, 0.0])
+    assert latch.update([0.0, 0.9, 0.0, 0.0]) == 1  # all done: the last stage
+    assert latch.latched == [True, True] and latch.last == [0.0, 0.9]
+    with pytest.raises(ValueError, match="2 stages"):
+        latch.update([0.1])
+    with pytest.raises(ValueError):
+        gst.MonitorLatch(2, threshold=1.0)
+
+
+def test_monitor_mode_sends_no_stage_and_latches_the_response():
+    echo = gst.PlanEcho("monitor", 2, monitor={"threshold": 0.5, "consecutive": 1})
+    req = echo.request()
+    assert "oracle_plan_index" not in req and req["plan_prev_done"] == [0.0, 0.0]
+    assert echo.update({"actions": None, "glow_done": [0.1, 0.0, 0.0, 0.0]}) == 0
+    assert not echo.monitor_done(0)
+    echo.request()
+    assert echo.update({"actions": None, "glow_done": [0.9, 0.0, 0.0, 0.0]}) == 1
+    assert echo.monitor_done(0) and echo.request()["plan_prev_done"] == [1.0, 0.0]
+    assert echo.switches == [(0, 0, 1)]
+    assert "monitor_latched=[1, 0]" in echo.trace()
+    echo.request()
+    with pytest.raises(ValueError, match="glow_done"):
+        echo.update({"actions": None})
+    # The other modes never latch.
+    assert not gst.PlanEcho("oracle", 2).monitor_done(0)

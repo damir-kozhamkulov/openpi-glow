@@ -117,6 +117,13 @@ class Observation(Generic[ArrayT]):
     glow_teacher_prompt_mask: at.Bool[ArrayT, "*b gp"] | None = None
     # Per-sample weight of the flow term in GLOW's distillation training (training only).
     glow_flow_weight: at.Float[ArrayT, "*b"] | None = None
+    # GLOW progress monitor (openpi.glow.module_inputs): each stage's done label and which labels
+    # count (training only); whether the sample's stage is given (training, or a client's oracle
+    # stage); the stages the client has latched as done (inference only).
+    glow_done: at.Float[ArrayT, "*b gk"] | None = None
+    glow_done_mask: at.Bool[ArrayT, "*b gk"] | None = None
+    glow_stage_given: at.Bool[ArrayT, "*b"] | None = None
+    glow_prev_done: at.Float[ArrayT, "*b gk"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -145,6 +152,10 @@ class Observation(Generic[ArrayT]):
             glow_teacher_prompt=data.get("glow_teacher_prompt"),
             glow_teacher_prompt_mask=data.get("glow_teacher_prompt_mask"),
             glow_flow_weight=data.get("glow_flow_weight"),
+            glow_done=data.get("glow_done"),
+            glow_done_mask=data.get("glow_done_mask"),
+            glow_stage_given=data.get("glow_stage_given"),
+            glow_prev_done=data.get("glow_prev_done"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -231,6 +242,10 @@ def preprocess_observation(
         glow_teacher_prompt=observation.glow_teacher_prompt,
         glow_teacher_prompt_mask=observation.glow_teacher_prompt_mask,
         glow_flow_weight=observation.glow_flow_weight,
+        glow_done=observation.glow_done,
+        glow_done_mask=observation.glow_done_mask,
+        glow_stage_given=observation.glow_stage_given,
+        glow_prev_done=observation.glow_prev_done,
     )
 
 

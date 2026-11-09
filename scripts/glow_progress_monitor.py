@@ -93,6 +93,9 @@ class Args:
     precision: str = "float32"
     device: str = "cuda"
     out: str | None = None
+    # Each variant's trained monitor goes to <save_dir>/<variant>/model.safetensors (parameter names
+    # under MONITOR_PREFIX, as GlowModulePI0Pytorch.load_progress_monitor reads them) with monitor.json.
+    save_dir: str | None = None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -150,15 +153,11 @@ def split(pack, episodes, chains: dict[int, int], holdout_every: int, heldout_in
 
 
 def labels(episode_plan, frame: int, tail: int) -> tuple[np.ndarray, np.ndarray]:
-    """(done, labeled) [K] in execution order for one frame (see the module docstring)."""
-    starts = episode_plan.stage_starts
-    k = len(starts)
-    done = np.zeros(k, dtype=np.float32)
-    labeled = np.ones(k, dtype=bool)
-    for j in range(k - 1):
-        done[j] = float(frame >= starts[j + 1])
-    labeled[k - 1] = frame < episode_plan.n_frames - tail
-    return done, labeled
+    """(done, labeled) [K] in execution order for one frame: module_inputs.done_labels, the labels
+    a monitor row trains on."""
+    from openpi.glow import module_inputs as _mi
+
+    return _mi.done_labels(episode_plan, frame, tail)
 
 
 def frame_plan(pack, episodes, chains, heldout, stride: int, single_stride: int, tail: int) -> list[dict]:
@@ -194,37 +193,24 @@ def padded(x: np.ndarray, k_max: int, fill) -> np.ndarray:
 
 
 def cyclic_perm(valid):
-    """[B, K_MAX] index: the valid stages shifted by one (stage j+1 at position j), the rest kept."""
-    import torch
+    """module_encoders.cyclic_stage_perm."""
+    from openpi.glow import module_encoders as _enc
 
-    k = valid.long().sum(-1, keepdim=True)
-    j = torch.arange(valid.shape[-1], device=valid.device).expand_as(valid)
-    return torch.where(valid, (j + 1) % k.clamp(min=1), j)
+    return _enc.cyclic_stage_perm(valid)
 
 
 def random_perm(valid, generator=None):
-    """[B, K_MAX] index: the valid stages in a random order other than their own (plans with two or
-    more stages; a one-stage plan keeps its order), padding positions kept."""
-    import torch
+    """module_encoders.random_stage_perm."""
+    from openpi.glow import module_encoders as _enc
 
-    r = torch.rand(valid.shape, generator=generator, device=valid.device)
-    r = torch.where(valid, r, torch.inf)
-    perm = torch.argsort(r, dim=-1)
-    j = torch.arange(valid.shape[-1], device=valid.device).expand_as(valid)
-    perm = torch.where(valid, perm, j)
-    same = (perm == j).all(-1, keepdim=True)
-    return torch.where(same, cyclic_perm(valid), perm)
+    return _enc.random_stage_perm(valid, generator)
 
 
 def permute(perm, *xs):
-    """Each x [B, K_MAX, ...] reordered so that position i holds stage perm[i]."""
-    import torch
+    """module_encoders.permute_stages."""
+    from openpi.glow import module_encoders as _enc
 
-    out = []
-    for x in xs:
-        index = perm.reshape(*perm.shape, *([1] * (x.ndim - 2))).expand(-1, -1, *x.shape[2:])
-        out.append(torch.gather(x, 1, index))
-    return out
+    return _enc.permute_stages(perm, *xs)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -487,16 +473,10 @@ def load_vision(model_cfg, weights: str, precision: str, device):
 
 
 def pooled_tokens(tokens, pool: int):
-    """[B, T, D] patch tokens on a square grid -> [B, T / pool^2, D] averaged over pool x pool cells."""
-    import torch
+    """module_encoders.pool_image_tokens."""
+    from openpi.glow import module_encoders as _enc
 
-    b, t, d = tokens.shape
-    side = int(round(t**0.5))
-    if side * side != t or side % pool:
-        raise ValueError(f"{t} tokens are not a square grid divisible by {pool}")
-    grid = tokens.reshape(b, side, side, d).permute(0, 3, 1, 2).float()
-    grid = torch.nn.functional.avg_pool2d(grid, pool)
-    return grid.flatten(2).transpose(1, 2)
+    return _enc.pool_image_tokens(tokens, pool)
 
 
 class Store:
@@ -663,6 +643,10 @@ def dump(samples, pipeline, model, args, device, root, action_horizon) -> tuple[
                 cameras = shown
                 if any(bool(m.any()) for i, m in enumerate(masks) if i not in shown):
                     raise ValueError("a camera is present in some samples only")
+                # The monitor's camera embedding is by position: the cameras kept must be the
+                # prefix's first image slots, as the model passes them.
+                if cameras != list(range(len(cameras))):
+                    raise ValueError(f"cameras {cameras} are not the prefix's first image slots")
             elif shown != cameras:
                 raise ValueError(f"cameras changed between batches: {cameras} vs {shown}")
             feats = torch.stack(
@@ -732,7 +716,6 @@ def train_variant(name, keys: bool, swap_p: float, store, task_row, done, labele
         args.depth,
         keys=keys,
         heads=args.heads,
-        cameras=store.images.shape[1],
     ).to(device)
     train_labeled = labeled[torch.as_tensor(train_idx, device=device)]
     train_done = done[torch.as_tensor(train_idx, device=device)]
@@ -774,6 +757,31 @@ def train_variant(name, keys: bool, swap_p: float, store, task_row, done, labele
             running = []
     monitor.eval()
     return monitor
+
+
+MONITOR_PREFIX = "glow_progress_monitor."
+
+
+def save_monitor(monitor, out_dir: pathlib.Path, args, *, keys: bool) -> pathlib.Path:
+    """The monitor's parameters under MONITOR_PREFIX, and its shape and input settings (monitor.json)."""
+    import safetensors.torch
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state = {MONITOR_PREFIX + k: v.detach().contiguous().cpu() for k, v in monitor.state_dict().items()}
+    path = out_dir / "model.safetensors"
+    safetensors.torch.save_file(state, str(path))
+    meta = {
+        "width": args.width,
+        "depth": args.depth,
+        "heads": args.heads,
+        "pool": args.pool,
+        "keys": keys,
+        "config": args.config,
+        "weights": args.weights,
+        "plan_pack": args.plan_pack,
+    }
+    (out_dir / "monitor.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    return path
 
 
 def swap_perm(valid, swap_p: float, gen=None):
@@ -874,6 +882,9 @@ def main(args: Args) -> dict:
             samples, test_idx, own, pack, args.threshold, args.start_window, swapped=shifted
         )
         result.setdefault("variant_swap_p", {})[name] = swap_p
+        if args.save_dir:
+            path = save_monitor(monitor, pathlib.Path(args.save_dir) / name, args, keys=keys)
+            logging.info(f"saved {name} to {path}")
         write()
         del monitor
 

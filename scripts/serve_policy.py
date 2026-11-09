@@ -30,6 +30,8 @@ class Checkpoint:
     dir: str
     # Another checkpoint directory to take the GLOW Spatial encoder from.
     spatial_from: str | None = None
+    # A GLOW progress monitor's weights (directory or file), for a monitor row whose checkpoint has none.
+    monitor_from: str | None = None
 
 
 @dataclasses.dataclass
@@ -96,6 +98,7 @@ def create_policy(args: Args) -> _policy.Policy:
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 spatial_from=args.policy.spatial_from,
+                monitor_from=args.policy.monitor_from,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

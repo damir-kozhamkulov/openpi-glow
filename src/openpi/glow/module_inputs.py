@@ -56,6 +56,12 @@ anchors, and the teacher prompt of that active task. Its demo action belongs to 
 carries `glow_flow_weight` 0 (every other training sample 1): only the teacher's velocity, which
 follows the active task, supervises it. The same images then call for different actions depending
 on which stage the plan makes active.
+
+With `monitor` (a model whose progress monitor decides the stage) training samples also carry done
+labels (`glow_done`, `glow_done_mask`, see `done_labels`; a counterfactual sample's are all "not
+done") and `glow_stage_given` True; an inference sample may come without oracle_plan_index, and then
+carries `glow_stage_given` False and the client's latched stages `plan_prev_done` as
+`glow_prev_done` (zeros when absent). A non-monitor model ignores plan_prev_done.
 """
 
 import dataclasses
@@ -197,6 +203,28 @@ def teacher_prompt(stage: _plan_pack.Stage, task_string: str) -> str:
     return stage.subgoal_operation if stage.subgoal_operation_source == GOAL_INSTRUCTION_SOURCE else task_string
 
 
+DONE_TAIL = 15
+
+
+def done_labels(episode: _plan_pack.EpisodePlan, frame: int, tail: int = DONE_TAIL) -> tuple[np.ndarray, np.ndarray]:
+    """(done [K], labeled [K]) for a frame of a demo, in execution order: stage j is done from the
+    frame stage j + 1 starts. The last stage's goal is reached only as the demo ends, at success:
+    not done, and its last `tail` frames are unlabeled."""
+    starts = episode.stage_starts
+    k = len(starts)
+    done = np.array([float(frame >= starts[j + 1]) for j in range(k - 1)] + [0.0], dtype=np.float32)
+    labeled = np.ones(k, dtype=bool)
+    labeled[k - 1] = frame < episode.n_frames - tail
+    return done, labeled
+
+
+def _padded(x: np.ndarray, fill) -> np.ndarray:
+    """x [K] padded to K_MAX with `fill`."""
+    out = np.full(K_MAX, fill, dtype=x.dtype)
+    out[: len(x)] = x
+    return out
+
+
 def _scalar(x):
     return x if isinstance(x, str | int) else np.asarray(x).item()
 
@@ -226,10 +254,16 @@ class GlowModuleInputs(DataTransformFn):
     # Random draws for the augmentation; None uses numpy's global generator, which the DataLoader
     # seeds per worker.
     rng: np.random.Generator | None = None
+    # The model's progress monitor decides the stage (see the module docstring): training samples
+    # carry done labels, and an inference sample may come without a stage.
+    monitor: bool = False
 
     def __post_init__(self):
         if self.stage_order not in STAGE_ORDERS:
             raise ValueError(f"stage_order must be one of {STAGE_ORDERS}, got {self.stage_order!r}")
+        if self.monitor and self.chain_p > 0:
+            # A chained partner stage would be labelled done while the cameras show it untouched.
+            raise ValueError("a monitor's done labels need the episode's own plan: chain_p must be 0")
         if not 0.0 <= self.chain_p <= 1.0:
             raise ValueError(f"chain_p must be in [0, 1], got {self.chain_p}")
         if self.chain_p > 0 and not self.chain_tasks:
@@ -264,6 +298,7 @@ class GlowModuleInputs(DataTransformFn):
         plan_chain = None if plan_chain is None or len(plan_chain) == 0 else [_scalar(t) for t in plan_chain]
         data.pop("prev_plan_index", None)
         stage_frames = data.pop("plan_stage_frames", None)
+        prev_done = data.pop("plan_prev_done", None)
         grounding = None
 
         if "episode_index" in data and "frame_index" in data:
@@ -299,13 +334,23 @@ class GlowModuleInputs(DataTransformFn):
                 data["glow_teacher_prompt"], data["glow_teacher_prompt_mask"] = tokens, mask
             if self.counterfactual_p > 0:
                 data["glow_flow_weight"] = np.float32(0.0 if counterfactual is not None else 1.0)
-        elif (oracle := data.pop("oracle_plan_index", None)) is not None:
+            if self.monitor:
+                if counterfactual is not None:
+                    # A start frame of another task's plan: none of its stages is done.
+                    done, labeled = np.zeros(len(stages), np.float32), np.ones(len(stages), bool)
+                else:
+                    done, labeled = done_labels(episode, frame_index)
+                data["glow_done"] = _padded(done, 0.0)
+                data["glow_done_mask"] = _padded(labeled, False)
+                data["glow_stage_given"] = np.bool_(True)
+        elif (oracle := data.pop("oracle_plan_index", None)) is not None or self.monitor:
             if stage_frames is None and self.stage_clock:
                 raise ValueError(
                     "GlowModuleInputs: this model reads the stage clock; the client must send plan_stage_frames"
                 )
             stage_frames = -1 if stage_frames is None else int(_scalar(stage_frames))
-            plan_index = int(_scalar(oracle))
+            # Without an oracle stage the monitor decides; the index sent is a placeholder.
+            plan_index = 0 if oracle is None else int(_scalar(oracle))
             if plan_chain is not None:
                 if plan_task is not None:
                     raise ValueError("GlowModuleInputs: plan_task and plan_chain exclude each other")
@@ -314,6 +359,12 @@ class GlowModuleInputs(DataTransformFn):
                 stages = self.pack.task(prompt if plan_task is None else plan_task).stages
                 if plan_task is not None:
                     plan_index = min(plan_index, len(stages) - 1)
+            if self.monitor:
+                data["glow_stage_given"] = np.bool_(oracle is not None)
+                prev = np.zeros(len(stages), np.float32) if prev_done is None else np.asarray(prev_done, np.float32)
+                if prev.shape != (len(stages),):
+                    raise ValueError(f"GlowModuleInputs: plan_prev_done has shape {prev.shape}; the plan has {len(stages)} stages")
+                data["glow_prev_done"] = _padded(prev, 0.0)
         else:
             raise ValueError(
                 "GlowModuleInputs: the module encoders read a given stage; serve with the LIBERO client's "

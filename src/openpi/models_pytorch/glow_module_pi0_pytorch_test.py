@@ -216,7 +216,8 @@ def test_ablation_switches(switch, ignored, tokens):
 def test_encoders_get_gradients(model):
     model.zero_grad(set_to_none=True)
     _flow(model, _obs(0, _module_arrays(0))).mean().backward()
-    for prefix in GlowModulePI0Pytorch.NEW_PARAM_PREFIXES:
+    # The default row has both encoders and no progress monitor.
+    for prefix in ("glow_spatial_encoder.", "glow_temporal_encoder."):
         named = [(n, p) for n, p in model.named_parameters() if n.startswith(prefix)]
         assert named, prefix
         # Unused rows of embedding tables get none; every module gets some.
@@ -917,3 +918,163 @@ def test_flow_weight():
     assert float(some["counterfactual"]) == 0.5
     # All counterfactual: no flow term at all.
     assert float(run([0, 0, 0, 0])["flow"]) == 0.0
+
+
+# ---------------------------------------------------------------------------------------------
+# Progress monitor rows: the stage comes from the monitor's done probabilities.
+
+from openpi.models_pytorch import glow_module_pi0_pytorch as _glow_module  # noqa: E402
+
+
+def _monitor_model(**kw):
+    return _model_with(
+        module_temporal=False,
+        module_temporal_monitor=True,
+        module_stage_gate=0.06,
+        module_monitor_width=16,
+        module_monitor_depth=1,
+        module_monitor_heads=2,
+        **kw,
+    )
+
+
+def _monitor_obs(seed, module, **extra):
+    return _obs(seed, {**module, **{k: np.asarray(v) for k, v in extra.items()}})
+
+
+def _prefix(model, obs):
+    model.eval()
+    images, img_masks, lang_tokens, lang_masks, _ = model._preprocess_observation(obs, train=False)  # noqa: SLF001
+    with torch.no_grad():
+        return model.embed_observation_prefix(obs, images, img_masks, lang_tokens, lang_masks)
+
+
+def test_monitor_row_validation():
+    with pytest.raises(ValueError, match="replaces the Temporal encoder"):
+        _model_with(module_temporal_monitor=True, module_stage_gate=0.06)
+    with pytest.raises(ValueError, match="module_stage_gate"):
+        _model_with(module_temporal=False, module_temporal_monitor=True)
+    with pytest.raises(ValueError, match="belong to a module_temporal_monitor row"):
+        _model_with(module_freeze_spatial=True)
+    m = _monitor_model()
+    assert m.glow_temporal_encoder is None and m.glow_progress_monitor is not None
+    assert m.init_ignored_prefixes == (_glow_module.TEMPORAL_PREFIX,)
+    assert _model_with().init_ignored_prefixes == ()
+
+
+def test_monitor_given_stage_enters_at_the_fixed_gates():
+    """With the stage given, a monitor row's prefix is the fixed-gate row's with the same Spatial."""
+    m = _monitor_model()
+    ref = _model_with(module_temporal=False, module_stage_gate=0.06)
+    ref.load_state_dict({k: v for k, v in m.state_dict().items() if not k.startswith(_glow_module.MONITOR_PREFIX)})
+    module = _module_arrays(0)
+    given = _monitor_obs(0, module, glow_stage_given=np.ones(B, dtype=bool))
+    for a, b in zip(_prefix(m, given), _prefix(ref, _obs(0, module)), strict=True):
+        torch.testing.assert_close(a, b)
+
+
+def test_monitor_ignores_the_stage_pointer_without_a_given_stage():
+    m = _monitor_model()
+    module = _module_arrays(0)
+    other = {**module, "glow_ints": module["glow_ints"].copy()}
+    other["glow_ints"][:, _mi.INT_STAGE] = 1 - module["glow_ints"][:, _mi.INT_STAGE]
+    free = np.zeros(B, dtype=bool)
+    a = _prefix(m, _monitor_obs(0, module, glow_stage_given=free))[0]
+    b = _prefix(m, _monitor_obs(0, other, glow_stage_given=free))[0]
+    torch.testing.assert_close(a, b)
+    given = np.ones(B, dtype=bool)
+    c = _prefix(m, _monitor_obs(0, module, glow_stage_given=given))[0]
+    d = _prefix(m, _monitor_obs(0, other, glow_stage_given=given))[0]
+    assert not torch.allclose(c, d)
+
+
+def test_monitor_gates_follow_done_and_the_latched_floor():
+    import types
+
+    m = _monitor_model().eval()
+    ints = torch.as_tensor(_module_arrays(0)["glow_ints"])
+    valid = _enc.stage_valid(ints)
+    never = torch.full((B, _mi.K_MAX), -30.0)
+
+    def fixed(stage):
+        pointed = ints.clone()
+        pointed[:, _mi.INT_STAGE] = stage
+        return _enc.fixed_stage_gates(pointed, 0.06).float()
+
+    gates, done = m.monitor_stage_gates(types.SimpleNamespace(), never, valid, ints)
+    torch.testing.assert_close(gates, fixed(0), atol=1e-6, rtol=0)
+    assert float(done.max()) < 1e-6
+    latched = torch.zeros(B, _mi.K_MAX)
+    latched[:, 0] = 1.0
+    gates, done = m.monitor_stage_gates(types.SimpleNamespace(glow_prev_done=latched), never, valid, ints)
+    torch.testing.assert_close(gates, fixed(1), atol=1e-6, rtol=0)
+    assert done[:, 0].tolist() == [1.0] * B
+
+
+def test_monitor_sample_actions_return_the_done_probabilities():
+    m = _monitor_model()
+    out = _act(m, _monitor_obs(0, _module_arrays(0), glow_stage_given=np.zeros(B, dtype=bool)))
+    assert set(out) == {"actions", "glow_done"}
+    assert out["actions"].shape == (B, 10, 32) and out["glow_done"].shape == (B, _mi.K_MAX)
+    assert bool((out["glow_done"][:, K:] == 0).all())
+    assert bool(((out["glow_done"] >= 0) & (out["glow_done"] <= 1)).all())
+
+
+def test_monitor_training_terms_and_gradients():
+    m = _monitor_model(module_monitor_swap_p=1.0)
+    labels = np.zeros((B, _mi.K_MAX), np.float32)
+    labels[:2, 0] = 1.0
+    mask = np.zeros((B, _mi.K_MAX), bool)
+    mask[:, :K] = True
+    obs = _monitor_obs(
+        0, _module_arrays(0), glow_done=labels, glow_done_mask=mask, glow_stage_given=np.ones(B, dtype=bool)
+    )
+    m.zero_grad(set_to_none=True)
+    out = _flow(m, obs)
+    assert {"loss", "flow", "done_bce", "done_acc", "active_acc"} <= set(out)
+    torch.testing.assert_close(out["loss"], out["flow"] + out["done_bce"])
+    out["loss"].backward()
+    grads = [p.grad for n, p in m.named_parameters() if n.startswith(_glow_module.MONITOR_PREFIX)]
+    assert grads and all(g is not None for g in grads)
+    with pytest.raises(ValueError, match="glow_done"):
+        _flow(m, _monitor_obs(0, _module_arrays(0), glow_stage_given=np.ones(B, dtype=bool)))
+
+
+def test_monitor_row_loads_a_temporal_row_and_a_separate_monitor(tmp_path):
+    src = _model_with(module_temporal_gate=0.25)
+    path = tmp_path / "model.safetensors"
+    safetensors.torch.save_model(src, str(path))
+    m = _monitor_model()
+    missing, unexpected = safetensors.torch.load_model(m, str(path), strict=False)
+    m.check_partial_load(str(path), missing, unexpected)
+    assert m.monitor_missing
+    spatial = {k: v for k, v in src.state_dict().items() if k.startswith("glow_spatial_encoder.")}
+    for k, v in spatial.items():
+        assert torch.equal(m.state_dict()[k], v), k
+
+    trained = _monitor_model()
+    with torch.no_grad():
+        for p in trained.glow_progress_monitor.parameters():
+            p.add_(1.0)
+    monitor_dir = tmp_path / "monitor"
+    monitor_dir.mkdir()
+    state = {_glow_module.MONITOR_PREFIX + k: v for k, v in trained.glow_progress_monitor.state_dict().items()}
+    safetensors.torch.save_file(state, str(monitor_dir / "model.safetensors"))
+    assert m.load_progress_monitor(str(monitor_dir)) == len(state)
+    assert not m.monitor_missing
+    for k, v in trained.glow_progress_monitor.state_dict().items():
+        assert torch.equal(m.glow_progress_monitor.state_dict()[k], v), k
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        m.check_partial_load(str(path), missing, [*unexpected, "paligemma_with_expert.extra"])
+    cfg = _cfg(
+        GlowModulePi0Config,
+        module_width=32,
+        module_temporal=False,
+        module_temporal_monitor=True,
+        module_stage_gate=0.06,
+        module_monitor_width=16,
+        module_monitor_depth=1,
+        module_monitor_heads=2,
+    )
+    assert cfg.load_pytorch(None, str(path)).monitor_missing

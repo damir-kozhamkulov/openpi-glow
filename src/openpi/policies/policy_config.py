@@ -23,6 +23,7 @@ def create_trained_policy(
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
     spatial_from: str | None = None,
+    monitor_from: str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -39,6 +40,8 @@ def create_trained_policy(
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
         spatial_from: Another PyTorch checkpoint directory to take the GLOW Spatial encoder from.
+        monitor_from: A directory (or file) with a GLOW progress monitor's weights, for a monitor row
+            whose checkpoint has none (scripts/glow_progress_monitor.py --save-dir).
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -52,12 +55,16 @@ def create_trained_policy(
     is_pytorch = os.path.exists(weight_path)
 
     logging.info("Loading model...")
-    if spatial_from is not None and not is_pytorch:
-        raise ValueError("spatial_from needs a PyTorch checkpoint")
+    if (spatial_from is not None or monitor_from is not None) and not is_pytorch:
+        raise ValueError("spatial_from and monitor_from need a PyTorch checkpoint")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         if spatial_from is not None:
             logging.info(f"Spatial encoder from {spatial_from}: {model.load_spatial_encoder(spatial_from)} tensors")
+        if monitor_from is not None:
+            logging.info(f"Progress monitor from {monitor_from}: {model.load_progress_monitor(monitor_from)} tensors")
+        if getattr(model, "monitor_missing", False):
+            raise ValueError(f"{weight_path} has no progress monitor; give one with monitor_from")
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))

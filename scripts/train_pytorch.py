@@ -325,12 +325,38 @@ def load_init_weights(model: torch.nn.Module, model_path: str, device) -> None:
         return
     missing, unexpected = safetensors.torch.load_model(model, model_path, strict=False, device=str(device))
     stray = [k for k in missing if not k.startswith(prefixes)]
+    # Tensors the model does not use (a monitor row from a checkpoint with a Temporal encoder).
+    ignored = tuple(getattr(model, "init_ignored_prefixes", ()))
+    skipped = [k for k in unexpected if ignored and k.startswith(ignored)]
+    unexpected = [k for k in unexpected if k not in skipped]
     if stray or unexpected:
         raise RuntimeError(
             f"init weights {model_path} do not match the model outside {prefixes}: "
             f"missing {stray[:10]} ({len(stray)}), unexpected {unexpected[:10]} ({len(unexpected)})"
         )
     logging.info(f"Init weights: {len(missing)} tensors under {prefixes} start from their initialization")
+    if skipped:
+        logging.info(f"Init weights: {len(skipped)} tensors under {ignored} skipped (not in this model)")
+
+
+def load_module_init(model: torch.nn.Module, model_cfg) -> None:
+    """Loads the model config's module_monitor_init over the init weights (unwrapped model)."""
+    path = getattr(model_cfg, "module_monitor_init", None)
+    if path is not None:
+        logging.info(f"Progress monitor from {path}: {model.load_progress_monitor(path)} tensors")
+
+
+def freeze_spatial(model: torch.nn.Module) -> int:
+    """Stop gradients to the GLOW Spatial encoder (call before wrapping the model); returns how many
+    parameters that freezes."""
+    frozen = 0
+    for name, param in model.named_parameters():
+        if name.removeprefix("module.").startswith("glow_spatial_encoder."):
+            param.requires_grad_(False)
+            frozen += param.numel()
+    if frozen == 0:
+        raise ValueError("freeze_spatial: the model has no Spatial encoder")
+    return frozen
 
 
 def freeze_pretrained(model: torch.nn.Module) -> int:
@@ -667,6 +693,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Frozen: {freeze_pretrained(model):,} pretrained parameters (only the new ones train)")
     elif config.freeze_vlm:
         logging.info(f"Frozen VLM: {freeze_vlm(model):,} parameters (the action expert and new parameters train)")
+    if getattr(model_cfg, "module_freeze_spatial", False):
+        logging.info(f"Frozen Spatial encoder: {freeze_spatial(model):,} parameters")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -700,6 +728,7 @@ def train_loop(config: _config.TrainConfig):
             logging.info(f"Loading weights from: {config.pytorch_weight_path}")
             model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
             load_init_weights(model, model_path, device)
+            load_module_init(model, model_cfg)
         model = _fsdp.shard_model(model, _fsdp.build_mesh(device))
         if is_main and torch.cuda.is_available():
             log_memory_usage(device, 0, "after_sharding")
@@ -717,11 +746,9 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        load_init_weights(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
-            model_path,
-            device,
-        )
+        unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        load_init_weights(unwrapped, model_path, device)
+        load_module_init(unwrapped, model_cfg)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
