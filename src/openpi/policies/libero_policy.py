@@ -80,15 +80,15 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
-        # GLOW plan-state keys, consumed by the GlowPlanState model transform: the dataset's
-        # episode/frame at training; at inference the model's previous plan as echoed by the
-        # client, plus an optional oracle plan, an optional steering task whose plans are used, an
-        # optional chain of tasks whose stages run as one plan, the stage clock, and the stages the
-        # client has latched as done from a progress monitor's outputs. Absent otherwise.
+        # GLOW plan-state keys, consumed by the GlowModuleInputs model transform: the dataset's
+        # episode/frame at training; at inference the stage the client gives (its tracker's, a
+        # forced one, or none for a progress-monitor server), an optional steering task whose plans
+        # are used, an optional chain of tasks whose stages run as one plan, the stage clock, and
+        # the stages the client has latched as done from a progress monitor's outputs. Absent
+        # otherwise.
         for key in (
             "episode_index",
             "frame_index",
-            "prev_plan_index",
             "oracle_plan_index",
             "plan_task",
             "plan_chain",
@@ -116,11 +116,8 @@ class LiberoOutputs(transforms.DataTransformFn):
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
         out = {"actions": np.asarray(data["actions"][..., :7])}
-        # GLOW: the model's plan choice (a plan index when every stage was a candidate) and the
-        # candidate scores; the client echoes the choice back as the next query's previous plan.
-        # A progress monitor's done probability per stage (K_MAX, 0 past the plan), which the
-        # client latches.
-        for key in ("plan_choice", "plan_logp", "glow_done"):
-            if key in data:
-                out[key] = np.asarray(data[key])
+        # GLOW: a progress monitor's done probability per stage (K_MAX, 0 past the plan), which
+        # the client latches.
+        if "glow_done" in data:
+            out["glow_done"] = np.asarray(data["glow_done"])
         return out

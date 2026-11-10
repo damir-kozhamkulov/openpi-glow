@@ -90,8 +90,9 @@ class Policy(BasePolicy):
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         sampled = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
-        # A model may return a dict of outputs (GLOW: actions plus its plan choice) instead of the
-        # bare action array; every entry is batched and goes through the output transforms.
+        # A model may return a dict of outputs (GLOW: actions plus its progress monitor's done
+        # probabilities) instead of the bare action array; every entry is batched and goes through
+        # the output transforms.
         outputs = {"state": inputs["state"], **(sampled if isinstance(sampled, dict) else {"actions": sampled})}
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:

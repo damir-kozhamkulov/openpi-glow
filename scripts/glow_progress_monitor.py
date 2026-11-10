@@ -38,14 +38,9 @@ import dataclasses
 import json
 import logging
 import pathlib
-import sys
 import time
 
 import numpy as np
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import glow_flow_probe as _flow_probe  # noqa: E402
-import glow_temporal_probe as _probe  # noqa: E402
 
 GOAL_FIRST_EPISODE, GOAL_END_EPISODE = 379, 807
 FAMILIES = ("libero10", "goal", "chain")
@@ -513,9 +508,27 @@ class Store:
         self.valid = torch.stack(self.valid)
 
 
+def read_task_strings(root: pathlib.Path) -> dict[int, str]:
+    """The dataset's task strings by task index (meta/tasks.jsonl)."""
+    tasks = {}
+    with open(root / "meta/tasks.jsonl", encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            tasks[int(row["task_index"])] = row["task"]
+    return tasks
+
+
+def collate(items):
+    """Stacks rendered samples into a batch, as data_loader._collate_fn."""
+    import jax
+
+    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+
+
 def make_build(pipeline, root: pathlib.Path, action_horizon: int, task_strings, cache: int = 4):
     """build(samples) -> {"samples", "batch"}: the frames as the training loader hands them over
-    (as glow_temporal_probe.read_frames), rendered and collated. The last `cache` episodes' tables
+    (images, state, the action chunk with the last action repeated past the episode's end, indices
+    and the prompt), rendered and collated. The last `cache` episodes' tables
     stay in memory, so batches that share an episode read its file once."""
     import collections
     import io
@@ -558,7 +571,7 @@ def make_build(pipeline, root: pathlib.Path, action_horizon: int, task_strings, 
 
     def build(samples: list[dict]) -> dict:
         rendered = [pipeline(frame(s["episode"], s["frame"])) for s in samples]
-        return {"samples": samples, "batch": _flow_probe._collate(rendered)}  # noqa: SLF001
+        return {"samples": samples, "batch": collate(rendered)}
 
     return build
 
@@ -625,7 +638,7 @@ def dump(samples, pipeline, model, args, device, root, action_horizon) -> tuple[
     from openpi.models import model as _model
 
     embed = model.paligemma_with_expert.embed_language_tokens
-    build = make_build(pipeline, root, action_horizon, _probe.read_task_strings(root))
+    build = make_build(pipeline, root, action_horizon, read_task_strings(root))
     plan = [{"episode": s["episode"], "frame": s["frame"]} for s in samples]
     batches = Prefetch((plan[i : i + args.render_batch] for i in range(0, len(plan), args.render_batch)), build)
     store = Store()

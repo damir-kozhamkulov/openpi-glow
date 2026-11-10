@@ -61,18 +61,18 @@ class Args:
     # GLOW plan state (unset = stock client, nothing extra is sent)
     #################################################################################################################
     # Plan pack (build_plan_pack.py). When set, every observation carries the plan state a
-    # pi05_libero_glow_* server requires (glow_stage_tracker.PlanEcho), and a proprioceptive stage
+    # pi05_libero_glow_* server reads (glow_stage_tracker.PlanEcho), and a proprioceptive stage
     # tracker runs alongside for comparison. Tasks missing from the pack abort the run rather than
     # silently sending nothing.
     plan_pack: Optional[str] = None
-    # self: the model chooses each plan and reads its own choice back; oracle: the tracker's stage
-    # is the plan; forced: --plan-forced-index is the plan throughout (clamped to a task's last stage);
+    # oracle: the tracker's stage is the plan; forced: --plan-forced-index is the plan throughout
+    # (clamped to a task's last stage);
     # atoms: the plan is the first stage in --plan-order whose goal atom has not held yet on the
     # simulator; monitor: no stage is sent, the server's progress monitor decides it, and the stages
     # its done probabilities pass --plan-monitor-threshold for --plan-monitor-consecutive queries
     # are latched and sent back (glow_stage_tracker.MonitorLatch). Every mode logs when each
     # stage's goal atom first held and which held first.
-    plan_mode: Literal["self", "oracle", "forced", "atoms", "monitor"] = "self"
+    plan_mode: Literal["oracle", "forced", "atoms", "monitor"] = "oracle"
     plan_forced_index: Optional[int] = None
     plan_monitor_threshold: float = glow_stage_tracker.MONITOR_THRESHOLD
     plan_monitor_consecutive: int = glow_stage_tracker.MONITOR_CONSECUTIVE
@@ -88,18 +88,17 @@ class Args:
     # its atom holds.
     plan_release_cap: Optional[int] = None
     # Steering (needs --plan-pack): the plans sent are this pack task's instead of the
-    # environment's - the input plan, the oracle / forced plan and the candidates, stage indices
-    # clamped to its stages. Against a plan-bottleneck server (pi05_libero_glow_bottleneck) the
-    # actions read nothing but the plan, so this measures whether they follow it. While steering,
-    # two goals are scored on the same simulator state: the environment task's (`success`, met at
+    # environment's, stage indices clamped to its stages. A GLOW module server reads nothing but
+    # the plan, so this measures whether the actions follow it. While steering, two goals are
+    # scored on the same simulator state: the environment task's (`success`, met at
     # any step) and the steering task's (`steered_success`, which ends the episode). The steering
     # task must be a task of this suite set in the environment task's scene (SCENE_FIELDS); the
     # run refuses to start otherwise.
     plan_task: Optional[str] = None
     # Steering by a derangement (needs --plan-pack, excludes --plan-task): environment task i gets
-    # the plans of suite task (i + offset) mod n, scored as for --plan-task. A plan-as-prompt server
-    # (pi05_libero_plan_prompt) reads nothing but the plan, so its own-task success should collapse
-    # when the plans are another goal's, and its steered success shows whether it reaches that goal.
+    # the plans of suite task (i + offset) mod n, scored as for --plan-task: own-task success
+    # should collapse when the plans are another goal's, and the steered success shows whether the
+    # policy reaches that goal.
     plan_task_offset: Optional[int] = None
     # Chains (needs --plan-pack and --plan-mode atoms or forced; excludes steering): environment
     # task i runs a two-stage plan of its own goal and a partner's, the partner being the first
@@ -118,7 +117,7 @@ class Args:
     # budget, and the policy then takes over for the second stage. None: the policy goes on from
     # wherever the first stage ended.
     plan_return_steps: Optional[int] = None
-    # Instruction sent to the server in place of the environment's task (the planner reads it).
+    # Instruction sent to the server in place of the environment's task.
     prompt: Optional[str] = None
     # When set, every episode's queries (both cameras and the state as sent, the other request
     # fields, the response's glow_done) and its plan trace go to <dump_dir>/task<i>_ep<n>.npz
@@ -392,11 +391,9 @@ def eval_libero(args: Args) -> None:
                             query_dump.add(t - args.num_steps_wait, element, response)
                         if plan is not None:
                             used = plan.update(response)
-                            logp = response.get("plan_logp")
                             done = response.get("glow_done")
                             logging.info(
-                                f"plan query: frame={plan.tracker.frame} plan={used} tracker={plan.tracker.plan_index} "
-                                f"logp={None if logp is None else np.round(np.asarray(logp, dtype=float), 3).tolist()}"
+                                f"plan query: frame={plan.tracker.frame} plan={used} tracker={plan.tracker.plan_index}"
                                 + (
                                     ""
                                     if done is None

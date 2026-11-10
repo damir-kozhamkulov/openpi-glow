@@ -26,7 +26,7 @@ from openpi.glow.model_config import GlowModulePi0Config
 from openpi.models_pytorch.glow_module_pi0_pytorch import GlowModulePI0Pytorch
 from openpi.models_pytorch.glow_module_pi0_pytorch_test import B
 from openpi.models_pytorch.glow_module_pi0_pytorch_test import _distill_obs
-from openpi.models_pytorch.glow_pi0_pytorch_test import _cfg
+from openpi.models_pytorch.glow_testing import dummy_config as _cfg
 
 from . import train_pytorch
 from .train_pytorch_fsdp_test import _test_environment

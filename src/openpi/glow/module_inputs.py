@@ -1,8 +1,8 @@
 """Data transform for GLOW's planning module read by learned encoders (GlowModulePI0Pytorch).
 
-`GlowModuleInputs` runs before the stock tokenizer, like `GlowPlanAsPrompt`, and drops the task
-string the same way (the prompt becomes empty). It emits the WHOLE plan of the sample's task as
-fixed-shape arrays, split between the two encoders so that each carries what the other cannot:
+`GlowModuleInputs` runs before the stock tokenizer and drops the task string (the prompt becomes
+empty). It emits the WHOLE plan of the sample's task as fixed-shape arrays, split between the two
+encoders so that each carries what the other cannot:
 
     Spatial   what every stage does and where: per stage its atom, subgoal_operation, object and
               target nouns, predicate and anchors (the grounding), in the order `stage_order`
@@ -30,7 +30,7 @@ The active stage comes from the labels at training (`episode_index` / `frame_ind
 `oracle_plan_index` at inference (the client's tracker, or a forced stage); an optional
 `plan_task` steers (that task's plan, index clamped to its stages) and an optional `plan_chain`
 (a list of task strings) runs their stages as one plan in that order, the index counting over
-the chain. `prev_plan_index`, sent by every GLOW client, is accepted and ignored. The stage clock
+the chain. The stage clock
 comes from `frame_index` and the episode's stage starts at training and from `plan_stage_frames`
 (the client's count since the stage it sends last changed) at inference; with `stage_clock` an
 inference sample without it raises. A field longer than its segment raises rather than being cut.
@@ -296,7 +296,6 @@ class GlowModuleInputs(DataTransformFn):
         plan_task = None if plan_task is None or not _scalar(plan_task) else _scalar(plan_task)
         plan_chain = data.pop("plan_chain", None)
         plan_chain = None if plan_chain is None or len(plan_chain) == 0 else [_scalar(t) for t in plan_chain]
-        data.pop("prev_plan_index", None)
         stage_frames = data.pop("plan_stage_frames", None)
         prev_done = data.pop("plan_prev_done", None)
         grounding = None

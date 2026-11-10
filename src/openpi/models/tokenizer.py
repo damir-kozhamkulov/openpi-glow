@@ -47,11 +47,6 @@ class PaligemmaTokenizer:
 
         return np.asarray(tokens), np.asarray(mask)
 
-    def encode_answer(self, text: str) -> list[int]:
-        """Tokens of an answer block placed after the prompt: no BOS, EOS-terminated."""
-        cleaned_text = text.strip().replace("_", " ").replace("\n", " ")
-        return self._tokenizer.encode(cleaned_text, add_bos=False, add_eos=True)
-
     def encode_text(self, text: str) -> list[int]:
         """Tokens of a bare text piece, cleaned as prompts are: no BOS, no EOS."""
         cleaned_text = text.strip().replace("_", " ").replace("\n", " ")

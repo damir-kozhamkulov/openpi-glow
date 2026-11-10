@@ -16,7 +16,6 @@ import tyro
 import openpi.glow.model_config as glow_model_config
 import openpi.glow.module_inputs as _module_inputs
 import openpi.glow.plan_pack as _plan_pack
-import openpi.glow.plan_prompt as _plan_prompt
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -375,43 +374,22 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
-    """LIBERO pipeline plus GLOW's plan state: previous plan in the prompt, current plan as target.
+    """LIBERO pipeline plus GLOW's planning module as encoder inputs.
 
     Differences from `LeRobotLiberoDataConfig`: the repack keeps `episode_index` / `frame_index`
-    so the plan state can be looked up, and the model transforms insert `GlowPlanState` before
-    the stock tokenizer and `GlowTokenizePlan` after it. Everything else (images, state, actions,
-    normalization, tokenizer, max_token_len) is the stock pi05 pipeline.
-
-    `plan_as_prompt` instead inserts `GlowPlanAsPrompt` before the tokenizer: the active plan
-    replaces the prompt, with no previous plan and no plan block.
-
-    `module_inputs` instead inserts `GlowModuleInputs` before the tokenizer: the active stage goes
-    to the model as arrays for its Spatial / Temporal encoders and the prompt is emptied (the task
-    string is dropped). The model must be a GlowModulePi0Config.
+    so the plan state can be looked up, and the model transforms insert `GlowModuleInputs` before
+    the stock tokenizer: the whole plan goes to the model as arrays for its Spatial / Temporal
+    encoders and the prompt is emptied (the task string is dropped). Everything else (images,
+    state, actions, normalization, tokenizer) is the stock pi05 pipeline. The model must be a
+    GlowModulePi0Config.
     """
 
     # Plan pack path; None resolves $OPENPI_PLAN_PACK, then the in-image default.
     plan_pack_path: str | None = None
-    # Frames between the input plan and the target plan. Required, like plan_corrupt_p: every row
-    # states both, so no row inherits a value by accident.
-    plan_delta: int | None = None
-    # Probability that a training sample's input plan is replaced by another stage of its task.
-    plan_corrupt_p: float | None = None
-    # Grounding in the rendered plans: the object / target nouns and their digitized anchor bins.
-    plan_nouns: bool = True
-    plan_anchors: bool = True
-    # Append the plan block twice, the second copy for the actions; must match the model's
-    # GlowPi0Config.plan_bottleneck.
-    plan_bottleneck: bool = False
-    # The active plan is the whole prompt (the task string is dropped); plan_delta and
-    # plan_corrupt_p do not apply.
-    plan_as_prompt: bool = False
-    # The whole plan as encoder inputs (GlowModuleInputs); plan_delta and plan_corrupt_p do not
-    # apply. module_stage_order orders the Spatial groups ("sorted" by runtime key: a set, the
-    # execution order in the Temporal arrays alone; or "execution"). module_chain_p > 0 chains a
-    # training sample of a one-stage task in module_chain_tasks (task indices) with another such
-    # task, in random order, with that probability.
-    module_inputs: bool = False
+    # module_stage_order orders the Spatial groups ("sorted" by runtime key: a set, the execution
+    # order in the Temporal arrays alone; or "execution" / "remaining", GlowModuleInputs).
+    # module_chain_p > 0 chains a training sample of a one-stage task in module_chain_tasks (task
+    # indices) with another such task, in random order, with that probability.
     module_stage_order: str = "sorted"
     module_chain_p: float = 0.0
     module_chain_tasks: tuple[int, ...] = ()
@@ -430,23 +408,12 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if sum((self.plan_as_prompt, self.plan_bottleneck, self.module_inputs)) > 1:
-            raise ValueError(
-                "LeRobotLiberoGlowDataConfig: plan_as_prompt, plan_bottleneck and module_inputs exclude each other"
-            )
-        if isinstance(model_config, glow_model_config.GlowModulePi0Config) != self.module_inputs:
-            raise ValueError("LeRobotLiberoGlowDataConfig.module_inputs needs, and is needed by, a GlowModulePi0Config")
-        if not (self.plan_as_prompt or self.module_inputs) and (self.plan_delta is None or self.plan_corrupt_p is None):
-            raise ValueError("LeRobotLiberoGlowDataConfig.plan_delta and plan_corrupt_p must be set explicitly")
-        if bool(getattr(model_config, "plan_bottleneck", False)) != self.plan_bottleneck:
-            raise ValueError("LeRobotLiberoGlowDataConfig.plan_bottleneck must match the model's plan_bottleneck")
+        if not isinstance(model_config, glow_model_config.GlowModulePi0Config):
+            raise ValueError("LeRobotLiberoGlowDataConfig needs a GlowModulePi0Config")
         if model_config.model_type != ModelType.PI05:
             raise ValueError("GLOW is defined for the pi05 model type")
-        assert isinstance(model_config, pi0_config.Pi0Config)
-        if self.module_stage_clock != bool(getattr(model_config, "module_stage_clock", False)):
+        if self.module_stage_clock != model_config.module_stage_clock:
             raise ValueError("LeRobotLiberoGlowDataConfig.module_stage_clock must match the model's module_stage_clock")
-        if (self.module_stage_clock or self.module_episode_grounding) and not self.module_inputs:
-            raise ValueError("module_stage_clock and module_episode_grounding need module_inputs")
         if self.decision_repeat < 1 or self.decision_window < 0:
             raise ValueError("decision_repeat must be >= 1 and decision_window >= 0")
         base = super().create(assets_dirs, model_config)
@@ -474,56 +441,34 @@ class LeRobotLiberoGlowDataConfig(LeRobotLiberoDataConfig):
                 decision_repeat=self.decision_repeat,
                 episode_stage_starts=tuple(sorted((ep, e.stage_starts) for ep, e in pack.episodes.items())),
             )
-        # Splice the two GLOW transforms into the stock pi05 list the parent already built - the
-        # prompt rewrite immediately before the tokenizer, the plan block immediately after - and
-        # reuse that tokenizer, so the SentencePiece model is loaded once.
+        # Splice GlowModuleInputs into the stock pi05 list the parent already built, immediately
+        # before the tokenizer, and reuse that tokenizer, so the SentencePiece model is loaded once.
         stock = list(base.model_transforms.inputs)
         at_tokenize = [n for n, t in enumerate(stock) if isinstance(t, _transforms.TokenizePrompt)]
         if len(at_tokenize) != 1:
             raise ValueError(f"expected one TokenizePrompt in the pi05 model transforms, got {len(at_tokenize)}")
         i = at_tokenize[0]
-        if self.module_inputs:
-            teacher = (
-                _tokenizer.PaligemmaTokenizer(model_config.module_teacher_prompt_len)
-                if model_config.module_distill_weight > 0
-                else None
-            )
-            module = _module_inputs.GlowModuleInputs(
-                pack,
-                stock[i].tokenizer,
-                teacher,
-                stage_order=self.module_stage_order,
-                stage_clock=self.module_stage_clock,
-                episode_grounding=self.module_episode_grounding,
-                chain_p=self.module_chain_p,
-                chain_tasks=self.module_chain_tasks,
-                counterfactual_p=self.module_counterfactual_p,
-                counterfactual_window=self.module_counterfactual_window,
-                counterfactual_tasks=self.module_counterfactual_tasks,
-                monitor=model_config.module_temporal_monitor,
-            )
-            plan = [module, stock[i]]
-            model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
-            return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
-        if self.plan_as_prompt:
-            plan = [_plan_prompt.GlowPlanAsPrompt(pack, nouns=self.plan_nouns, anchors=self.plan_anchors), stock[i]]
-            model_transforms = dataclasses.replace(base.model_transforms, inputs=[*stock[:i], *plan, *stock[i + 1 :]])
-            return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
+        teacher = (
+            _tokenizer.PaligemmaTokenizer(model_config.module_teacher_prompt_len)
+            if model_config.module_distill_weight > 0
+            else None
+        )
+        module = _module_inputs.GlowModuleInputs(
+            pack,
+            stock[i].tokenizer,
+            teacher,
+            stage_order=self.module_stage_order,
+            stage_clock=self.module_stage_clock,
+            episode_grounding=self.module_episode_grounding,
+            chain_p=self.module_chain_p,
+            chain_tasks=self.module_chain_tasks,
+            counterfactual_p=self.module_counterfactual_p,
+            counterfactual_window=self.module_counterfactual_window,
+            counterfactual_tasks=self.module_counterfactual_tasks,
+            monitor=model_config.module_temporal_monitor,
+        )
         model_transforms = dataclasses.replace(
-            base.model_transforms,
-            inputs=[
-                *stock[:i],
-                _plan_prompt.GlowPlanState(
-                    pack,
-                    delta=self.plan_delta,
-                    corrupt_p=self.plan_corrupt_p,
-                    nouns=self.plan_nouns,
-                    anchors=self.plan_anchors,
-                ),
-                stock[i],
-                _plan_prompt.GlowTokenizePlan(stock[i].tokenizer, action_block=self.plan_bottleneck),
-                *stock[i + 1 :],
-            ],
+            base.model_transforms, inputs=[*stock[:i], module, stock[i], *stock[i + 1 :]]
         )
         return dataclasses.replace(base, repack_transforms=repack_transform, model_transforms=model_transforms)
 
@@ -733,43 +678,13 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-def _glow_plan_prompt_train_config(name: str, **data) -> "TrainConfig":
-    """The plan-as-prompt row (pi05 reading the active stage's rendered plan instead of the task
-    string) on the LIBERO-10 + Goal pack; `data` overrides fields of its
-    LeRobotLiberoGlowDataConfig."""
-    return TrainConfig(
-        name=name,
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
-        data=LeRobotLiberoGlowDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
-            plan_as_prompt=True,
-            train_episodes="0:807",
-            **data,
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=300,
-            peak_lr=6.25e-6,
-            decay_steps=5_000,
-            decay_lr=6.25e-7,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=5_000,
-    )
-
-
 def _glow_module_train_config(name: str, data: dict | None = None, **module) -> "TrainConfig":
     """A GLOW module row: GlowModulePi0Config (switches in `module`) reading the LIBERO-10 + Goal
-    pack's plans, with pi05_libero_plan_prompt's data and recipe; `data` overrides fields of the
-    LeRobotLiberoGlowDataConfig (the chain augmentation, the Spatial stage order). The prompt is
-    empty, so max_token_len is cut to 8 (BOS and the newline answer token are the only language
-    tokens)."""
+    pack's plans on LIBERO-10 + LIBERO-Goal (episodes 0-806), batch 32 x 5k steps from the
+    converged pi05_libero, with that recipe's peak LR scaled to batch 32 (5e-5 x 32/256) and a
+    cosine decay to a tenth by the last step; `data` overrides fields of the
+    LeRobotLiberoGlowDataConfig. The prompt is empty, so max_token_len is cut to 8 (BOS and the
+    newline answer token are the only language tokens)."""
     return TrainConfig(
         name=name,
         model=glow_model_config.GlowModulePi0Config(
@@ -780,7 +695,6 @@ def _glow_module_train_config(name: str, data: dict | None = None, **module) -> 
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
-            module_inputs=True,
             train_episodes="0:807",
             **(data or {}),
         ),
@@ -1004,232 +918,31 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-    # GLOW unified model: pi05_libero whose prompt carries the plan state delta frames earlier
-    # ("{task}. Was: {plan}") and which predicts the current plan ("Now: {plan}", cross-entropy
-    # weighted by subtask_ce_weight) jointly with the actions. Identical recipe otherwise (batch,
-    # schedule, optimizer, EMA, weights). plan_delta = 5 is the LIBERO client's replan interval.
-    # norm_stats are shared with pi05_libero via --data.assets.assets-dir (the entrypoint sets it).
-    TrainConfig(
-        name="pi05_libero_glow_unified",
-        model=glow_model_config.GlowPi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.1
-        ),
-        data=LeRobotLiberoGlowDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            plan_delta=5,
-            plan_corrupt_p=0.25,
-        ),
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    # Grounding ablation: pi05_libero_glow_unified with the object / target nouns and anchor bins
-    # removed from every rendered plan (input and target alike).
-    TrainConfig(
-        name="pi05_libero_glow_unified_nogrounding",
-        model=glow_model_config.GlowPi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False, subtask_ce_weight=0.1
-        ),
-        data=LeRobotLiberoGlowDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            plan_delta=5,
-            plan_corrupt_p=0.25,
-            plan_nouns=False,
-            plan_anchors=False,
-        ),
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    # Plan bottleneck: pi05_libero_glow_unified with the actions reading language only through a
-    # copy of the plan block (GlowPI0Pytorch's module docstring), trained on LIBERO-10 + LIBERO-Goal
-    # (episodes 0-806; Goal is ten goals in one scene, so only the plan tells the actions which).
-    # Plans come from the LIBERO-10 + Goal pack. Batch 32 x 5k steps from the converged
-    # pi05_libero, with the recipe's peak LR scaled to batch 32 (5e-5 x 32/256) and a cosine decay
-    # to a tenth by the last step. max_token_len 272: the longest prompt + two plan blocks in that
-    # pack is 265 tokens.
-    # Same-data baseline for pi05_libero_glow_bottleneck: the stock pi05_libero model and pipeline
-    # on the same episodes (LIBERO-10 + LIBERO-Goal, 0-806) with the same schedule, budget and
-    # initialization, so a bottleneck row's delta is against a model that saw the same
-    # demonstrations.
-    TrainConfig(
-        name="pi05_libero_10_goal",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            train_episodes="0:807",
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=300,
-            peak_lr=6.25e-6,
-            decay_steps=5_000,
-            decay_lr=6.25e-7,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=5_000,
-    ),
-    # Plan as the prompt: the stock pi05_libero model whose only language input is the active plan
-    # (the task string is dropped), on LIBERO-10 + LIBERO-Goal with pi05_libero_10_goal's recipe.
-    # Plans are the labels at training; at evaluation the LIBERO client sends the stage (its
-    # tracker's, or a forced one) and optionally another task to steer by.
-    _glow_plan_prompt_train_config("pi05_libero_plan_prompt"),
-    TrainConfig(
-        name="pi05_libero_glow_bottleneck",
-        model=glow_model_config.GlowPi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            subtask_ce_weight=0.1,
-            plan_bottleneck=True,
-            max_token_len=272,
-        ),
-        data=LeRobotLiberoGlowDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-            plan_pack_path="/app/glow/plan_pack_libero10_goal.json",
-            plan_delta=5,
-            plan_corrupt_p=0.25,
-            plan_bottleneck=True,
-            train_episodes="0:807",
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=300,
-            peak_lr=6.25e-6,
-            decay_steps=5_000,
-            decay_lr=6.25e-7,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=5_000,
-    ),
     # GLOW module rows: the planning module through learned Spatial / Temporal encoders, the task
-    # string dropped (the encoders are the only goal input). _st is the full model; the others
-    # ablate the Temporal encoder, the grounding (anchors) and the subgoal_operation text.
-    _glow_module_train_config("pi05_libero_glow_st"),
-    _glow_module_train_config("pi05_libero_glow_s_only", module_temporal=False),
-    _glow_module_train_config("pi05_libero_glow_nogrounding", module_grounding=False),
-    _glow_module_train_config("pi05_libero_glow_nosubgoal", module_subgoal_text=False),
-    # Text-anchored encoders (each token starts as its slot's text embedding) whose tokens enter
-    # the prefix at a word token's size. _st_align trains only them, the backbone frozen, on
-    # flow + distillation from the same model reading the task string; _st_anchor is the joint
-    # fine-tune, started from an _st_align checkpoint.
-    _glow_module_train_config(
-        "pi05_libero_glow_st_align",
-        module_text_anchor=True,
-        module_token_scale="words",
-        freeze_pretrained=True,
-        module_distill_weight=1.0,
-    ),
-    _glow_module_train_config("pi05_libero_glow_st_anchor", module_text_anchor=True, module_token_scale="words"),
-    # Chain rows: _st_anchor's model and recipe, training samples of the LIBERO-Goal tasks
-    # (task indices 10-19, one scene) chained in pairs in random order half of the time, so the
-    # Temporal pointer is the only input that says which stage is active. _chain shows the Spatial
-    # groups sorted by runtime key (the execution order lives in the Temporal arrays alone);
-    # _chain_exec shows them in execution order.
-    _glow_module_train_config(
-        "pi05_libero_glow_chain",
-        data={"module_chain_p": 0.5, "module_chain_tasks": tuple(range(10, 20))},
-        module_text_anchor=True,
-        module_token_scale="words",
-    ),
-    _glow_module_train_config(
-        "pi05_libero_glow_chain_exec",
-        data={"module_chain_p": 0.5, "module_chain_tasks": tuple(range(10, 20)), "module_stage_order": "execution"},
-        module_text_anchor=True,
-        module_token_scale="words",
-    ),
-    # Frozen-VLM rows (TrainConfig.freeze_vlm: the action expert and the encoders train), which fit
-    # one 48 GB GPU. _st_anchor_fv is _st_anchor so: the parity row against the joint fine-tune.
-    dataclasses.replace(
-        _glow_module_train_config(
-            "pi05_libero_glow_st_anchor_fv", module_text_anchor=True, module_token_scale="words"
-        ),
-        freeze_vlm=True,
-    ),
-    # The v2 inputs: the remaining plan (the active stage's Spatial group first, done stages not
-    # shown), head-word anchors, the Temporal stage clock, training samples' own per-episode
-    # anchors, and decision frames (the first 40 after every stage start) seen 3x per epoch. The
-    # suffixed rows switch Spatial inputs off: the anchors' xyz, the atom text, or every text
-    # (grounding_only: predicates and xyz only).
-    *(
-        dataclasses.replace(
-            _glow_module_train_config(
-                name,
-                data={
-                    "module_stage_order": "remaining",
-                    "module_stage_clock": True,
-                    "module_episode_grounding": True,
-                    "decision_window": 40,
-                    "decision_repeat": 3,
-                },
-                module_text_anchor=True,
-                module_token_scale="words",
-                module_anchor="head",
-                module_stage_clock=True,
-                **switches,
-            ),
-            freeze_vlm=True,
-        )
-        for name, switches in (
-            ("pi05_libero_glow_v2", {}),
-            ("pi05_libero_glow_v2_nogrounding", {"module_grounding": False}),
-            ("pi05_libero_glow_v2_noatom", {"module_atom": False}),
-            (
-                "pi05_libero_glow_v2_grounding_only",
-                {"module_subgoal_text": False, "module_nouns": False, "module_atom": False},
-            ),
-        )
-    ),
-    # Ordering rows (align recipe: only the encoders train, so the distillation teacher - the
-    # same frozen model reading the active stage's instruction - stays fixed). Both add
-    # counterfactual samples: within 40 frames of a Goal-scene episode's start, half the samples
-    # get another Goal task's plan and the teacher's velocity for it. _v2t keeps the order out of
-    # the Spatial tokens (sorted groups, a summary anchored to all shown stages) and anchors the
-    # Temporal active token to the active stage's object noun, so only Temporal says which stage
-    # comes first; _v2s is the v2 inputs (the remaining plan, active stage first) on the same
-    # recipe; _v2t_gate is _v2t with the Temporal encoder also scaling the Spatial groups, the
-    # other stages' starting at a quarter of the active stage's; _v2t_key is _v2t with the Temporal
-    # encoder reading only the active stage's runtime key, so no stage clock; _v2t_fixed is _v2t_key
-    # with the other stages' Spatial groups at a constant set by the stage pointer, _v2t_fixed_masked
-    # the same without the Temporal tokens in the prefix. Both serve _v2t_key's weights with _v2t_gate's
-    # Spatial encoder (serve_policy's --policy.spatial-from).
+    # string dropped (the encoders are the only goal input). All use the align recipe: only the
+    # encoders train, so the distillation teacher - the same frozen model reading the active
+    # stage's instruction - stays fixed. Head-word text anchors, tokens at a word token's size,
+    # training samples' own per-episode anchors, decision frames (the first 40 after every stage
+    # start) seen 3x per epoch, and counterfactual samples: within 40 frames of a Goal-scene
+    # episode's start, half the samples get another Goal task's plan and the teacher's velocity
+    # for it. The Spatial tokens carry no order (sorted groups, a summary anchored to all shown
+    # stages).
+    #   _v2t_gate  the Temporal active token is anchored to the active stage's object noun, and the
+    #              Temporal encoder scales the Spatial groups, the other stages' starting at a
+    #              quarter of the active stage's.
+    #   _v2t_fixed the Temporal encoder reads only the active stage's runtime key (no stage clock),
+    #              and the other stages' Spatial groups enter at a constant 0.06 set by the stage
+    #              pointer.
+    #   _monitor   the progress monitor decides the stage: _v2t_fixed's 0.06 turn-down of the
+    #              stages it does not make active, no Temporal encoder; only the monitor trains.
+    #              Served with a _v2t_gate checkpoint and a monitor from
+    #              scripts/glow_progress_monitor.py --save-dir (serve_policy --policy.monitor-from),
+    #              or trained from them (module_monitor_init).
     *(
         _glow_module_train_config(
             name,
             data={
-                "module_stage_order": order,
+                "module_stage_order": "sorted",
                 "module_stage_clock": clock,
                 "module_episode_grounding": True,
                 "module_counterfactual_p": 0.5,
@@ -1242,57 +955,26 @@ _CONFIGS = [
             module_token_scale="words",
             module_anchor="head",
             module_stage_clock=clock,
+            module_ctx_active=False,
             freeze_pretrained=True,
             module_distill_weight=1.0,
             **switches,
         )
-        for name, order, clock, switches in (
-            (
-                "pi05_libero_glow_v2t",
-                "sorted",
-                True,
-                {"module_ctx_active": False, "module_temporal_active_anchor": "object"},
-            ),
+        for name, clock, switches in (
             (
                 "pi05_libero_glow_v2t_gate",
-                "sorted",
                 True,
-                {"module_ctx_active": False, "module_temporal_active_anchor": "object", "module_temporal_gate": 0.25},
-            ),
-            (
-                "pi05_libero_glow_v2t_key",
-                "sorted",
-                False,
-                {"module_ctx_active": False, "module_temporal_key_only": True},
+                {"module_temporal_active_anchor": "object", "module_temporal_gate": 0.25},
             ),
             (
                 "pi05_libero_glow_v2t_fixed",
-                "sorted",
                 False,
-                {"module_ctx_active": False, "module_temporal_key_only": True, "module_stage_gate": 0.06},
+                {"module_temporal_key_only": True, "module_stage_gate": 0.06},
             ),
-            (
-                "pi05_libero_glow_v2t_fixed_masked",
-                "sorted",
-                False,
-                {
-                    "module_ctx_active": False,
-                    "module_temporal_key_only": True,
-                    "module_stage_gate": 0.06,
-                    "module_temporal_masked": True,
-                },
-            ),
-            ("pi05_libero_glow_v2s", "remaining", True, {}),
-            # The progress monitor decides the stage: the fixed rows' 0.06 turn-down of the stages
-            # it does not make active, no Temporal encoder; only the monitor trains. Served with
-            # run8-gate's weights and a monitor from scripts/glow_progress_monitor.py --save-dir
-            # (serve_policy --policy.monitor-from), or trained from them (module_monitor_init).
             (
                 "pi05_libero_glow_monitor",
-                "sorted",
                 False,
                 {
-                    "module_ctx_active": False,
                     "module_temporal": False,
                     "module_temporal_monitor": True,
                     "module_stage_gate": 0.06,
@@ -1300,12 +982,6 @@ _CONFIGS = [
                 },
             ),
         )
-    ),
-    # The text control for the v2 rows: pi05_libero_plan_prompt with the same frozen VLM and
-    # decision oversampling.
-    dataclasses.replace(
-        _glow_plan_prompt_train_config("pi05_libero_plan_prompt_fv", decision_window=40, decision_repeat=3),
-        freeze_vlm=True,
     ),
     #
     # Fine-tuning Aloha configs.

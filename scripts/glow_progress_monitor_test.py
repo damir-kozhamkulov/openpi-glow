@@ -15,10 +15,10 @@ import types
 import numpy as np
 import pytest
 
-from . import glow_module_diag_test as _diag_test
 from . import glow_progress_monitor as gpm
+from . import glow_test_support as _support
 
-GOAL_PACK, DATASET = _diag_test.GOAL_PACK, _diag_test.DATASET
+GOAL_PACK, DATASET = _support.GOAL_PACK, _support.DATASET
 needs_pack_and_data = pytest.mark.skipif(
     not (GOAL_PACK.exists() and (DATASET / "meta/info.json").exists()),
     reason="plan pack or local LeRobot copy not present",
@@ -198,7 +198,7 @@ def test_load_vision_reads_only_the_vision_tower_projector_and_embedding(monkeyp
 
     from openpi.training import config as _config
 
-    _diag_test._dummy_configs(monkeypatch)  # noqa: SLF001
+    _support.dummy_configs(monkeypatch)
     cfg = _config.get_config("pi05_libero_glow_v2t_fixed")
     torch.manual_seed(0)
     full = dataclasses.replace(cfg.model, dtype="float32").create_pytorch()
@@ -224,7 +224,7 @@ def test_main_end_to_end_on_dummy_weights(monkeypatch, tmp_path):
 
     from openpi.training import config as _config
 
-    _diag_test._dummy_configs(monkeypatch)  # noqa: SLF001
+    _support.dummy_configs(monkeypatch)
     cfg = _config.get_config("pi05_libero_glow_v2t_fixed")
     torch.manual_seed(0)
     safetensors.torch.save_model(cfg.model.create_pytorch(), str(tmp_path / "model.safetensors"))

@@ -21,14 +21,6 @@ from openpi.glow import plan_pack as _plan_pack
 REPO = pathlib.Path(__file__).resolve().parents[4]  # glow_repo (openpi is its submodule)
 GOAL_PACK = REPO / "derived/plan_pack_libero10_goal.json"
 CHAINS = (REPO / "derived/plan_chain.csv", REPO / "derived/goal_plan_chain.csv")
-CONFIGS = (
-    "pi05_libero_glow_st",
-    "pi05_libero_glow_s_only",
-    "pi05_libero_glow_nogrounding",
-    "pi05_libero_glow_nosubgoal",
-    "pi05_libero_glow_chain",
-    "pi05_libero_glow_chain_exec",
-)
 GOAL_TASKS = tuple(range(10, 20))
 
 pytestmark = pytest.mark.skipif(
@@ -177,15 +169,15 @@ def test_training_stage_at_boundaries(pack, chain, transform):
 def test_inference_and_steering(pack, transform):
     two = next(t for t in pack.tasks.values() if t.num_plans == 2)
     one = next(t for t in pack.tasks.values() if t.num_plans == 1)
-    out = transform({"prompt": two.task, "oracle_plan_index": np.int64(1), "prev_plan_index": np.int64(0)})
-    assert out["prompt"] == "" and "prev_plan_index" not in out and "oracle_plan_index" not in out
+    out = transform({"prompt": two.task, "oracle_plan_index": np.int64(1)})
+    assert out["prompt"] == "" and "oracle_plan_index" not in out
     np.testing.assert_array_equal(out["glow_text"], transform.encode(two.task, 1)["glow_text"])
     # Steering: the steering task's plan, the stage clamped to its stages.
     out = transform({"prompt": two.task, "oracle_plan_index": 1, "plan_task": one.task})
     for key, value in transform.encode(one.task, 0).items():
         np.testing.assert_array_equal(out[key], value)
     with pytest.raises(ValueError, match="oracle"):
-        transform({"prompt": two.task, "prev_plan_index": 0})
+        transform({"prompt": two.task})
     ep = next(e for e, p in pack.episodes.items() if p.task_index == two.task_index)
     with pytest.raises(ValueError, match="steering"):
         transform({"prompt": two.task, "episode_index": ep, "frame_index": 0, "plan_task": one.task})
@@ -229,7 +221,7 @@ def test_plan_chain_through_policy_inputs(monkeypatch, pack):
     from openpi_client import msgpack_numpy
 
     monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    cfg = _config.get_config("pi05_libero_glow_chain")
+    cfg = _config.get_config("pi05_libero_glow_v2t_fixed")
     dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
     assert isinstance(dc.data_transforms.inputs[0], libero_policy.LiberoInputs)
     served = _transforms.compose(
@@ -384,112 +376,34 @@ def test_samples_make_a_valid_observation(pack, transform):
     assert obs.glow_ints.shape == (3, _mi.INTS_LEN)
 
 
-def test_module_configs(monkeypatch):
+def test_data_config_validation(monkeypatch):
     import openpi.training.config as _config
-    from openpi.glow.model_config import GlowModulePi0Config
 
-    plan_prompt = _config.get_config("pi05_libero_plan_prompt")
-    switches = {
-        "pi05_libero_glow_st": {},
-        "pi05_libero_glow_s_only": {"module_temporal": False},
-        "pi05_libero_glow_nogrounding": {"module_grounding": False},
-        "pi05_libero_glow_nosubgoal": {"module_subgoal_text": False},
-        "pi05_libero_glow_chain": {"module_text_anchor": True, "module_token_scale": "words"},
-        "pi05_libero_glow_chain_exec": {"module_text_anchor": True, "module_token_scale": "words"},
-    }
-    data = {
-        "pi05_libero_glow_chain": {
-            "module_chain_p": 0.5,
-            "module_chain_tasks": GOAL_TASKS,
-            "module_stage_order": "sorted",
-        },
-        "pi05_libero_glow_chain_exec": {
-            "module_chain_p": 0.5,
-            "module_chain_tasks": GOAL_TASKS,
-            "module_stage_order": "execution",
-        },
-    }
     monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    for name in CONFIGS:
-        cfg = _config.get_config(name)
-        assert isinstance(cfg.model, GlowModulePi0Config) and cfg.model.max_token_len == 8
-        expected = dataclasses.replace(GlowModulePi0Config(), **switches[name])
-        for field in (
-            "module_spatial",
-            "module_temporal",
-            "module_grounding",
-            "module_subgoal_text",
-            "module_text_anchor",
-        ):
-            assert getattr(cfg.model, field) == getattr(expected, field), (name, field)
-        assert cfg.data.module_inputs and cfg.data.plan_pack_path == plan_prompt.data.plan_pack_path
-        assert cfg.data.train_episodes == plan_prompt.data.train_episodes == "0:807"
-        for field, value in data.get(
-            name, {"module_chain_p": 0.0, "module_chain_tasks": (), "module_stage_order": "sorted"}
-        ).items():
-            assert getattr(cfg.data, field) == value, (name, field)
-        assert cfg.lr_schedule == plan_prompt.lr_schedule and cfg.batch_size == plan_prompt.batch_size
-        # The transform the config builds carries the data fields.
-        monkeypatch.setenv(_plan_pack.ENV_VAR, str(GOAL_PACK))
-        dc = dataclasses.replace(cfg.data, plan_pack_path=None).create(cfg.assets_dirs, cfg.model)
-        module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
-        assert (module.chain_p, module.chain_tasks, module.stage_order) == (
-            cfg.data.module_chain_p,
-            cfg.data.module_chain_tasks,
-            cfg.data.module_stage_order,
-        )
-        assert set(module.partners) == set(module.chain_tasks)
-        # The text control's data and recipe.
-        for field in ("batch_size", "num_train_steps", "lr_schedule", "optimizer", "ema_decay", "weight_loader"):
-            assert getattr(cfg, field) == getattr(plan_prompt, field), (name, field)
-        assert not cfg.data.plan_as_prompt
-    cfg = _config.get_config("pi05_libero_glow_st")
+    cfg = _config.get_config("pi05_libero_glow_v2t_fixed")
+    stock = _config.get_config("pi05_libero")
+    assert cfg.model.max_token_len == 8 and cfg.data.train_episodes == "0:807"
     local = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK))
     kinds = [type(t).__name__ for t in local.create(pathlib.Path("."), cfg.model).model_transforms.inputs]
     assert kinds.index("GlowModuleInputs") + 1 == kinds.index("TokenizePrompt")
-    assert "GlowPlanAsPrompt" not in kinds and "GlowPlanState" not in kinds
+    # The pack path falls back to the environment variable.
+    monkeypatch.setenv(_plan_pack.ENV_VAR, str(GOAL_PACK))
+    dc = dataclasses.replace(cfg.data, plan_pack_path=None).create(cfg.assets_dirs, cfg.model)
+    module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
+    assert (module.chain_p, module.chain_tasks, module.stage_order) == (0.0, (), "sorted")
     with pytest.raises(ValueError, match="GlowModulePi0Config"):
-        local.create(pathlib.Path("."), plan_prompt.model)
-    with pytest.raises(ValueError, match="exclude"):
-        dataclasses.replace(local, plan_as_prompt=True).create(pathlib.Path("."), cfg.model)
+        local.create(pathlib.Path("."), stock.model)
     with pytest.raises(ValueError, match="stage_order"):
         dataclasses.replace(local, module_stage_order="random").create(pathlib.Path("."), cfg.model)
-
-
-def test_align_configs(monkeypatch):
-    import openpi.training.config as _config
-
-    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    st = _config.get_config("pi05_libero_glow_st")
-    align = _config.get_config("pi05_libero_glow_st_align")
-    anchor = _config.get_config("pi05_libero_glow_st_anchor")
-    chain = _config.get_config("pi05_libero_glow_chain")
-    assert align.model.module_text_anchor and align.model.freeze_pretrained and align.model.module_distill_weight > 0
-    assert anchor.model.module_text_anchor and not anchor.model.freeze_pretrained
-    assert anchor.model.module_distill_weight == 0 and not st.model.module_text_anchor
-    # Both enter the prefix at a word token's size; the unanchored row keeps the language scale.
-    assert align.model.module_token_scale == anchor.model.module_token_scale == "words"
-    assert st.model.module_token_scale == "language"
-    # Same data and recipe as the unanchored row; the chain row is _st_anchor's model with chains.
-    for cfg in (align, anchor):
-        assert dataclasses.replace(cfg.data) == st.data
-        for field in ("batch_size", "num_train_steps", "lr_schedule", "optimizer", "weight_loader"):
-            assert getattr(cfg, field) == getattr(st, field), field
-    assert chain.model == anchor.model
-    assert dataclasses.replace(chain.data, module_chain_p=0.0, module_chain_tasks=()) == anchor.data
-
-    def module_transform(cfg):
-        local = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK))
-        inputs = local.create(pathlib.Path("."), cfg.model).model_transforms.inputs
-        return next(t for t in inputs if isinstance(t, _mi.GlowModuleInputs))
-
-    # Only a distilling model gets the teacher prompt.
-    assert module_transform(align).teacher_tokenizer is not None
-    assert module_transform(anchor).teacher_tokenizer is None and module_transform(st).teacher_tokenizer is None
+    # The clock must match the model's.
+    with pytest.raises(ValueError, match="module_stage_clock"):
+        dataclasses.replace(local, module_stage_clock=True).create(pathlib.Path("."), cfg.model)
+    with pytest.raises(ValueError, match="decision_repeat"):
+        dataclasses.replace(local, decision_repeat=0).create(pathlib.Path("."), cfg.model)
 
 
 @pytest.mark.parametrize(
-    "config_name", ["pi05_libero_glow_st", "pi05_libero_glow_st_align", "pi05_libero_glow_chain", "pi05_libero_glow_v2"]
+    "config_name", ["pi05_libero_glow_v2t_gate", "pi05_libero_glow_v2t_fixed", "pi05_libero_glow_monitor"]
 )
 def test_module_loader_end_to_end(monkeypatch, config_name):
     home = os.environ.get("HF_LEROBOT_HOME")
@@ -508,7 +422,6 @@ def test_module_loader_end_to_end(monkeypatch, config_name):
         batch_size=8,
         num_workers=0,
     )
-    chained = 0
     loader = _data.create_data_loader(cfg, framework="pytorch", shuffle=True, num_batches=3, skip_norm_stats=True)
     for obs, _ in loader:
         # The prompt is BOS + "\n" only; the goal is in the module arrays.
@@ -517,15 +430,13 @@ def test_module_loader_end_to_end(monkeypatch, config_name):
         ints = np.asarray(obs.glow_ints)
         assert ints.shape == (8, _mi.INTS_LEN) and np.asarray(obs.glow_text).shape == (8, _mi.TEXT_LEN)
         assert np.asarray(obs.glow_floats).shape == (8, _mi.FLOATS_LEN)
+        # A Goal sample has one stage; a counterfactual one has another task's plan chained with a
+        # partner (two runtime keys), stage 0 active, and no flow term.
         two = ints[:, _mi.INT_NUM_STAGES] == 2
-        chained += int(two.sum())
-        if cfg.data.module_chain_p == 0:
-            assert (ints[:, _mi.INT_NUM_STAGES] == 1).all() and (ints[:, _mi.INT_STAGE] == 0).all()
-        else:
-            assert (ints[~two, _mi.INT_STAGE] == 0).all() and (ints[two, _mi.INT_STAGE] <= 1).all()
-            # A chained sample has two runtime keys; an unchained one has one.
-            rk1 = slice(*_mi.TEXT_SEGMENTS["rk1"])
-            assert (np.asarray(obs.glow_text_mask)[:, rk1].any(axis=1) == two).all()
+        assert (ints[~two, _mi.INT_NUM_STAGES] == 1).all() and (ints[:, _mi.INT_STAGE] == 0).all()
+        rk1 = slice(*_mi.TEXT_SEGMENTS["rk1"])
+        assert (np.asarray(obs.glow_text_mask)[:, rk1].any(axis=1) == two).all()
+        np.testing.assert_array_equal(np.asarray(obs.glow_flow_weight) == 0, two)
         assert np.asarray(obs.glow_text_mask).any(axis=1).all()
         if cfg.model.module_distill_weight > 0:
             # The teacher's prompt: BOS, the task string, newline.
@@ -533,8 +444,6 @@ def test_module_loader_end_to_end(monkeypatch, config_name):
             assert (np.asarray(obs.glow_teacher_prompt_mask).sum(axis=1) > 2).all()
         else:
             assert obs.glow_teacher_prompt is None
-    if cfg.data.module_chain_p > 0:
-        assert 0 < chained < 24
 
 
 def test_remaining_order_shows_the_active_stage_first(pack, tokenizer):
@@ -666,49 +575,6 @@ def test_pack_episode_anchors(raw, tmp_path):
         _plan_pack.PlanPack.load(tmp_path / "broken.json")
 
 
-def test_v2_configs(monkeypatch):
-    import openpi.training.config as _config
-
-    monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    anchor = _config.get_config("pi05_libero_glow_st_anchor")
-    parity = _config.get_config("pi05_libero_glow_st_anchor_fv")
-    assert parity.freeze_vlm and not anchor.freeze_vlm
-    assert dataclasses.replace(parity, name=anchor.name, freeze_vlm=False) == anchor
-    v2 = _config.get_config("pi05_libero_glow_v2")
-    assert v2.freeze_vlm and v2.model.module_anchor == "head" and v2.model.module_stage_clock
-    assert (v2.data.module_stage_order, v2.data.module_stage_clock, v2.data.module_episode_grounding) == (
-        "remaining",
-        True,
-        True,
-    )
-    assert (v2.data.decision_window, v2.data.decision_repeat) == (40, 3)
-    for name, switches in (
-        ("pi05_libero_glow_v2_nogrounding", {"module_grounding": False}),
-        ("pi05_libero_glow_v2_noatom", {"module_atom": False}),
-        (
-            "pi05_libero_glow_v2_grounding_only",
-            {"module_subgoal_text": False, "module_nouns": False, "module_atom": False},
-        ),
-    ):
-        cfg = _config.get_config(name)
-        assert cfg.model == dataclasses.replace(v2.model, **switches) and cfg.data == v2.data, name
-    text = _config.get_config("pi05_libero_plan_prompt_fv")
-    stock = _config.get_config("pi05_libero_plan_prompt")
-    assert text.freeze_vlm and text.model == stock.model
-    assert dataclasses.replace(text.data, decision_window=0, decision_repeat=1) == stock.data
-    # The data config carries the stage starts for oversampling and the transform flags.
-    local = dataclasses.replace(v2.data, plan_pack_path=str(GOAL_PACK))
-    dc = local.create(pathlib.Path("."), v2.model)
-    assert (dc.decision_window, dc.decision_repeat) == (40, 3) and len(dc.episode_stage_starts) == 807
-    module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
-    assert module.stage_order == "remaining" and module.stage_clock and module.episode_grounding
-    # The clock must match the model's.
-    with pytest.raises(ValueError, match="module_stage_clock"):
-        dataclasses.replace(local, module_stage_clock=False).create(pathlib.Path("."), v2.model)
-    with pytest.raises(ValueError, match="decision_repeat"):
-        dataclasses.replace(local, decision_repeat=0).create(pathlib.Path("."), v2.model)
-
-
 def test_stage_clock_through_policy_inputs(monkeypatch, pack):
     """The stage clock as examples/libero sends it reaches a clocked config's module arrays."""
     import openpi.training.config as _config
@@ -716,7 +582,7 @@ def test_stage_clock_through_policy_inputs(monkeypatch, pack):
     from openpi_client import msgpack_numpy
 
     monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    cfg = _config.get_config("pi05_libero_glow_v2")
+    cfg = _config.get_config("pi05_libero_glow_v2t_gate")
     dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
     served = _transforms.compose(
         [
@@ -731,13 +597,12 @@ def test_stage_clock_through_policy_inputs(monkeypatch, pack):
         "observation/wrist_image": np.zeros((224, 224, 3), np.uint8),
         "observation/state": np.zeros(8),
         "prompt": task.task,
-        "prev_plan_index": 1,
         "oracle_plan_index": 1,
         "plan_stage_frames": 25,
     }
     out = served(msgpack_numpy.unpackb(msgpack_numpy.packb(element)))
     ints = out["glow_ints"]
-    assert ints[_mi.INT_STAGE] == 1 and ints[_mi.INT_STAGE_FRAMES] == 25 and ints[_mi.INT_SHOWN] == 1
+    assert ints[_mi.INT_STAGE] == 1 and ints[_mi.INT_STAGE_FRAMES] == 25 and ints[_mi.INT_SHOWN] == 2
     assert "plan_stage_frames" not in out
     with pytest.raises(ValueError, match="plan_stage_frames"):
         served(msgpack_numpy.unpackb(msgpack_numpy.packb({k: v for k, v in element.items() if k != "plan_stage_frames"})))
@@ -839,49 +704,40 @@ def test_ordering_configs(monkeypatch):
     import openpi.training.config as _config
 
     monkeypatch.setattr(_config.DataConfigFactory, "_load_norm_stats", lambda self, d, a: None)
-    v2 = _config.get_config("pi05_libero_glow_v2")
-    v2s = _config.get_config("pi05_libero_glow_v2s")
-    v2t = _config.get_config("pi05_libero_glow_v2t")
-    # v2s = the v2 inputs on the align recipe (only the encoders train, distillation 1).
-    assert not v2s.freeze_vlm and not v2t.freeze_vlm
-    assert v2s.model == dataclasses.replace(v2.model, freeze_pretrained=True, module_distill_weight=1.0)
-    # v2t differs from v2s only where the order lives.
-    assert v2t.model == dataclasses.replace(v2s.model, module_ctx_active=False, module_temporal_active_anchor="object")
-    assert v2t.data == dataclasses.replace(v2s.data, module_stage_order="sorted")
-    # The gated row is v2t plus the gate.
     gate = _config.get_config("pi05_libero_glow_v2t_gate")
-    assert gate.model == dataclasses.replace(v2t.model, module_temporal_gate=0.25)
-    assert gate.data == v2t.data and gate.lr_schedule == v2t.lr_schedule
-    # The key row is v2t with the Temporal encoder on the active runtime key alone.
-    key = _config.get_config("pi05_libero_glow_v2t_key")
-    assert key.model == dataclasses.replace(
-        v2t.model, module_temporal_key_only=True, module_stage_clock=False, module_temporal_active_anchor="ordinal"
-    )
-    assert key.data == dataclasses.replace(v2t.data, module_stage_clock=False)
-    assert key.lr_schedule == v2t.lr_schedule
-    # The fixed rows are the key row plus the constant turn-down, and without the Temporal tokens.
     fixed = _config.get_config("pi05_libero_glow_v2t_fixed")
-    assert fixed.model == dataclasses.replace(key.model, module_stage_gate=0.06)
-    assert fixed.data == key.data
-    masked = _config.get_config("pi05_libero_glow_v2t_fixed_masked")
-    assert masked.model == dataclasses.replace(fixed.model, module_temporal_masked=True)
-    assert masked.data == key.data
-    assert v2s.data == dataclasses.replace(
-        v2.data,
-        module_counterfactual_p=0.5,
-        module_counterfactual_window=40,
-        module_counterfactual_tasks=GOAL_TASKS,
+    for cfg in (gate, fixed):
+        # The align recipe: only the encoders train, distillation 1.
+        assert not cfg.freeze_vlm and cfg.model.freeze_pretrained and cfg.model.module_distill_weight == 1.0
+        assert cfg.model.module_text_anchor and cfg.model.module_anchor == "head"
+        assert cfg.model.module_token_scale == "words" and not cfg.model.module_ctx_active
+        assert (cfg.data.decision_window, cfg.data.decision_repeat) == (40, 3)
+    # The gate row: a clocked Temporal encoder anchored to the object noun, scaling the Spatial groups.
+    assert gate.model.module_temporal_gate == 0.25 and gate.model.module_stage_clock
+    assert gate.model.module_temporal_active_anchor == "object" and not gate.model.module_temporal_key_only
+    # The fixed row: the Temporal encoder on the active runtime key alone, a constant turn-down.
+    assert fixed.model == dataclasses.replace(
+        gate.model,
+        module_temporal_gate=0.0,
+        module_temporal_key_only=True,
+        module_stage_clock=False,
+        module_temporal_active_anchor="ordinal",
+        module_stage_gate=0.06,
     )
-    for cfg in (v2s, v2t):
+    assert fixed.data == dataclasses.replace(gate.data, module_stage_clock=False)
+    assert fixed.lr_schedule == gate.lr_schedule
+    for cfg in (gate, fixed):
         dc = dataclasses.replace(cfg.data, plan_pack_path=str(GOAL_PACK)).create(pathlib.Path("."), cfg.model)
+        assert (dc.decision_window, dc.decision_repeat) == (40, 3) and len(dc.episode_stage_starts) == 807
         module = next(t for t in dc.model_transforms.inputs if isinstance(t, _mi.GlowModuleInputs))
         assert module.teacher_tokenizer is not None and module.counterfactual_p == 0.5
         assert module.counterfactual_window == 40 and module.counterfactual_tasks == GOAL_TASKS
-        assert module.stage_order == cfg.data.module_stage_order
+        assert module.stage_order == "sorted" and module.episode_grounding
+        assert module.stage_clock == cfg.model.module_stage_clock
     # Counterfactual samples need the teacher.
     with pytest.raises(ValueError, match="teacher"):
-        dataclasses.replace(v2t.data, plan_pack_path=str(GOAL_PACK)).create(
-            pathlib.Path("."), dataclasses.replace(v2t.model, module_distill_weight=0.0)
+        dataclasses.replace(gate.data, plan_pack_path=str(GOAL_PACK)).create(
+            pathlib.Path("."), dataclasses.replace(gate.model, module_distill_weight=0.0)
         )
 
 
@@ -990,7 +846,6 @@ def test_monitor_request_through_policy_transforms(monkeypatch, pack):
         "observation/wrist_image": np.zeros((224, 224, 3), np.uint8),
         "observation/state": np.zeros(8),
         "prompt": a.task,
-        "prev_plan_index": 0,
         "plan_chain": [a.task, b.task],
         "plan_prev_done": [1.0, 0.0],
     }

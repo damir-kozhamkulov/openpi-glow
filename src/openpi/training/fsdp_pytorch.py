@@ -1,4 +1,4 @@
-"""Fully sharded data parallel (FSDP2) training support for PI0Pytorch / GlowPI0Pytorch.
+"""Fully sharded data parallel (FSDP2) training support for PI0Pytorch and its variants.
 
 A float32 pi05 replica with AdamW needs ~58 GB per GPU under DDP (parameters 14.5 + gradients
 14.5 + moments 29), which no 46-48 GB card holds. Sharding gradients, moments and the resting
@@ -8,8 +8,8 @@ forward/backward is in flight.
 Sharding units. `PaliGemmaWithExpertModel.forward` runs each joint layer by calling the
 submodules of `layers[i]` directly (input_layernorm, q/k/v/o_proj, post_attention_layernorm,
 mlp), never `GemmaDecoderLayer.forward`, so FSDP hooks on the decoder layer would never fire.
-Each decoder layer is therefore sharded as a group of exactly those submodules, which both the
-joint loop and the stock HF decoder-layer forward (the GLOW prefix-only CE pass) call. SigLIP
+Each decoder layer is therefore sharded as a group of exactly those submodules, which the stock
+HF decoder-layer forward calls as well. SigLIP
 encoder layers are called normally and are sharded whole; everything else (embeddings, the
 tied lm_head, projections, final norms) belongs to the root unit.
 

@@ -281,7 +281,7 @@ class Scorer:
 
     def prepare(self, elements) -> dict:
         """The served input transforms of `elements`, collated (host arrays; any thread)."""
-        return _m1._flow_probe._collate([self.transform(e) for e in elements])  # noqa: SLF001
+        return _m1.collate([self.transform(e) for e in elements])
 
     def observation(self, batch):
         from openpi.models import model as _model

@@ -682,7 +682,7 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    # The config picks the module: PI0Pytorch, or a variant such as GLOW's GlowPI0Pytorch.
+    # The config picks the module: PI0Pytorch, or a variant such as GLOW's GlowModulePI0Pytorch.
     model = (
         model_cfg.create_pytorch() if hasattr(model_cfg, "create_pytorch")
         else openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
@@ -889,7 +889,7 @@ def train_loop(config: _config.TrainConfig):
             with sync_context:
                 # Forward pass
                 losses = model(observation, actions)
-                # A model may return {"loss": scalar, <term>: scalar, ...} (GLOW: flow + plan CE);
+                # A model may return {"loss": scalar, <term>: scalar, ...} (GLOW: flow + distillation);
                 # the stock model returns the per-element flow loss.
                 terms = {}
                 if isinstance(losses, dict):
@@ -977,7 +977,7 @@ def train_loop(config: _config.TrainConfig):
                 # accumulator is not moving.
                 ema_distance = ema.relative_distance(model) if ema is not None else None
 
-                # Extra loss terms (GLOW: flow, plan_ce, plan_token_acc, plan_exact, ce_samples),
+                # Extra loss terms (GLOW: flow, distill, teacher_flow, done_bce, ...),
                 # averaged over the steps that reported them.
                 term_keys = sorted({k for info in infos for k in info if k.startswith("term/")})
                 avg_terms = {

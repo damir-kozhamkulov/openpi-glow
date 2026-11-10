@@ -316,7 +316,7 @@ def embed_sim(episodes: list[SimEpisode], pipeline, model, args, device):
         plans = [plan_id(ep["request"][int(i)]) for i in e.queries]
         batches = [
             (
-                _m1._flow_probe._collate([pipeline(x) for x in elements[s : s + args.render_batch]]),  # noqa: SLF001
+                _m1.collate([pipeline(x) for x in elements[s : s + args.render_batch]]),
                 plans[s : s + args.render_batch],
             )
             for s in range(0, len(elements), args.render_batch)

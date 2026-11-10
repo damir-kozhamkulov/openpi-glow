@@ -44,7 +44,7 @@ class WebsocketPolicyServer:
             process_request=_health_check,
             # Inference runs on the event loop, so nothing answers a pong while it is in flight.
             # With the default 20 s timeout the server closes the connection on any slower
-            # request: a 526 s torch.compile autotune ended a LIBERO eval this way on 2026-08-26.
+            # request (a torch.compile autotune on the first query takes minutes).
             # None keeps sending pings but stops treating a late pong as a dead peer.
             ping_timeout=None,
         ) as server:

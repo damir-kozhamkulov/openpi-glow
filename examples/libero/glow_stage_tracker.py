@@ -7,19 +7,18 @@ is evaluation-legal. Replayed over the LIBERO-10 training tapes it reproduces th
 plan chain on 99.89% of frames (378/379 episodes exact); a regrasp guard was measured to make
 that worse, so there is none.
 
-`PlanEcho`: what one episode sends a GLOW server and what it keeps. Every query carries the
-previous plan (`prev_plan_index`, stage 1 at reset); the plan that query settles on becomes the
-next query's previous plan. Modes:
-  self    the server scores every stage and returns its choice (`plan_choice`)
+`PlanEcho`: what one episode sends a GLOW server and what it keeps. Modes:
   oracle  the tracker's stage is sent as `oracle_plan_index` and used as the plan
   forced  a fixed stage is sent as `oracle_plan_index` (counterfactual: do actions follow it?)
   atoms   the first stage of a given order whose goal atom has not held yet on the simulator
           (`StageAtoms`) is sent as `oracle_plan_index`: order 0,1 is a simulator oracle, 1,0
           asks for the stages the other way round (do actions follow the stage when the scene
           does not settle it?)
-Every mode but self also sends the stage clock, `plan_stage_frames`: the frames since the stage
-it sends last changed (or since the episode began), as training reads it from the labels.
-The tracker runs in every mode, so the model's plan can be compared against it. When the plans
+  monitor no stage is sent: the server's progress monitor decides it, and the stages its done
+          probabilities latch (`MonitorLatch`) go back as `plan_prev_done`
+Every mode that sends a stage also sends the stage clock, `plan_stage_frames`: the frames since
+the stage it sends last changed (or since the episode began), as training reads it from the labels.
+The tracker runs in every mode, so the plan in use can be compared against it. When the plans
 come from another task than the environment's (steering), `tracker_plans` is the environment
 task's stage count and `num_plans` the plan task's.
 
@@ -30,7 +29,7 @@ an evaluation could not have.
 """
 
 HOLD_MIN = 30
-PLAN_MODES = ("self", "oracle", "forced", "atoms", "monitor")
+PLAN_MODES = ("oracle", "forced", "atoms", "monitor")
 # --plan-mode monitor: a stage counts as done once the server's done probability for it is above
 # MONITOR_THRESHOLD on MONITOR_CONSECUTIVE queries in a row, and stays done.
 MONITOR_THRESHOLD = 0.7
@@ -297,7 +296,7 @@ class PlanEcho:
 
     def request(self):
         """Keys to add to the next observation sent to the server."""
-        req = {"prev_plan_index": self.prev}
+        req = {}
         if self.mode == "oracle":
             req["oracle_plan_index"] = self.tracker.plan_index
         elif self.mode == "forced":
@@ -318,11 +317,7 @@ class PlanEcho:
         """Take the server's response to the last request; returns the plan that query used."""
         if self._sent is None:
             raise RuntimeError("update() without a preceding request()")
-        if self.mode == "self":
-            plan = int(response["plan_choice"])
-            if not 0 <= plan < self.num_plans:
-                raise ValueError("server chose plan {} outside 0..{}".format(plan, self.num_plans - 1))
-        elif self.mode == "monitor":
+        if self.mode == "monitor":
             if "glow_done" not in response:
                 raise ValueError("monitor mode needs a progress-monitor server (no glow_done in the response)")
             plan = self.monitor.update(response["glow_done"])

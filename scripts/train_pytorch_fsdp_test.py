@@ -1,4 +1,4 @@
-"""FSDP (OPENPI_PARALLEL=fsdp) against a single-process reference, on the GLOW model at dummy scale.
+"""FSDP (OPENPI_PARALLEL=fsdp) against a single-process reference, on pi05 at dummy scale.
 
 Two CPU ranks over gloo each take half of every batch; the reference takes the whole batch.
 Checked: per-step loss, the full gradients, the clipped norm, the parameters after AdamW steps,
@@ -29,12 +29,12 @@ from transformers.models.auto import CONFIG_MAPPING
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-from openpi.glow.model_config import GlowPi0Config
+import openpi.models.pi0_config as pi0_config
 import openpi.models_pytorch.gemma_pytorch as gemma_pytorch
-from openpi.models_pytorch.glow_pi0_pytorch import GlowPI0Pytorch
-from openpi.models_pytorch.glow_pi0_pytorch_test import B
-from openpi.models_pytorch.glow_pi0_pytorch_test import _cfg
-from openpi.models_pytorch.glow_pi0_pytorch_test import _make_obs
+from openpi.models_pytorch.glow_testing import B
+from openpi.models_pytorch.glow_testing import dummy_config as _cfg
+from openpi.models_pytorch.glow_testing import make_observation as _make_obs
+from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 import openpi.models_pytorch.preprocessing_pytorch as preprocessing
 
 from . import train_pytorch
@@ -45,10 +45,9 @@ _LR = 1e-3
 # Small enough that clipping is active on every step.
 _MAX_NORM = 0.05
 # Parameter tolerance after the AdamW steps: 1% of the most a step can move a parameter (lr).
-# Adam divides each gradient component by its own running RMS, so components near eps (rows of
-# the tied embedding the CE head barely touches) turn float32 summation-order differences into
-# visible parameter differences, ~7e-6 here; a missing or unreduced gradient moves parameters by
-# up to lr.
+# Adam divides each gradient component by its own running RMS, so components near eps turn
+# float32 summation-order differences into visible parameter differences, ~7e-6 here; a missing
+# or unreduced gradient moves parameters by up to lr.
 _PARAM_ATOL = 1e-2 * _LR * _STEPS
 
 
@@ -92,9 +91,9 @@ def _test_environment():
         preprocessing.preprocess_observation_pytorch = orig_preprocess
 
 
-def _make_model(ce_weight: float) -> torch.nn.Module:
+def _make_model() -> torch.nn.Module:
     torch.manual_seed(1234)
-    model = GlowPI0Pytorch(_cfg(GlowPi0Config, subtask_ce_weight=ce_weight))
+    model = PI0Pytorch(_cfg(pi0_config.Pi0Config))
     model.gradient_checkpointing_enable()
     model.train()
     return model
@@ -118,10 +117,8 @@ def _select_rows(observation, selected):
 
 
 def _batch(step: int, rows: slice):
-    """Step `step`'s batch of 4 restricted to `rows`. Every row carries a plan block of the same
-    length, so each half holds the same number of CE targets and the per-rank CE means average
-    to the full-batch mean."""
-    obs = _make_obs(100 + step, block_seed=1100 + step)
+    """Step `step`'s batch of 4 restricted to `rows`."""
+    obs = _make_obs(100 + step)
     g = torch.Generator().manual_seed(200 + step)
     actions = torch.randn(B, 10, 32, generator=g)
     noise = torch.randn(B, 10, 32, generator=g)
@@ -141,11 +138,11 @@ def _optimizer(model) -> torch.optim.Optimizer:
     return torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=1e-4)
 
 
-def _reference(tmp_path: pathlib.Path, ce_weight: float) -> dict:
+def _reference(tmp_path: pathlib.Path) -> dict:
     """Single process, whole batches. Writes the init weights and checkpoints at steps 1 and
     _STEPS in the single-process format."""
     with _test_environment():
-        model = _make_model(ce_weight)
+        model = _make_model()
         safetensors.torch.save_model(model, tmp_path / "init.safetensors")
         optim = _optimizer(model)
         record = {"loss": [], "grad_norm": [], "grads": None}
@@ -168,7 +165,7 @@ def _reference(tmp_path: pathlib.Path, ce_weight: float) -> dict:
         return record
 
 
-def _fsdp_worker(rank: int, tmp: str, ce_weight: float, mode: str) -> None:
+def _fsdp_worker(rank: int, tmp: str, mode: str) -> None:
     """mode: "fresh" (from the init weights), "resume" (from the reference's step-1
     checkpoint) or "accum" (fresh, each rank's half batch as two micro-batches of one)."""
     tmp_path = pathlib.Path(tmp)
@@ -190,7 +187,7 @@ def _fsdp_worker(rank: int, tmp: str, ce_weight: float, mode: str) -> None:
     _fsdp_collectives._get_gradient_divide_factors = lambda *_, **__: (1.0, float(_WORLD_SIZE))  # noqa: SLF001
     try:
         with _test_environment():
-            model = _make_model(ce_weight)
+            model = _make_model()
             if resume:
                 ckpt_root = tmp_path / "ckpt_resume_from"
                 train_pytorch.load_model_weights(model, ckpt_root / "1", device)
@@ -236,8 +233,8 @@ def _fsdp_worker(rank: int, tmp: str, ce_weight: float, mode: str) -> None:
         dist.destroy_process_group()
 
 
-def _run_fsdp(tmp_path: pathlib.Path, ce_weight: float, mode: str) -> dict:
-    mp.spawn(_fsdp_worker, args=(str(tmp_path), ce_weight, mode), nprocs=_WORLD_SIZE, join=True)
+def _run_fsdp(tmp_path: pathlib.Path, mode: str) -> dict:
+    mp.spawn(_fsdp_worker, args=(str(tmp_path), mode), nprocs=_WORLD_SIZE, join=True)
     return torch.load(tmp_path / f"fsdp_{mode}.pt", weights_only=False)
 
 
@@ -247,12 +244,12 @@ def _assert_params_close(got: dict, want: dict) -> None:
         torch.testing.assert_close(got[name], value, rtol=0, atol=_PARAM_ATOL, msg=name)
 
 
-@pytest.fixture(scope="module", params=[0.1, 0.0], ids=["glow_ce", "stock_flow"])
-def runs(request, tmp_path_factory):
-    tmp_path = tmp_path_factory.mktemp(f"fsdp_{request.param}")
-    reference = _reference(tmp_path, request.param)
-    fsdp = _run_fsdp(tmp_path, request.param, "fresh")
-    resumed = _run_fsdp(tmp_path, request.param, "resume")
+@pytest.fixture(scope="module")
+def runs(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("fsdp")
+    reference = _reference(tmp_path)
+    fsdp = _run_fsdp(tmp_path, "fresh")
+    resumed = _run_fsdp(tmp_path, "resume")
     return tmp_path, reference, fsdp, resumed
 
 
@@ -270,8 +267,8 @@ def test_losses_and_clipped_norms_match(runs):
 
 def test_gradients_match(runs):
     _, reference, fsdp, _ = runs
-    # Same set of parameters with gradients: the unused ones (the expert's lm_head, and under the
-    # flow loss alone the last PaliGemma layer's MLP) have none on either side.
+    # Same set of parameters with gradients: the unused ones (the expert's lm_head and the last
+    # PaliGemma layer's MLP) have none on either side.
     assert fsdp["grads"].keys() == reference["grads"].keys()
     for name, grad in reference["grads"].items():
         torch.testing.assert_close(fsdp["grads"][name], grad, rtol=1e-4, atol=1e-7, msg=name)
@@ -320,10 +317,8 @@ def test_checkpoint_files_match_single_process_format(runs):
 
 
 def test_accumulation_matches_full_batch(tmp_path):
-    # Flow loss only: the CE term is a mean over target tokens, so micro-batch means reproduce the
-    # full-batch mean only when every micro-batch holds the same number of them.
-    reference = _reference(tmp_path, 0.0)
-    accumulated = _run_fsdp(tmp_path, 0.0, "accum")
+    reference = _reference(tmp_path)
+    accumulated = _run_fsdp(tmp_path, "accum")
     torch.testing.assert_close(accumulated["grad_norm"], reference["grad_norm"], rtol=1e-4, atol=0)
     _assert_params_close(accumulated["params"], reference["params"])
 

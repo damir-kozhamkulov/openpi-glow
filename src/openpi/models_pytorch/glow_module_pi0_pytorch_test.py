@@ -20,9 +20,9 @@ from openpi.glow.model_config import GlowModulePi0Config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 from openpi.models_pytorch.glow_module_pi0_pytorch import GlowModulePI0Pytorch
-from openpi.models_pytorch.glow_pi0_pytorch_test import _arrays
-from openpi.models_pytorch.glow_pi0_pytorch_test import _cfg
-from openpi.models_pytorch.glow_pi0_pytorch_test import tiny_vision_tower  # noqa: F401
+from openpi.models_pytorch.glow_testing import dummy_config as _cfg
+from openpi.models_pytorch.glow_testing import observation_arrays as _arrays
+from openpi.models_pytorch.glow_testing import tiny_vision_tower  # noqa: F401
 
 B = 4
 WIDTH = 64  # dummy Gemma width
@@ -66,7 +66,7 @@ def _valid_tokens(num_stages=K):
 
 
 def _obs(seed, module, bsize=B):
-    imgs, masks, state, tokens, tmask, _, _ = _arrays(seed, 0, bsize, with_block=False)
+    imgs, masks, state, tokens, tmask = _arrays(seed, bsize)
     d = {"image": imgs, "image_mask": masks, "state": state, "tokenized_prompt": tokens, "tokenized_prompt_mask": tmask}
     d |= {k: torch.as_tensor(v) for k, v in module.items()}
     return _model.Observation.from_dict(d)
@@ -227,7 +227,7 @@ def test_encoders_get_gradients(model):
 
 
 def test_missing_module_arrays_raise(model):
-    imgs, masks, state, tokens, tmask, _, _ = _arrays(0, 0, B, with_block=False)
+    imgs, masks, state, tokens, tmask = _arrays(0, B)
     obs = _model.Observation.from_dict(
         {"image": imgs, "image_mask": masks, "state": state, "tokenized_prompt": tokens, "tokenized_prompt_mask": tmask}
     )
@@ -308,7 +308,7 @@ def test_text_anchor_residual_trains():
 
 def _teacher(seed=0, bsize=B):
     """Task-string tokens for the teacher pass: the stock prompt rows of `_arrays`."""
-    _, _, _, tokens, tmask, _, _ = _arrays(seed + 50, 0, bsize, with_block=False)
+    _, _, _, tokens, tmask = _arrays(seed + 50, bsize)
     return {"glow_teacher_prompt": tokens, "glow_teacher_prompt_mask": tmask}
 
 
