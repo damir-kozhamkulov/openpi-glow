@@ -7,6 +7,7 @@ import pathlib
 from typing import Literal, Optional
 
 import glow_chain_demo
+import glow_query_dump
 import glow_stage_tracker
 import imageio
 from libero.libero import benchmark
@@ -119,6 +120,10 @@ class Args:
     plan_return_steps: Optional[int] = None
     # Instruction sent to the server in place of the environment's task (the planner reads it).
     prompt: Optional[str] = None
+    # When set, every episode's queries (both cameras and the state as sent, the other request
+    # fields, the response's glow_done) and its plan trace go to <dump_dir>/task<i>_ep<n>.npz
+    # (glow_query_dump), for scripts/glow_monitor_replay.py.
+    dump_dir: Optional[str] = None
 
 
 def eval_libero(args: Args) -> None:
@@ -191,6 +196,7 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Task suite: {args.task_suite_name}")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    query_dump = glow_query_dump.QueryDump(args.dump_dir) if args.dump_dir is not None else None
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -382,6 +388,8 @@ def eval_libero(args: Args) -> None:
                         # Query model to get action
                         response = client.infer(element)
                         action_chunk = response["actions"]
+                        if query_dump is not None:
+                            query_dump.add(t - args.num_steps_wait, element, response)
                         if plan is not None:
                             used = plan.update(response)
                             logp = response.get("plan_logp")
@@ -481,15 +489,19 @@ def eval_libero(args: Args) -> None:
                     f"chain_held_at_end={bool(env.env._check_success() and partner_goal.check())} "  # noqa: SLF001
                     f"{chain_return.trace() + ' ' if chain_return is not None else ''}"
                 )
+            trace_line = ""
             if plan is not None:
                 # One line per episode for the stage-resolved failure analysis.
-                logging.info(
+                trace_line = (
                     f"plan trace: task={task_id} episode={episode_idx} success={success} {steered_fields}"
                     f"frames={plan.tracker.frame} {plan.trace()} {atoms.trace()}"
                 )
+                logging.info(trace_line)
                 if len(atom_list) > 1:
                     task_first[atoms.first()] += 1
                     total_first[atoms.first()] += 1
+            if query_dump is not None:
+                query_dump.save(task_id, episode_idx, task_description, trace_line)
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
             if steered is not None:
